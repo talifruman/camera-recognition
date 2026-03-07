@@ -6,6 +6,7 @@ Always use **Obra Superpowers: Brainstorming** in **Planning Mode**.
 - When I ask for ideas, first switch to planning mode.
 - Structure output as: goal, assumptions, options, trade-offs, and step-by-step action plan.
 - Do not jump directly to implementation unless I explicitly ask.
+- Don't create code unless I explicitly ask to create code. After plan, if I ask to start implementation, I need just update MD file. If I will want to create code, I will text "create code" or "update code".
 
 ## Trigger
 - Apply this rule by default for new project discussions, feature ideation, and strategy questions.
@@ -106,10 +107,11 @@ The clip recorder table under Detailed Comparison provides a concrete instance o
 ## Full System Architecture
 Control plane and data plane split:
 - Each service contains its own configuration module (file/env/secret based), no centralized configuration service.
-- Camera Service handles adapters and emits normalized frames/metadata.
+- Camera Service handles adapters and emits normalized frames/metadata via shared memory (MVP) or gRPC (growth).
 - Unified Vision Service consumes frames and runs internal modules: Motion Detection, Object Detection, Face Detection, and Face Recognition.
+- Frame Buffer Service maintains historical frame buffers for pre/post roll support and serves frame ranges to Clip Recording Service via gRPC.
 - Event Service assembles canonical event record and state transitions.
-- Clip Recording Service buffers pre/post frames and writes event clips.
+- Clip Recording Service fetches pre/post frames from Frame Buffer Service and writes event clips.
 - Telegram Notification Service sends rich message + media.
 - Storage Service abstracts DB and media object operations.
 - API Gateway exposes admin APIs and query APIs.
@@ -130,6 +132,7 @@ Core design rules:
 | - RtspCameraAdapter                                           |
 | - FileReplayAdapter                                           |
 | - SyntheticGeneratorAdapter                                   |
+| - IPC Adapter (shared memory) / gRPC Adapter (multi-host)    |
 +---------------------------------------------------------------+
                |                       |
                |                       |
@@ -142,6 +145,7 @@ Core design rules:
 | - Object Detection                                            |
 | - Face Detection                                              |
 | - Face Recognition                                            |
+| - IPC Client / gRPC Client (frame adapter)                    |
 +---------------------------------------------------------------+
                |
                v
@@ -154,8 +158,21 @@ Core design rules:
 | Clip Recording        |   | Telegram Notification       |
 | Service               |   | Service                     |
 +-----------------------+   +-----------------------------+
-| (Buffers video from   |   |
-| Camera Service)       |   |
+| (Fetches video from   |   |
+| Frame Buffer Service) |   |
+| - IPC Client / gRPC   |   |
+| Client (frame adapter)|   |
+
++-----------------------+
+| Frame Buffer Service  |
+|---------------------------------------------------------------|
+| - Maintains pre/post frame history                            |
+| - Serves gRPC GetFrameRange requests from Clip Recording      |
+| - Consumes shared memory/gRPC from Camera Service             |
++-----------------------+
+     ^            ^
+     |            |
+Camera Service   Clip Recording
 
 +-----------------------+
 | Storage Service       |
@@ -165,15 +182,114 @@ Core design rules:
 Unified Vision   |         Clip Recording
 Service          |
                Event Service
-[Per-service configuration module inside each service: Camera, Unified Vision, Event, Clip, Telegram]
+[Per-service configuration module inside each service: Camera, Unified Vision, Event, Clip, Telegram, Frame Buffer]
 ```
 
 ## Data Flow Diagram
-FrameSource -> Camera Service -> frame.raw topic -> Unified Vision Service (motion -> object -> face detection -> face recognition) -> person.identified topic -> Event Service -> event.created topic -> Clip Recording -> event.clip.ready topic -> Telegram Notification
+FrameSource -> Camera Service -> {Unified Vision Service, Frame Buffer Service}
+
+Unified Vision Service path:
+- frame.raw (via IPC/gRPC adapter) -> motion -> object -> face detection -> face recognition -> person.identified topic -> Event Service -> event.created topic
+
+Frame Buffer Service path:
+- frame.raw (via IPC/gRPC adapter) -> maintains pre/post frame history
+
+Clip Recording path:
+- Event Service -> event.created topic -> Clip Recording Service
+- Clip Recording Service -> gRPC GetFrameRange request to Frame Buffer Service -> receives pre/post frames -> writes clip to storage
+
+Notification path:
+- Event Service -> event.clip.ready topic -> Telegram Notification Service
 
 Branch behavior:
 - No person detected: optionally store motion event only (configurable).
 - Unknown face: create unknown event with confidence and optional alert policy.
+
+## Sequence Diagrams: MVP Service Flow (High-Level)
+
+### Frame Capture & Real-Time Detection Flow
+```mermaid
+sequenceDiagram
+	autonumber
+	participant CameraService as Camera Service<br/>(RTSP Ingest)
+	participant UVService as Unified Vision<br/>Service
+	participant FrameBuffer as Frame Buffer<br/>Service
+	participant EventService as Event Service<br/>(Redis Streams)
+
+	loop Every 33ms (30fps)
+		CameraService->>UVService: frame (via IPC adapter)
+		
+		UVService->>UVService: motion_detect()
+		UVService->>UVService: object_detect()
+		UVService->>UVService: face_detect()
+		UVService->>UVService: face_recognize()
+		
+		alt Person Detected
+			UVService->>FrameBuffer: store_frame(timestamp)
+			FrameBuffer->>FrameBuffer: add_to_history()
+			UVService->>EventService: emit(person.identified)
+		else Motion Only
+			UVService->>FrameBuffer: store_motion_frame(timestamp)
+		end
+	end
+
+	Note over UVService,EventService: Total latency: ~150-200ms<br/>IPC: <10ms | Inference: <100ms | Redis: <50ms
+```
+
+### Event-Triggered Clip Recording Flow
+```mermaid
+sequenceDiagram
+	autonumber
+	participant EventService as Event Service<br/>(Redis Stream)
+	participant ClipRecorder as Clip Recording<br/>Service
+	participant FrameBuffer as Frame Buffer<br/>Service
+	participant Storage as Storage<br/>(Disk)
+
+	EventService->>ClipRecorder: event_created(camera_id, timestamp)
+	Note over ClipRecorder: Calculate window: t-1s to t+4s
+	
+	ClipRecorder->>FrameBuffer: GetFrameRange(camera_id, t-1s, t+4s)
+	FrameBuffer->>FrameBuffer: fetch pre/post frames
+	FrameBuffer-->>ClipRecorder: frame_stream (pre+post)
+	
+	ClipRecorder->>ClipRecorder: assemble_clip(frames)
+	ClipRecorder->>ClipRecorder: mux_video(ffmpeg)
+	ClipRecorder->>Storage: write_mp4(event_id.mp4)
+	Storage-->>ClipRecorder: ack
+	
+	ClipRecorder->>EventService: emit(event.clip.ready)
+
+	Note over ClipRecorder,Storage: Total latency: ~250-300ms<br/>Fetch: <50ms | Mux: <200ms | Write: <50ms
+```
+
+### Multi-Camera Frame Distribution
+```mermaid
+sequenceDiagram
+	autonumber
+	participant CameraService as Camera Service<br/>(Multi-Camera)
+	participant UVService as Unified Vision<br/>Service
+	participant FrameBuffer as Frame Buffer<br/>Service
+	participant EventService as Event Service<br/>(Events)
+
+	Note over CameraService: Camera 0, 1, 2, ... N<br/>Each 30fps stream
+	
+	loop Parallel camera feeds
+		CameraService->>UVService: frame[camera_0]
+		CameraService->>UVService: frame[camera_1]
+		CameraService->>UVService: frame[camera_2]
+	end
+	
+	UVService->>UVService: process_frame[camera_0]
+	UVService->>UVService: process_frame[camera_1]
+	UVService->>UVService: process_frame[camera_2]
+	
+	alt Detection in any camera
+		UVService->>FrameBuffer: store(camera_id, frame)
+		UVService->>EventService: emit(event, camera_id)
+	end
+
+	Note over CameraService,EventService: Per-camera streams isolated<br/>Frame history per camera<br/>Events tagged with camera_id
+```
 
 ## Camera Abstraction Layer
 Common interface:
@@ -228,10 +344,16 @@ Telegram Notification API:
 - POST /v1/notify/event/{event_id} for manual resend
 - Internal subscriber on event.ready_for_notify
 
+Frame Buffer Service API:
+- gRPC StreamCamera(camera_id, adapter_type): stream CameraFrame (MVP uses IPC adapter, growth uses gRPC adapter)
+- gRPC GetFrameRange(camera_id, start_timestamp, end_timestamp): returns frame series for clip construction
+- Supports adapter pattern: IPC (shared memory via named pipe/mmap) for MVP, gRPC for multi-host growth phase
+
 ## Service Executables (No Central Config Service)
 - api-gateway.exe
 - camera-service.exe
 - unified-vision-service.exe
+- frame-buffer-service.exe
 - event-service.exe
 - clip-recording-service.exe
 - telegram-notification-service.exe
@@ -239,6 +361,27 @@ Telegram Notification API:
 - people-library-service.exe (optional if merged into face-recognition)
 
 config-service.exe is intentionally excluded; each service executable owns its configuration module.
+
+## Video Transport Architecture (MVP → Growth)
+
+**MVP (Phases 1-2): Shared In-Host Ring Buffer + IPC Adapters**
+- Camera Service writes normalized frames to POSIX named pipe or memory-mapped file (ring buffer).
+- Unified Vision Service reads via IPC adapter (< 10ms latency).
+- Frame Buffer Service maintains ring buffer history for pre/post roll.
+- Clip Recording Service fetches pre/post frames from Frame Buffer Service via IPC adapter on event trigger.
+- All services use adapters to abstract transport; core logic unchanged.
+
+**Growth (Phases 3-5): gRPC Server Streaming + Adapter Migration**
+- Camera Service implements gRPC StreamCamera alongside ring buffer.
+- Frame Buffer Service adds gRPC GetFrameRange for historical frame access.
+- Services swap IPC adapters to gRPC adapters via config change; core code unchanged.
+- Enables multi-host scaling: Unified Vision Service and Clip Recording Service can run on different hosts.
+- Ring buffer decommissioned when multi-host deployment confirmed.
+
+**Adapter Pattern Benefits**
+- Isolates transport mechanism from business logic (frame processing, clipping, events).
+- Enables seamless MVP → growth migration without core service refactoring.
+- Supports A/B testing of IPC vs. gRPC performance during transition.
 
 ## Database Schema (logical)
 Tables:
@@ -255,6 +398,89 @@ Indexes:
 - events(person_id, timestamp)
 - persons(name)
 - notifications(event_id, status)
+
+## Suggested Libraries and Tools
+Video and media:
+- OpenCV for frame ops and motion preprocessing.
+- FFmpeg for clip assembly/transcoding.
+- GStreamer optional for advanced stream handling.
+
+Detection and recognition:
+- YOLOv8/YOLO11 person detection.
+- InsightFace for embeddings and matching.
+- ONNX Runtime for portable inference acceleration.
+
+Messaging and cache:
+- Redis Streams for MVP event bus.
+- Kafka for higher throughput later.
+- Redis for short-lived frame/event cache.
+
+Data/storage:
+- PostgreSQL for metadata/events.
+- S3-compatible object store (MinIO local, cloud object store later).
+
+Service framework:
+- FastAPI or Node/NestJS for admin/control APIs.
+- gRPC optional for low-latency internal RPC.
+
+Observability:
+- OpenTelemetry + Prometheus + Grafana + Loki.
+
+## Development Roadmap
+Phase 1 - Minimal pipeline:
+- Deliverables: adapter abstraction, one camera source, motion detection, event creation, local clip.
+- Exit criteria: motion event produces stored snapshot+clip.
+
+Phase 2 - Face detection:
+- Deliverables: face crop extraction and event attachment.
+- Exit criteria: events include face bounding boxes and crops.
+
+Phase 3 - Face recognition:
+- Deliverables: person CRUD, embedding index, matching service.
+- Exit criteria: known person identified with calibrated threshold.
+
+Phase 4 - Telegram integration:
+- Deliverables: bot integration with text+photo+video.
+- Exit criteria: alert contains name, confidence, image, clip.
+
+Phase 5 - Multi-camera:
+- Deliverables: per-camera workers/config, health endpoints.
+- Exit criteria: at least 3 concurrent streams stable.
+
+Phase 6 - Scalability/hardening:
+- Deliverables: retries, DLQ, idempotency, tracing, load tests.
+- Exit criteria: no duplicate alerts, graceful failure handling.
+
+## System.md Template
+Use System.md (project architecture document) with these sections:
+- Overview
+- Architecture
+- Services and Responsibilities
+- Data Flow and Topics
+- API Contracts
+- Data Models and Storage
+- Configuration
+- Security and Privacy
+- Observability and Reliability
+- Development Roadmap
+- Open Decisions
+- Future Features
+- Change Log
+
+Update policy:
+- Every architecture/API/model change updates System.md in same change set.
+- Add one-line rationale in Change Log.
+
+## Future Feature Ideas
+- Unknown person alert policy engine.
+- Vehicle and license plate microservices.
+- Behavior analytics (loitering, line crossing).
+- Web dashboard and mobile push.
+- Edge deployment profile with intermittent connectivity.
+- Cloud analytics pipeline and long-term retention.
+- Federated multi-site camera management.
+
+system.md status: implementation started for Phase 1 - Minimal pipeline: camera ingest, frame publish, motion detect, event create, clip record, basic Telegram text alert.
 
 Media storage paths:
 - snapshots/{camera_id}/{event_id}.jpg
@@ -342,4 +568,4 @@ Update policy:
 - Cloud analytics pipeline and long-term retention.
 - Federated multi-site camera management.
 
-system.md status: updated this session with architecture refinements, including unified vision service consolidation and detailed comparison notes.
+system.md status: updated this session with video transport architecture, Frame Buffer Service integration, adapter pattern for IPC/gRPC migration, and MVP → growth phase evolution plan.
