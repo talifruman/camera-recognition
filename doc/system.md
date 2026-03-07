@@ -65,6 +65,36 @@ Learning-first microservices design that supports live/synthetic video, person r
 - Extensibility: Separate services make specialized stage evolution easier; unified service remains extensible when internal module contracts and extraction seams are preserved.
 - Recommendation: Use unified vision service now, with explicit extraction triggers for future split.
 
+## Comparative Analysis
+
+The architecture options discussed throughout the document can be compared along multiple dimensions:
+
+  - **Isolation**: separate services limit faults; an embedded model increases blast radius.
+  - **Scaling**: independent horizontal scaling vs. monolithic scale.
+  - **Latency**: inter-service hops add delay; shared buffers reduce it.
+  - **Operational complexity**: more components vs. simpler deployment.
+  - **Data duplication**: separate services may duplicate video ingest; unified service avoids it.
+  - **Migration**: easier to extract later if services are already independent.
+
+The clip recorder table under Detailed Comparison provides a concrete instance of this pattern, reinforcing the high‑level trade‑offs above.
+
+### Architecture Options Comparison
+
+| Criterion                  | Option A – Separate Services                          | Option B – Unified Service                            |
+|----------------------------|-------------------------------------------------------|-------------------------------------------------------|
+| Isolation                  | Strong; faults isolated to individual services        | Weak; single process failures affect all modules      |
+| Scaling                    | Independent scaling per service (CPU, GPU, I/O)       | Coupled scaling; all modules scale together           |
+| Latency                    | Higher due to inter-service communication             | Lower; in-process data flow                           |
+| Operational complexity     | Higher; more services to deploy, monitor, CI/CD       | Lower; single service deployment                      |
+| Data duplication           | Potential duplication (e.g., video ingest)             | Minimal; shared resources and buffers                 |
+| Migration                  | Easier to evolve or split services later              | Harder; requires refactoring to extract modules       |
+| Resource efficiency        | Can optimize per service; may duplicate overhead      | Efficient; shared runtime and preprocessing           |
+| Fault tolerance            | Better; process-level isolation                        | Worse; module failures can cascade                    |
+| Extensibility              | High; add/replace services independently              | Medium; add modules but extraction is complex         |
+| Development speed          | Slower initially; more coordination needed            | Faster for MVP; simpler codebase                      |
+
+**Recommendation**: Start with Option B (unified service) for simplicity and speed, but design with extraction seams for future migration to Option A as needs grow.
+
 ## Step-by-step Action Plan
 - Phase 1 - Minimal pipeline: camera ingest, frame publish, motion detect, event create, clip record, basic Telegram text alert.
 - Phase 2 - Face detection: add face localization and snapshot generation.
@@ -101,8 +131,9 @@ Core design rules:
 | - FileReplayAdapter                                           |
 | - SyntheticGeneratorAdapter                                   |
 +---------------------------------------------------------------+
-               |
-               v
+               |                       |
+               |                       |
+               v                       v
 +---------------------------------------------------------------+
 | Unified Vision Service                                        |
 |---------------------------------------------------------------|
@@ -123,6 +154,8 @@ Core design rules:
 | Clip Recording        |   | Telegram Notification       |
 | Service               |   | Service                     |
 +-----------------------+   +-----------------------------+
+| (Buffers video from   |   |
+| Camera Service)       |   |
 
 +-----------------------+
 | Storage Service       |
