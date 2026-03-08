@@ -15,6 +15,7 @@ Always use **Obra Superpowers: Brainstorming** in **Planning Mode**.
 - At the start of each task, read this file first.
 - After each brainstorming session, update this file with new decisions, constraints, or trigger refinements.
 - If nothing changed, explicitly state that this file is already up to date.
+- Load user-level skills recursively from `%USERPROFILE%\.agents\skills\` (example: `C:\Users\alexfru\.agents\skills\`) so this project works across different computers.
 
 ## Plan: Smart Camera Monitoring System
 Learning-first microservices design that supports live/synthetic video, person recognition, event clips, and Telegram alerts while staying simple to evolve.
@@ -207,6 +208,8 @@ Branch behavior:
 
 ## Sequence Diagrams: MVP Service Flow (High-Level)
 
+Note: In MVP, Frame Buffer is continuously fed by Camera Service to preserve reliable pre/post roll clip windows.
+
 ### Frame Capture & Real-Time Detection Flow
 ```mermaid
 sequenceDiagram
@@ -218,6 +221,7 @@ sequenceDiagram
 
 	loop Every 33ms (30fps)
 		CameraService->>UVService: frame (via IPC adapter)
+		CameraService->>FrameBuffer: frame (via IPC adapter)
 		
 		UVService->>UVService: motion_detect()
 		UVService->>UVService: object_detect()
@@ -225,11 +229,9 @@ sequenceDiagram
 		UVService->>UVService: face_recognize()
 		
 		alt Person Detected
-			UVService->>FrameBuffer: store_frame(timestamp)
-			FrameBuffer->>FrameBuffer: add_to_history()
 			UVService->>EventService: emit(person.identified)
 		else Motion Only
-			UVService->>FrameBuffer: store_motion_frame(timestamp)
+			UVService->>UVService: no person event
 		end
 	end
 
@@ -275,8 +277,11 @@ sequenceDiagram
 	
 	loop Parallel camera feeds
 		CameraService->>UVService: frame[camera_0]
+		CameraService->>FrameBuffer: frame[camera_0]
 		CameraService->>UVService: frame[camera_1]
+		CameraService->>FrameBuffer: frame[camera_1]
 		CameraService->>UVService: frame[camera_2]
+		CameraService->>FrameBuffer: frame[camera_2]
 	end
 	
 	UVService->>UVService: process_frame[camera_0]
@@ -284,7 +289,6 @@ sequenceDiagram
 	UVService->>UVService: process_frame[camera_2]
 	
 	alt Detection in any camera
-		UVService->>FrameBuffer: store(camera_id, frame)
 		UVService->>EventService: emit(event, camera_id)
 	end
 
