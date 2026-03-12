@@ -15,7 +15,6 @@ Always use **Obra Superpowers: Brainstorming** in **Planning Mode**.
 - At the start of each task, read this file first.
 - After each brainstorming session, update this file with new decisions, constraints, or trigger refinements.
 - If nothing changed, explicitly state that this file is already up to date.
-- Load user-level skills recursively from `%USERPROFILE%\.agents\skills\` (example: `C:\Users\alexfru\.agents\skills\`) so this project works across different computers.
 
 ## Plan: Smart Camera Monitoring System
 Learning-first microservices design that supports live/synthetic video, person recognition, event clips, and Telegram alerts while staying simple to evolve.
@@ -110,11 +109,10 @@ Control plane and data plane split:
 - Each service contains its own configuration module (file/env/secret based), no centralized configuration service.
 - Camera Service handles adapters and emits normalized frames/metadata via shared memory (MVP) or gRPC (growth).
 - Unified Vision Service consumes frames and runs internal modules: Motion Detection, Object Detection, Face Detection, and Face Recognition.
-- Frame Buffer Service maintains historical frame buffers for pre/post roll support and serves frame ranges to Clip Recording Service via gRPC.
+- Frame Buffer Service maintains historical frame buffers for pre/post roll support and serves frame ranges to Media Service via gRPC.
 - Event Service assembles canonical event record and state transitions.
-- Clip Recording Service fetches pre/post frames from Frame Buffer Service and writes event clips.
+- Media Service fetches pre/post frames from Frame Buffer Service, assembles clips, and persists media artifacts.
 - Telegram Notification Service sends rich message + media.
-- Storage Service abstracts DB and media object operations.
 - API Gateway exposes admin APIs and query APIs.
 - Observability Stack collects logs, metrics, traces.
 
@@ -124,67 +122,50 @@ Core design rules:
 - Each service independently deployable and replaceable.
 
 ## Service Diagram (Smart Camera Monitoring System)
-```text
-+---------------------------------------------------------------+
-| Camera Service                                                |
-|---------------------------------------------------------------|
-| Internal Camera Adapters (classes/modules, not a service):   |
-| - UsbCameraAdapter                                            |
-| - RtspCameraAdapter                                           |
-| - FileReplayAdapter                                           |
-| - SyntheticGeneratorAdapter                                   |
-| - IPC Adapter (shared memory) / gRPC Adapter (multi-host)    |
-+---------------------------------------------------------------+
-               |                       |
-               |                       |
-               v                       v
-+---------------------------------------------------------------+
-| Unified Vision Service                                        |
-|---------------------------------------------------------------|
-| Internal modules (not separate services):                     |
-| - Motion Detection                                            |
-| - Object Detection                                            |
-| - Face Detection                                              |
-| - Face Recognition                                            |
-| - IPC Client / gRPC Client (frame adapter)                    |
-+---------------------------------------------------------------+
-               |
-               v
-+-----------------------+
-| Event Service         |
-+-----------------------+
-          |                       |
-          v                       v
-+-----------------------+   +-----------------------------+
-| Clip Recording        |   | Telegram Notification       |
-| Service               |   | Service                     |
-+-----------------------+   +-----------------------------+
-| (Fetches video from   |   |
-| Frame Buffer Service) |   |
-| - IPC Client / gRPC   |   |
-| Client (frame adapter)|   |
+```mermaid
+flowchart TB
+	subgraph CameraService[Camera Service]
+		CA1[UsbCameraAdapter]
+		CA2[RtspCameraAdapter]
+		CA3[FileReplayAdapter]
+		CA4[SyntheticGeneratorAdapter]
+		CA5[IPC Adapter Shared Memory And Grpc Adapter Multi Host]
+	end
 
-+-----------------------+
-| Frame Buffer Service  |
-|---------------------------------------------------------------|
-| - Maintains pre/post frame history                            |
-| - Serves gRPC GetFrameRange requests from Clip Recording      |
-| - Consumes shared memory/gRPC from Camera Service             |
-+-----------------------+
-     ^            ^
-     |            |
-Camera Service   Clip Recording
+	subgraph UnifiedVision[Unified Vision Service]
+		UV1[Motion Detection]
+		UV2[Object Detection]
+		UV3[Face Detection]
+		UV4[Face Recognition]
+		UV5[IPC Client And Grpc Client Frame Adapter]
+	end
 
-+-----------------------+
-| Storage Service       |
-+-----------------------+
-     ^            ^            ^
-     |            |            |
-Unified Vision   |         Clip Recording
-Service          |
-               Event Service
-[Per-service configuration module inside each service: Camera, Unified Vision, Event, Clip, Telegram, Frame Buffer]
+	EventService[Event Service]
+
+	subgraph MediaService[Media Service Clip And Storage]
+		MS1[clip_pipeline]
+		MS2[storage_adapter]
+		MS3[IPC And Grpc Frame Client Adapter]
+	end
+
+	TelegramService[Telegram Notification Service]
+
+	subgraph FrameBuffer[Frame Buffer Service]
+		FB1[Maintains Pre And Post Frame History]
+		FB2[Serves Grpc GetFrameRange Requests From Media Service]
+		FB3[Consumes Shared Memory And Grpc From Camera Service]
+	end
+
+	CameraService --> UnifiedVision
+	CameraService --> FrameBuffer
+	UnifiedVision --> EventService
+	EventService --> MediaService
+	EventService --> TelegramService
+	MediaService --> FrameBuffer
+	FrameBuffer --> MediaService
 ```
+
+[Per-service configuration module inside each service: Camera, Unified Vision, Event, Media, Telegram, Frame Buffer]
 
 ## Data Flow Diagram
 FrameSource -> Camera Service -> {Unified Vision Service, Frame Buffer Service}
@@ -195,9 +176,9 @@ Unified Vision Service path:
 Frame Buffer Service path:
 - frame.raw (via IPC/gRPC adapter) -> maintains pre/post frame history
 
-Clip Recording path:
-- Event Service -> event.created topic -> Clip Recording Service
-- Clip Recording Service -> gRPC GetFrameRange request to Frame Buffer Service -> receives pre/post frames -> writes clip to storage
+Media path:
+- Event Service -> event.created topic -> Media Service
+- Media Service -> gRPC GetFrameRange request to Frame Buffer Service -> receives pre/post frames -> assembles clip -> writes clip + metadata
 
 Notification path:
 - Event Service -> event.clip.ready topic -> Telegram Notification Service
@@ -238,30 +219,30 @@ sequenceDiagram
 	Note over UVService,EventService: Total latency: ~150-200ms<br/>IPC: <10ms | Inference: <100ms | Redis: <50ms
 ```
 
-### Event-Triggered Clip Recording Flow
+### Event-Triggered Media Clip Flow
 ```mermaid
 sequenceDiagram
 	autonumber
 	participant EventService as Event Service<br/>(Redis Stream)
-	participant ClipRecorder as Clip Recording<br/>Service
+	participant MediaService as Media<br/>Service
 	participant FrameBuffer as Frame Buffer<br/>Service
-	participant Storage as Storage<br/>(Disk)
+	participant Disk as Media Storage<br/>(Disk/Object Store)
 
-	EventService->>ClipRecorder: event_created(camera_id, timestamp)
-	Note over ClipRecorder: Calculate window: t-1s to t+4s
+	EventService->>MediaService: event_created(camera_id, timestamp)
+	Note over MediaService: Calculate window: t-1s to t+4s
 	
-	ClipRecorder->>FrameBuffer: GetFrameRange(camera_id, t-1s, t+4s)
+	MediaService->>FrameBuffer: GetFrameRange(camera_id, t-1s, t+4s)
 	FrameBuffer->>FrameBuffer: fetch pre/post frames
-	FrameBuffer-->>ClipRecorder: frame_stream (pre+post)
+	FrameBuffer-->>MediaService: frame_stream (pre+post)
 	
-	ClipRecorder->>ClipRecorder: assemble_clip(frames)
-	ClipRecorder->>ClipRecorder: mux_video(ffmpeg)
-	ClipRecorder->>Storage: write_mp4(event_id.mp4)
-	Storage-->>ClipRecorder: ack
+	MediaService->>MediaService: assemble_clip(frames)
+	MediaService->>MediaService: mux_video(ffmpeg)
+	MediaService->>Disk: write_mp4(event_id.mp4)
+	Disk-->>MediaService: ack
 	
-	ClipRecorder->>EventService: emit(event.clip.ready)
+	MediaService->>EventService: emit(event.clip.ready)
 
-	Note over ClipRecorder,Storage: Total latency: ~250-300ms<br/>Fetch: <50ms | Mux: <200ms | Write: <50ms
+	Note over MediaService,Disk: Total latency: ~250-300ms<br/>Fetch: <50ms | Mux: <200ms | Write: <50ms
 ```
 
 ### Multi-Camera Frame Distribution
@@ -359,9 +340,8 @@ Frame Buffer Service API:
 - unified-vision-service.exe
 - frame-buffer-service.exe
 - event-service.exe
-- clip-recording-service.exe
+- media-service.exe
 - telegram-notification-service.exe
-- storage-service.exe
 - people-library-service.exe (optional if merged into face-recognition)
 
 config-service.exe is intentionally excluded; each service executable owns its configuration module.
@@ -372,14 +352,14 @@ config-service.exe is intentionally excluded; each service executable owns its c
 - Camera Service writes normalized frames to POSIX named pipe or memory-mapped file (ring buffer).
 - Unified Vision Service reads via IPC adapter (< 10ms latency).
 - Frame Buffer Service maintains ring buffer history for pre/post roll.
-- Clip Recording Service fetches pre/post frames from Frame Buffer Service via IPC adapter on event trigger.
+- Media Service fetches pre/post frames from Frame Buffer Service via IPC adapter on event trigger.
 - All services use adapters to abstract transport; core logic unchanged.
 
 **Growth (Phases 3-5): gRPC Server Streaming + Adapter Migration**
 - Camera Service implements gRPC StreamCamera alongside ring buffer.
 - Frame Buffer Service adds gRPC GetFrameRange for historical frame access.
 - Services swap IPC adapters to gRPC adapters via config change; core code unchanged.
-- Enables multi-host scaling: Unified Vision Service and Clip Recording Service can run on different hosts.
+- Enables multi-host scaling: Unified Vision Service and Media Service can run on different hosts.
 - Ring buffer decommissioned when multi-host deployment confirmed.
 
 **Adapter Pattern Benefits**
@@ -484,7 +464,7 @@ Update policy:
 - Cloud analytics pipeline and long-term retention.
 - Federated multi-site camera management.
 
-system.md status: implementation started for Phase 1 - Minimal pipeline: camera ingest, frame publish, motion detect, event create, clip record, basic Telegram text alert.
+system.md status: implementation started for Phase 1 - Minimal pipeline: camera ingest, frame publish, motion detect, event create, clip record, basic Telegram text alert. Decision update (2026-03-12): Clip Recording + Storage merged into Media Service with internal extraction seams.
 
 Media storage paths:
 - snapshots/{camera_id}/{event_id}.jpg
