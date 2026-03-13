@@ -64,7 +64,7 @@ Learning-first microservices design that supports live/synthetic video, person r
 - Resource efficiency: Separate services can right-size resources per stage but may duplicate runtime/model overhead; unified service reuses preprocessing and runtime resources.
 - Security/multi-tenancy: Separate services allow stricter per-boundary controls; unified service centralizes controls and requires careful tenant quota/isolation policy.
 - Extensibility: Separate services make specialized stage evolution easier; unified service remains extensible when internal module contracts and extraction seams are preserved.
-- Recommendation: Use unified vision service now, with explicit extraction triggers for future split.
+- Recommendation: Use image processing service now, with explicit extraction triggers for future split.
 
 ## Comparative Analysis
 
@@ -108,7 +108,7 @@ The clip recorder table under Detailed Comparison provides a concrete instance o
 Control plane and data plane split:
 - Each service contains its own configuration module (file/env/secret based), no centralized configuration service.
 - Camera Service handles adapters and emits normalized frames/metadata via shared memory (MVP) or gRPC (growth).
-- Unified Vision Service consumes frames and runs internal modules: Motion Detection, Object Detection, Face Detection, and Face Recognition.
+- Image processing service consumes frames and runs internal modules: Motion Detection, Object Detection, Face Detection, and Face Recognition.
 - Frame Buffer Service maintains historical frame buffers for pre/post roll support and serves frame ranges to Media Service via gRPC.
 - Event Service assembles canonical event record and state transitions.
 - Media Service fetches pre/post frames from Frame Buffer Service, assembles clips, and persists media artifacts.
@@ -132,7 +132,7 @@ flowchart TB
 		CA5[IPC Adapter Shared Memory And Grpc Adapter Multi Host]
 	end
 
-	subgraph UnifiedVision[Unified Vision Service]
+	subgraph ImageProcessing[Image processing service]
 		UV1[Motion Detection]
 		UV2[Object Detection]
 		UV3[Face Detection]
@@ -156,21 +156,21 @@ flowchart TB
 		FB3[Consumes Shared Memory And Grpc From Camera Service]
 	end
 
-	CameraService --> UnifiedVision
+	CameraService --> ImageProcessing
 	CameraService --> FrameBuffer
-	UnifiedVision --> EventService
+	ImageProcessing --> EventService
 	EventService --> MediaService
 	EventService --> TelegramService
 	MediaService --> FrameBuffer
 	FrameBuffer --> MediaService
 ```
 
-[Per-service configuration module inside each service: Camera, Unified Vision, Event, Media, Telegram, Frame Buffer]
+[Per-service configuration module inside each service: Camera, Image processing, Event, Media, Telegram, Frame Buffer]
 
 ## Data Flow Diagram
-FrameSource -> Camera Service -> {Unified Vision Service, Frame Buffer Service}
+FrameSource -> Camera Service -> {Image processing service, Frame Buffer Service}
 
-Unified Vision Service path:
+Image processing service path:
 - frame.raw (via IPC/gRPC adapter) -> motion -> object -> face detection -> face recognition -> person.identified topic -> Event Service -> event.created topic
 
 Frame Buffer Service path:
@@ -196,7 +196,7 @@ Note: In MVP, Frame Buffer is continuously fed by Camera Service to preserve rel
 sequenceDiagram
 	autonumber
 	participant CameraService as Camera Service<br/>(RTSP Ingest)
-	participant UVService as Unified Vision<br/>Service
+	participant UVService as Image processing<br/>service
 	participant FrameBuffer as Frame Buffer<br/>Service
 	participant EventService as Event Service<br/>(Redis Streams)
 
@@ -250,7 +250,7 @@ sequenceDiagram
 sequenceDiagram
 	autonumber
 	participant CameraService as Camera Service<br/>(Multi-Camera)
-	participant UVService as Unified Vision<br/>Service
+	participant UVService as Image processing<br/>service
 	participant FrameBuffer as Frame Buffer<br/>Service
 	participant EventService as Event Service<br/>(Events)
 
@@ -337,7 +337,7 @@ Frame Buffer Service API:
 ## Service Executables (No Central Config Service)
 - api-gateway.exe
 - camera-service.exe
-- unified-vision-service.exe
+- image-processing-service.exe
 - frame-buffer-service.exe
 - event-service.exe
 - media-service.exe
@@ -350,7 +350,7 @@ config-service.exe is intentionally excluded; each service executable owns its c
 
 **MVP (Phases 1-2): Shared In-Host Ring Buffer + IPC Adapters**
 - Camera Service writes normalized frames to POSIX named pipe or memory-mapped file (ring buffer).
-- Unified Vision Service reads via IPC adapter (< 10ms latency).
+- Image processing service reads via IPC adapter (< 10ms latency).
 - Frame Buffer Service maintains ring buffer history for pre/post roll.
 - Media Service fetches pre/post frames from Frame Buffer Service via IPC adapter on event trigger.
 - All services use adapters to abstract transport; core logic unchanged.
@@ -359,7 +359,7 @@ config-service.exe is intentionally excluded; each service executable owns its c
 - Camera Service implements gRPC StreamCamera alongside ring buffer.
 - Frame Buffer Service adds gRPC GetFrameRange for historical frame access.
 - Services swap IPC adapters to gRPC adapters via config change; core code unchanged.
-- Enables multi-host scaling: Unified Vision Service and Media Service can run on different hosts.
+- Enables multi-host scaling: Image processing service and Media Service can run on different hosts.
 - Ring buffer decommissioned when multi-host deployment confirmed.
 
 **Adapter Pattern Benefits**

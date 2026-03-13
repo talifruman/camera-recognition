@@ -4,7 +4,7 @@
 
 **Goal:** Merge Clip Recording and Storage into a unified Media Service in documentation, reducing streaming overhead while preserving future extraction seams.
 
-**Architecture:** Replace the external Clip Recording -> Storage hop with a single Media Service that contains internal clip pipeline and storage adapter modules. Keep Frame Buffer, Event Service, and Unified Vision boundaries unchanged, and retain event topic compatibility.
+**Architecture:** Replace the external Clip Recording -> Storage hop with a single Media Service that contains internal clip pipeline and storage adapter modules. Keep Frame Buffer, Event Service, and Image processing service boundaries unchanged, and retain event topic compatibility.
 
 **Tech Stack:** Markdown documentation, Mermaid sequence diagrams, architecture decision records in system.md.
 
