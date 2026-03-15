@@ -107,7 +107,7 @@ The clip recorder table under Detailed Comparison provides a concrete instance o
 ## Full System Architecture
 Control plane and data plane split:
 - Each service contains its own configuration module (file/env/secret based), no centralized configuration service.
-- Camera Service handles adapters and emits normalized frames/metadata via shared memory (MVP) or gRPC (growth).
+- Camera Service handles adapters and emits normalized frames/metadata via gRPC.
 - Image processing service consumes frames and runs internal modules: Motion Detection, Object Detection, Face Detection, and Face Recognition.
 - Frame Buffer Service maintains historical frame buffers for pre/post roll support and serves frame ranges to Media Service via gRPC.
 - Event Service assembles canonical event record and state transitions.
@@ -129,7 +129,7 @@ flowchart TB
 		CA2[RtspCameraAdapter]
 		CA3[FileReplayAdapter]
 		CA4[SyntheticGeneratorAdapter]
-		CA5[IPC Adapter Shared Memory And Grpc Adapter Multi Host]
+		CA5[gRPC Adapter Multi Host]
 	end
 
 	subgraph ImageProcessing[Image processing service]
@@ -137,7 +137,7 @@ flowchart TB
 		UV2[Object Detection]
 		UV3[Face Detection]
 		UV4[Face Recognition]
-		UV5[IPC Client And Grpc Client Frame Adapter]
+		UV5[gRPC Client Frame Adapter]
 	end
 
 	EventService[Event Service]
@@ -145,7 +145,7 @@ flowchart TB
 	subgraph MediaService[Media Service Clip And Storage]
 		MS1[clip_pipeline]
 		MS2[storage_adapter]
-		MS3[IPC And Grpc Frame Client Adapter]
+		MS3[gRPC Frame Client Adapter]
 	end
 
 	TelegramService[Telegram Notification Service]
@@ -153,7 +153,7 @@ flowchart TB
 	subgraph FrameBuffer[Frame Buffer Service]
 		FB1[Maintains Pre And Post Frame History]
 		FB2[Serves Grpc GetFrameRange Requests From Media Service]
-		FB3[Consumes Shared Memory And Grpc From Camera Service]
+		FB3[Consumes gRPC From Camera Service]
 	end
 
 	CameraService --> ImageProcessing
@@ -171,10 +171,10 @@ flowchart TB
 FrameSource -> Camera Service -> {Image processing service, Frame Buffer Service}
 
 Image processing service path:
-- frame.raw (via IPC/gRPC adapter) -> motion -> object -> face detection -> face recognition -> person.identified topic -> Event Service -> event.created topic
+- frame.raw (via gRPC adapter) -> motion -> object -> face detection -> face recognition -> person.identified topic -> Event Service -> event.created topic
 
 Frame Buffer Service path:
-- frame.raw (via IPC/gRPC adapter) -> maintains pre/post frame history
+- frame.raw (via gRPC adapter) -> maintains pre/post frame history
 
 Media path:
 - Event Service -> event.created topic -> Media Service
@@ -183,10 +183,10 @@ Media path:
 Notification path:
 - Event Service -> event.clip.ready topic -> Telegram Notification Service
 
-Branch behavior:
-- No person detected: optionally store motion event only (configurable).
+- Branch behavior:
+- No person detected: optionally record motion-only metadata or snapshot (configurable); Motion Detection itself does not publish system events.
 - Unknown face: create unknown event with confidence and optional alert policy.
-
+Unknown face: create unknown event with confidence and optional alert policy.
 ## Sequence Diagrams: MVP Service Flow (High-Level)
 
 Note: In MVP, Frame Buffer is continuously fed by Camera Service to preserve reliable pre/post roll clip windows.
@@ -201,8 +201,8 @@ sequenceDiagram
 	participant EventService as Event Service<br/>(Redis Streams)
 
 	loop Every 33ms (30fps)
-		CameraService->>UVService: frame (via IPC adapter)
-		CameraService->>FrameBuffer: frame (via IPC adapter)
+		CameraService->>UVService: frame (via gRPC adapter)
+		CameraService->>FrameBuffer: frame (via gRPC adapter)
 		
 		UVService->>UVService: motion_detect()
 		UVService->>UVService: object_detect()
@@ -216,7 +216,7 @@ sequenceDiagram
 		end
 	end
 
-	Note over UVService,EventService: Total latency: ~150-200ms<br/>IPC: <10ms | Inference: <100ms | Redis: <50ms
+	Note over UVService,EventService: Total latency: ~150-200ms<br/>gRPC: <10ms | Inference: <100ms | Redis: <50ms
 ```
 
 ### Event-Triggered Media Clip Flow
@@ -330,9 +330,9 @@ Telegram Notification API:
 - Internal subscriber on event.ready_for_notify
 
 Frame Buffer Service API:
-- gRPC StreamCamera(camera_id, adapter_type): stream CameraFrame (MVP uses IPC adapter, growth uses gRPC adapter)
+- gRPC StreamCamera(camera_id, adapter_type): stream CameraFrame (gRPC streaming transport)
 - gRPC GetFrameRange(camera_id, start_timestamp, end_timestamp): returns frame series for clip construction
-- Supports adapter pattern: IPC (shared memory via named pipe/mmap) for MVP, gRPC for multi-host growth phase
+- Supports adapter pattern: gRPC adapters for transport and history access
 
 ## Service Executables (No Central Config Service)
 - api-gateway.exe
@@ -348,24 +348,23 @@ config-service.exe is intentionally excluded; each service executable owns its c
 
 ## Video Transport Architecture (MVP → Growth)
 
-**MVP (Phases 1-2): Shared In-Host Ring Buffer + IPC Adapters**
-- Camera Service writes normalized frames to POSIX named pipe or memory-mapped file (ring buffer).
-- Image processing service reads via IPC adapter (< 10ms latency).
-- Frame Buffer Service maintains ring buffer history for pre/post roll.
-- Media Service fetches pre/post frames from Frame Buffer Service via IPC adapter on event trigger.
-- All services use adapters to abstract transport; core logic unchanged.
 
-**Growth (Phases 3-5): gRPC Server Streaming + Adapter Migration**
-- Camera Service implements gRPC StreamCamera alongside ring buffer.
-- Frame Buffer Service adds gRPC GetFrameRange for historical frame access.
-- Services swap IPC adapters to gRPC adapters via config change; core code unchanged.
+**MVP (Phases 1-2): gRPC Streaming Adapters**
+- Camera Service implements gRPC StreamCamera to stream normalized frames.
+- Image processing service consumes frames via gRPC streaming (typical low-latency on local network).
+- Frame Buffer Service maintains pre/post frame history accessible via gRPC GetFrameRange.
+- Media Service fetches pre/post frames from Frame Buffer Service via gRPC on event trigger.
+- All services use gRPC adapters to abstract transport; core logic unchanged.
+
+**Growth (Phases 3-5): gRPC Server Streaming Scale-Up**
+- Camera Service and other services continue to use gRPC streaming; the architecture scales by adding instances and partitioning streams.
+- Frame history and retrieval remain available via gRPC; only gRPC transport is used.
 - Enables multi-host scaling: Image processing service and Media Service can run on different hosts.
-- Ring buffer decommissioned when multi-host deployment confirmed.
 
 **Adapter Pattern Benefits**
 - Isolates transport mechanism from business logic (frame processing, clipping, events).
 - Enables seamless MVP → growth migration without core service refactoring.
-- Supports A/B testing of IPC vs. gRPC performance during transition.
+- Supports A/B testing of transport performance during transition.
 
 ## Database Schema (logical)
 Tables:
@@ -413,7 +412,7 @@ Observability:
 ## Development Roadmap
 Phase 1 - Minimal pipeline:
 - Deliverables: adapter abstraction, one camera source, motion detection, event creation, local clip.
-- Exit criteria: motion event produces stored snapshot+clip.
+- Exit criteria: motion-triggered snapshot+clip stored; event generation occurs only after downstream analysis (object/face/identity).
 
 Phase 2 - Face detection:
 - Deliverables: face crop extraction and event attachment.
@@ -501,7 +500,7 @@ Observability:
 ## Development Roadmap
 Phase 1 - Minimal pipeline:
 - Deliverables: adapter abstraction, one camera source, motion detection, event creation, local clip.
-- Exit criteria: motion event produces stored snapshot+clip.
+- Exit criteria: motion-triggered snapshot+clip stored; event generation occurs only after downstream analysis (object/face/identity).
 
 Phase 2 - Face detection:
 - Deliverables: face crop extraction and event attachment.
@@ -552,4 +551,4 @@ Update policy:
 - Cloud analytics pipeline and long-term retention.
 - Federated multi-site camera management.
 
-system.md status: updated this session with video transport architecture, Frame Buffer Service integration, adapter pattern for IPC/gRPC migration, and MVP → growth phase evolution plan.
+system.md status: updated this session with video transport architecture, Frame Buffer Service integration, adapter pattern for gRPC migration, and MVP → growth phase evolution plan.
