@@ -1,254 +1,252 @@
-adapter.start()
-
 # Frame Adapter
 
 ## Purpose
-The Frame Adapter is a robust, source-agnostic component that ingests frames from external sources (e.g., RTSP cameras, video files), decodes and normalizes them, attaches canonical metadata, and emits standardized `FramePacket` objects into the Image Processing Service (IPS) pipeline.
+The Frame Adapter in IPS is a gRPC client adapter. It receives frames from the Camera Service gRPC stream, validates ingress fields, and builds canonical `FramePacket` objects for IPS.
+
+IPS does not connect directly to cameras. RTSP/USB/file connectivity and camera-side stream handling belong to Camera Service.
 
 ## Architectural Role
-The Frame Adapter is responsible for:
-- Receiving frames from a configured source (RTSP, file, etc.).
-- Decoding or extracting raw pixel buffers as needed.
-- Populating the canonical `FramePacket` fields (timestamp, camera_id, resolution, format, pixel data).
-- Attaching metadata (source URI, codec, sequence ids) and pipeline control flags.
-- Emitting metrics/diagnostics: frames_in, frames_dropped, reconnects, ingest_latency_ms.
-- Respecting backpressure (bounded handoff queue) and applying a configurable drop policy.
+The Frame Adapter is composed of two focused classes wired together by a thin coordinator:
+
+**`FrameReceiver`** - ingress and parsing only:
+- Receives frame messages from Camera Service over gRPC stream.
+- Parses ingress transport messages and validates required fields.
+- Populates canonical `FramePacket` fields (`frame_id`, `camera_id`, `timestamp_ms`, `width`, `height`, `pixel_format`, `num_color_channels`, `bits_per_pixel`, `image_bytes`, `metadata`).
+- Emits metrics: `frames_in_total`, `adapter_reconnects_total`, `ingest_latency_ms`.
+- Calls a single callback with each new `FramePacket` (`FrameStore.store_or_replace`).
+
+**`FrameStore`** - latest-frame-per-camera storage only:
+- Owns in-memory storage with exactly one slot per `camera_id`.
+- Exposes `store_or_replace(frame_packet)` as callback target for `FrameReceiver`.
+- Replaces any older frame currently stored for the same camera with the newest frame.
+- Exposes `get_next_frame()` to return one frame in round-robin camera order.
+- Does not invoke downstream consumers directly.
+- Emits metrics: `frames_overwritten_total`, `active_camera_slots`, `frames_served_total`.
+
+**`GrpcClientFrameAdapter`** - thin coordinator (public-facing):
+- Instantiates and wires `FrameReceiver` and `FrameStore`.
+- Exposes unchanged adapter lifecycle API (`configure`, `start`, `stop`, `health`).
+- Exposes `get_next_frame()` by delegating to `FrameStore`.
 
 **Key Principle:**
-The Frame Adapter normalizes all heterogeneous camera or file inputs to a single, in-process data model (`FramePacket`). It does not perform algorithm-specific image transformations; those are handled by the Frame Transformation Layer.
+Camera Service sends raw frame payload only. Frame Adapter does not decode or transcode ingress payloads. It always keeps only the newest frame per camera.
 
-## Supported Input Types
-- RTSP camera streams (live cameras)
-- Video file sources (testing/offline)
+**Responsibility Boundary:**
+`FrameReceiver` handles ingress parsing and packet creation. `FrameStore` handles latest-frame storage and retrieval only. Neither class performs downstream image processing.
+
+## Supported Ingress Contract
+- gRPC streaming messages from Camera Service only.
+- Required ingress fields: `frame_id`, `camera_id`, `timestamp_ms`, `width`, `height`, `pixel_format`, `num_color_channels`, `bits_per_pixel`, raw payload bytes.
+- Encoded/compressed payload ingress is out of scope for this contract.
 
 ## Base Interface: `FrameAdapter`
 All concrete adapters implement the following conceptual interface:
-- `start()` — Non-blocking. Allocates resources and starts capture/processing threads or async loops. Returns quickly; errors are reported via status/metrics or exceptions during initialization.
-- `stop()` — Graceful shutdown: stop capture loop, drain handoff queue (configurable), release decoders and network handles.
-- `configure(config: FrameAdapterConfig)` — Provide adapter-specific configuration (URI, camera_id, queue sizes, decoder options).
-- `register_consumer(callable)` — Supply a callback or pipeline ingest function to receive `FramePacket` objects. Alternatively, adapters may push into a shared `PipelineOrchestrator.ingest_frame()` API.
-- `health() -> AdapterHealth` — Optional health/status report for monitoring.
+- `start()` - Non-blocking. Allocates resources and starts gRPC receive loop.
+- `stop()` - Graceful shutdown: stop receive loop, stop storage access, close stream and network handles.
+- `configure(config: FrameAdapterConfig)` - Provide adapter configuration (service endpoint, stream name, filters, storage and retry options).
+- `get_next_frame() -> FramePacket | None` - Return next frame in round-robin camera order, or `None` if no frame is available.
+- `health() -> AdapterHealth` - Optional health/status report for monitoring.
 
 **Concurrency Model:**
-Single capture thread (or async task) performs I/O and decoding, then enqueues `FramePacket` objects to a bounded in-memory handoff queue. A short-lived worker drains the queue and calls the registered consumer. This decouples network/decoder jitter from pipeline processing.
+`FrameReceiver` runs a single gRPC receive thread (or async task). For each message it builds a `FramePacket` and calls `FrameStore.store_or_replace(packet)`.
 
-**Queue Sizing:**
-Configurable `max_queue_size`. Backpressure policy: `drop_oldest` (recommended) or `drop_newest`.
+`FrameStore` is passive. It stores one latest frame per camera key and exposes `get_next_frame()` for pull-based retrieval. Each call to `get_next_frame()` returns the next available camera slot in round-robin order using the fixed configured camera list order: camera 1, camera 2, ..., camera N, then back to camera 1.
 
-## Example Implementations
+**Round-Robin Retrieval Rule:**
+- Camera traversal order is fixed by configured camera list order.
+- If a camera slot has no new frame, skip it and continue to next camera.
+- The internal cursor advances across calls and resumes from the next camera after each returned frame.
+- Returning a frame marks that camera slot as consumed until a new frame arrives.
+- If all configured camera slots are empty, `get_next_frame()` returns `None` immediately.
 
-### RTSPFrameAdapter
-- Connects to an RTSP URI, reads encoded frames, decodes to raw pixels, and emits `FramePacket` at the stream rate.
-- Uses robust decoding stack (GStreamer, FFmpeg/PyAV). For prototyping, OpenCV `cv2.VideoCapture(rtsp_uri)` is acceptable.
-- Parses stream metadata (fps, resolution, codec). Uses PTS (presentation timestamp) as authoritative timestamp when available.
-- Timestamping fallback: PTS from stream > camera-supplied timestamp > local receive time.
-- Prefer hardware-accelerated decoders where available.
-- Normalizes decoder output to BGR (default for downstream modules).
-- Handles reconnects with exponential backoff. Emits health/error events on fatal error.
-- Applies drop policy if handoff queue is full.
+**Storage Sizing:**
+Storage capacity is proportional to active camera count: one frame slot per camera. With 5 active cameras, maximum retained frames is 5.
 
-**Configuration Example:**
+**Lifecycle Ordering:**
+- `start()`: start `FrameStore`, then `FrameReceiver`.
+- `stop()`: stop `FrameReceiver`, then `FrameStore`.
+
+## IPS Core Implementation
+
+### FrameReceiver
+Pure ingress component. No storage or consumer logic.
+
+- Connects to Camera Service gRPC streaming endpoint and receives frame messages.
+- Parses envelope and metadata (`frame_id`, `camera_id`, `timestamp_ms`, `width`, `height`, `pixel_format`, `num_color_channels`, `bits_per_pixel`).
+- Creates `FramePacket` from raw ingress payload without altering representation.
+- Handles stream reconnect with exponential backoff.
+- Calls `FrameStore.store_or_replace` for each frame.
+
+**Interface:**
+- `set_on_frame(callback)`
+- `start()` / `stop()`
+- `health() -> ReceiverHealth`
+
+**Metrics owned:** `frames_in_total`, `ingest_latency_ms`, `adapter_reconnects_total`.
+
+**Configuration fields owned:**
 ```yaml
-adapter_type: rtsp
-camera_id: cam-123
-uri: rtsp://10.0.0.5/stream
-decoder: ffmpeg
-max_queue_size: 8
-drop_policy: drop_oldest
+camera_service_endpoint: camera-service:50051
+stream_name: frames
 reconnect:
   max_retries: 0    # 0 == infinite
   base_backoff_ms: 500
   max_backoff_ms: 10000
 ```
 
-### VideoFileFrameAdapter
-- Reads video frames from disk for testing and offline analysis, producing deterministic timestamps and optional looped playback.
-- Uses OpenCV `VideoCapture(file)` or PyAV/FFmpeg for better timestamp fidelity.
-- Derives per-frame timestamp as: file_start_epoch_ms + round(frame_index * (1000 / fps)).
-- Supports playback options: `loop`, `playback_rate`, `start_time`, `end_time`.
+---
 
-**Configuration Example:**
+### FrameStore
+Pure latest-frame storage and retrieval. No gRPC parsing.
+
+- Exposes `store_or_replace(frame_packet)` entry point.
+- Stores exactly one latest frame per camera key (`camera_id`).
+- Overwrites the previously stored frame for the same camera on every new arrival.
+- Exposes `get_next_frame()` for round-robin pull retrieval.
+- Does not execute downstream callbacks.
+
+**Interface:**
+- `store_or_replace(frame_packet: FramePacket)`
+- `get_next_frame() -> FramePacket | None`
+- `start()` / `stop()`
+- `health() -> StoreHealth`
+
+**Metrics owned:** `frames_overwritten_total`, `active_camera_slots`, `frames_served_total`.
+
+**Configuration fields owned:**
 ```yaml
-adapter_type: file
-camera_id: cam-test
-path: /data/test_clip.mp4
-loop: false
-playback_rate: 1.0
-max_queue_size: 16
+max_camera_slots: 128
+camera_order_source: configured_list
 ```
-
-## Frame Object: `FramePacket`
-This is the canonical in-process frame model used by the IPS pipeline.
-
-```python
-from dataclasses import dataclass
-from typing import Optional, Dict
-
-@dataclass(frozen=True)
-class FramePacket:
-    frame_id: str           # UUID v4 string
-    camera_id: str
-    timestamp_ms: int      # epoch milliseconds
-    width: int
-    height: int
-    format: str            # e.g., 'BGR', 'RGB', 'JPEG'
-    image_bytes: bytes     # raw BGR bytes (row-major) OR encoded bytes if chosen
-    metadata: Dict[str, str]
-    pipeline_flags: Dict[str, bool]
-    # In-process implementations MAY also carry a numpy.ndarray for speed, but the serializable contract uses bytes.
-```
-
-**Adapter Conversion Rules:**
-- Decoded frames should be normalized to `format='BGR'` and `image_bytes` containing contiguous row-major BGR pixel bytes.
-- Populate `width`/`height` from decoder output; validate these match the byte length.
-- `frame_id` must be unique (UUID). `camera_id` comes from adapter config.
-- `metadata` should include `source_uri`, `codec`, `stream_seq` (optional), and original timestamp source.
-
-## Communication and Integration
-
-**Camera Service:**
-- May host its own adapters and push normalized frames to IPS over gRPC; or IPS may run adapters directly (pull from RTSP).
-- In-process: adapter directly calls `PipelineOrchestrator.ingest_frame(frame_packet)`.
-- Remote: Camera Service streams `Frame` protobuf messages; a gRPC client adapter decodes/normalizes them to `FramePacket`.
-
-**Image Processing Pipeline:**
-- The adapter hands frames to the pipeline via a small, stable API: `ingest_frame(frame: FramePacket) -> bool` (return indicates accepted/dropped). A shared, bounded queue decouples producer and consumer.
-
-**Initialization:**
-1. Configuration loader reads camera-specific adapter configs (URI, camera_id, adapter_type).
-2. `FrameAdapterFactory.create(adapter_config)` instantiates the requested adapter class.
-3. The adapter registers the pipeline consumer callback (e.g., `PipelineOrchestrator.ingest_frame`).
-4. Call `adapter.start()` which spins the capture and decode loop and returns immediately.
-5. Monitoring registers adapter health metrics; metrics exported (Prometheus, logs).
-
-**Example Registration:**
-```python
-adapter = FrameAdapterFactory.create(config)
-adapter.register_consumer(pipeline.ingest_frame)
-adapter.start()
-```
-
-## Implementation Notes
-- Prototyping: OpenCV (cv2.VideoCapture)
-- Production decoding: PyAV (FFmpeg bindings) or GStreamer (for complex pipelines and hardware acceleration).
-- Unit tests: use `VideoFileFrameAdapter` with short synthetic clips; assert `FramePacket` fields and timestamps.
-- Integration tests: `rtsp-simple-server` as local RTSP source to validate reconnect and backpressure behavior.
-- Metrics: `frames_in_total`, `frames_dropped_total`, `ingest_latency_ms`, `adapter_reconnects_total`.
-- Security: Secure RTSP via SRTP/HTTPS tunneling where supported.
-- Always use bounded queues and cap frames retained in-memory.
-- Validate and limit resolution to configured maximums to prevent OOM from malicious or misconfigured cameras.
-
-## Verification Checklist
-- [ ] `VideoFileFrameAdapter` unit test exists and passes.
-- [ ] `RTSPFrameAdapter` reconnect behavior validated against local RTSP server.
-- [ ] Metrics are emitted and visible in dev environment.
-- [ ] Drop policy tested under simulated slow pipeline (sleeping consumer).
 
 ---
 
-# Frame Transformation Layer (Integration Overview)
+### GrpcClientFrameAdapter (IPS coordinator)
+Thin coordinator. Creates and wires `FrameReceiver` + `FrameStore`.
 
-## Purpose
-The Frame Transformation Layer is an internal component that sits between the Frame Adapter and all downstream algorithm modules. It is responsible for converting heterogeneous camera-native formats into the exact working representations required by each algorithm.
+- `configure(config)` forwards relevant fields to `FrameReceiver` and `FrameStore`.
+- `start()` calls `FrameStore.start()` then `FrameReceiver.start()` and wires `FrameStore.store_or_replace` as receiver callback.
+- `get_next_frame()` delegates to `FrameStore.get_next_frame()`.
+- `stop()` calls `FrameReceiver.stop()` then `FrameStore.stop()`.
+- `health()` aggregates `ReceiverHealth` + `StoreHealth` into `AdapterHealth`.
 
-## Responsibilities
-- Receives raw frames (`FramePacket`) from the gRPC Client Frame Adapter.
-- Accepts heterogeneous image formats (BGR, RGB, grayscale, infrared, different bit depths, compressed, etc.).
-- Inspects canonical metadata (width, height, pixel_format, channels, bits_per_pixel, etc.).
-- Decodes payloads if necessary.
-- Converts the image into the exact working representation required by downstream algorithms.
-- Provides module-specific image views so algorithms do not need to support every camera-native format directly.
+**Full Configuration Example:**
+```yaml
+adapter_type: grpc_client
+camera_service_endpoint: camera-service:50051
+stream_name: frames
+max_camera_slots: 128
+camera_order_source: configured_list
+reconnect:
+  max_retries: 0    # 0 == infinite
+  base_backoff_ms: 500
+  max_backoff_ms: 10000
+```
 
-**Architectural Rule:**
-Downstream algorithms must not be required to support all camera-native formats. The Frame Transformation Layer provides normalized, algorithm-specific inputs.
+## Frame Object: `FramePacket`
+Canonical in-process frame model used by IPS pipeline.
 
-## Algorithm Input Format Specifications
+```python
+from dataclasses import dataclass
+from typing import Any, Dict
 
-### Motion Detection
-- Input: Grayscale (single-channel intensity)
-- Color Format: Grayscale (luma channel)
-- Bit Depth: 8 bits per pixel
-- Resolution: Downscaled to 640×360 (or configurable)
-- Preprocessing: Optional Gaussian blur or denoising before motion comparison
 
-### Object Detection
-- Input: RGB image as tensor
-- Color Format: RGB
-- Bit Depth: 8 bits per channel
-- Resolution: Resized to model input size (e.g., 640×640)
-- Preprocessing: Resize, normalization (e.g., [0,1] or mean/std), optional letterboxing
+@dataclass
+class FramePacket:
+    frame_id: str           # provided by Camera Service ingress
+    camera_id: str
+    timestamp_ms: int       # epoch milliseconds
+    width: int
+    height: int
+    pixel_format: str       # e.g., 'RGB', 'BGR', 'GRAY8', 'YUV420'
+    num_color_channels: int
+    bits_per_pixel: int
+    image_bytes: bytes      # raw ingress payload bytes only
+    metadata: Dict[str, Any]
+```
 
-### Face Detection
-- Input: RGB or BGR image
-- Color Format: RGB or BGR (as required by the model)
-- Bit Depth: 8 bits per channel
-- Resolution: Full frame or region of interest (ROI), typically not upscaled
-- Preprocessing: Resize to model input size if required
+**Mutability Strategy:**
+- `FramePacket` carries ingest/core fields produced by adapter.
+- Raw payload fields are immutable by policy after creation.
 
-### Face Recognition
-- Input: Aligned face crop as tensor
-- Color Format: RGB
-- Bit Depth: 8 bits per channel
-- Resolution: Model-specific (e.g., 112×112)
-- Preprocessing: Face alignment, crop, normalization (e.g., [0,1] or mean/std)
+**Adapter Conversion Rules:**
+- Preserve ingress representation; do not decode or transcode in Frame Adapter.
+- Populate `width`, `height`, `pixel_format`, `num_color_channels`, `bits_per_pixel` from ingress metadata.
+- Validate metadata consistency against payload expectations when possible.
+- `frame_id` and `camera_id` come from Camera Service ingress and are mandatory.
 
-## Frame Transformation Flow
-1. **Receive raw frame** from the gRPC Client Frame Adapter as a `FramePacket` (metadata + payload).
-2. **Inspect metadata and source format** (width, height, pixel_format, channels, bits_per_pixel, compression, etc.).
-3. **Decode payload** if compressed or encoded.
-4. **Generate algorithm-specific representations**:
-   - Grayscale, resized, blurred for Motion Detection
-   - RGB tensor, resized, normalized for Object Detection
-   - RGB/BGR, full frame or ROI for Face Detection
-   - Aligned, cropped, normalized RGB tensor for Face Recognition
-5. **Provide those representations** to pipeline modules, ensuring each receives only its required format.
+## Communication and Integration
 
-## Conceptual Data Flow Diagram
+- Frame Adapter receives gRPC frame messages from Camera Service.
+- FrameStore stores latest available frame per camera.
+- IPS pipeline (or coordinator loop) calls `get_next_frame()` to pull frames in round-robin order.
 
-Camera
-    ↓
-gRPC Client Frame Adapter
-    ↓
-FramePacket (metadata + payload)
-    ↓
-**Frame Transformation Layer**
-    ↓
-- Motion Detection (grayscale, resized, blurred)
-- Object Detection (RGB tensor, resized, normalized)
-- Face Detection (RGB/BGR, full frame or ROI)
-- Face Recognition (aligned face crop, normalized tensor)
+**Initialization:**
+1. Config loader reads adapter config (`camera_service_endpoint`, `stream_name`, storage/retry options).
+2. `FrameAdapterFactory.create(adapter_config)` instantiates gRPC client adapter.
+3. Call `adapter.start()` to start receiver and store.
+4. Processing loop pulls frames:
+
+```python
+adapter.start()
+
+while running:
+    frame = adapter.get_next_frame()
+    if frame is None:
+        continue
+    process_frame(frame)
+```
+
+## Implementation Notes
+- Camera ingestion inside IPS is gRPC-only.
+- Ingress payload is raw-only; encoded/compressed ingress is rejected.
+- Stream reconnect uses bounded exponential backoff (`FrameReceiver`).
+- `FrameStore` intentionally overwrites stale frames for same camera.
+- Retrieval order is round-robin across cameras using fixed configured camera list order.
+- Unit tests for `FrameStore`: overwrite semantics, round-robin order, per-camera isolation, max slot bounds.
+
+## Verification Checklist
+
+**`FrameReceiver`**
+- [ ] Unit tests pass: gRPC parsing, `FramePacket` mapping, timestamp handling.
+- [ ] Reconnect with exponential backoff validated.
+- [ ] Ingress mapping validated (`frame_id`, `camera_id`, `pixel_format`, `num_color_channels`, `bits_per_pixel`).
+
+**`FrameStore`**
+- [ ] One-slot-per-camera behavior validated.
+- [ ] With 5 active cameras, retained frames never exceed 5.
+- [ ] New frame for camera replaces prior stored frame for same camera.
+- [ ] `get_next_frame()` returns frames in round-robin fixed configured camera order.
+- [ ] Overwrite on camera A does not affect camera B.
+- [ ] `FrameStore` does not invoke downstream consumers; retrieval is pull-only via `get_next_frame()`.
+
+**`GrpcClientFrameAdapter`**
+- [ ] Integration test: end-to-end frame flow via pull-based `get_next_frame()`.
 
 ## Design Goals
-- Support all camera-native formats without burdening algorithms.
-- Algorithms operate on stable, normalized internal representations.
-- Image conversions are performed once per frame, only as needed.
-- Each algorithm explicitly declares its required input format.
-- Separation of concerns improves maintainability and simplifies algorithm development.
+- Clear separation: `FrameReceiver` owns ingress; `FrameStore` owns latest-frame storage and retrieval.
+- Always prefer newest frame per camera over backlog processing.
+- Bound memory by camera count (one frame per camera).
+- Round-robin fairness across cameras in retrieval order.
 
 ---
 
 ## Appendix: Minimal FramePacket Conversion Example (Python)
 ```python
-import time, uuid
-def decoded_frame_to_framepacket(camera_id, decoded_ndarray, src_meta):
-    h, w = decoded_ndarray.shape[:2]
-    frame_id = str(uuid.uuid4())
-    timestamp_ms = src_meta.get('pts_ms') or int(time.time() * 1000)
-    # Convert to contiguous BGR bytes
-    image_bytes = decoded_ndarray.tobytes()
+import time
+
+
+def ingress_to_framepacket(payload_bytes, src_meta):
     return FramePacket(
-        frame_id=frame_id,
-        camera_id=camera_id,
-        timestamp_ms=timestamp_ms,
-        width=w,
-        height=h,
-        format='BGR',
-        image_bytes=image_bytes,
+        frame_id=src_meta["frame_id"],
+        camera_id=src_meta["camera_id"],
+        timestamp_ms=src_meta.get("pts_ms") or int(time.time() * 1000),
+        width=src_meta["width"],
+        height=src_meta["height"],
+        pixel_format=src_meta["pixel_format"],
+        num_color_channels=src_meta["num_color_channels"],
+        bits_per_pixel=src_meta["bits_per_pixel"],
+        image_bytes=payload_bytes,
         metadata=src_meta,
-        pipeline_flags={'skip_remaining': False}
     )
 ```
-
----
-
-Document created by architecture working notes; implementors should adapt low-level APIs for chosen language and runtime (Python/C++/Go). Submit PRs for code + unit tests that exercise the behavior described here.

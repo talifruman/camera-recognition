@@ -4,11 +4,12 @@ def build_pipeline(config):
 
 ## Overview
 
-The Image Processing Service (IPS) ingests frames from the Camera Service, normalizes them into a canonical `FramePacket`, runs deterministic processing modules (motion, object, face, identity), and emits structured events to downstream services.
+The Image Processing Service (IPS) ingests frames from the Camera Service, normalizes them into a canonical `FramePacket`, exposes an internal Frame Transformation Layer for algorithm-specific data preparation, runs deterministic processing modules (motion, object, face, identity), and emits structured events to downstream services.
 
 ## Responsibilities
 
 - Ingest frames via gRPC and normalize into `FramePacket`.
+- Provide a pull-based internal transformation layer that converts immutable `FramePacket` input into algorithm-specific working representations.
 - Execute pipeline modules in deterministic order and attach results to `FramePacket`.
 - Publish structured events to the Event Service according to configured rules.
 - Expose diagnostics and pipeline tracing for observability.
@@ -33,6 +34,7 @@ flowchart TB
 
     subgraph ImageProcessing[Image Processing Service]
         FA[Frame Adapter]
+      FTL[Frame Transformation Layer]
         PO[Pipeline Orchestrator]
         MD[Motion Detection]
         OD[Object Detection]
@@ -43,10 +45,25 @@ flowchart TB
 
     EventService[Event Service]
 
-    CameraService --> FA --> PO
-    PO --> MD --> OD --> FD --> IR --> EP
+  CameraService --> FA --> PO
+  MD -. requests representations .-> FTL
+  OD -. requests representations .-> FTL
+  FD -. requests representations .-> FTL
+  IR -. requests representations .-> FTL
+  PO --> MD --> OD --> FD --> IR --> EP
     EP --> EventService
 ```
+
+## Internal Data Preparation
+
+IPS includes an internal Frame Transformation Layer that sits alongside the processing modules.
+
+- The Frame Adapter remains responsible for ingress parsing and canonical `FramePacket` creation.
+- The Frame Transformation Layer is responsible for interpreting `FramePacket` metadata, decoding payloads when necessary, and returning algorithm-specific working representations.
+- Pipeline modules pull the specific representation they need from the transformation layer.
+- The Pipeline Orchestrator remains responsible for execution order and pipeline control decisions.
+
+The Frame Transformation Layer is not a replacement for the Frame Adapter and is not itself a detection stage. It is an internal data-preparation utility used by modules on demand. See `doc/FRAME_TRANSFORMATION_LAYER.md` for the full architecture and representation contracts.
 
 ---
 
@@ -71,6 +88,8 @@ Note: Motion Detection does NOT publish events. It annotates the `FramePacket` a
 
 - Input: canonical `FramePacket` (normalized by the Frame Adapter). The packet must include `camera_id`, `timestamp_ms`, pixel data and resolution.
 - Output: the same `FramePacket` augmented with `frame_packet.motion` (and optional `pipeline_flags`, such as `skip_remaining`) and a `MotionResult` returned to the orchestrator.
+
+Motion Detection may request `motion_frame_v1` from the internal Frame Transformation Layer rather than owning payload decode and working-frame preparation itself.
 
 ### Motion payload (contract)
 
@@ -243,7 +262,7 @@ Detects objects of interest and populates `frame_packet.objects` for downstream 
 ### Data Flow
 
 - Input: `frame_packet.raw_frame` (or ROIs from `frame_packet.motion.mask`).
-- Preprocessing: color conversion, resize/pad (letterbox), and apply model-specific preprocessing.
+- Representation request: request `object_tensor_v1` from the Frame Transformation Layer.
 - Inference: call `ModelProvider.infer()` and obtain raw outputs.
 - Post-processing: confidence filtering, NMS (configured `iou_threshold`), coordinate transform back to original frame, class mapping.
 - Output: append detections to `frame_packet.objects` and update `pipeline_trace`.
@@ -278,7 +297,7 @@ Locates faces for subsequent recognition; typically run within person bounding b
 
 ### Data Flow
 
-- Input: person ROIs or entire frame.
+- Input: person ROIs or entire frame via `face_detect_frame_v1` requested from the Frame Transformation Layer.
 - Output: `frame_packet.faces` and `pipeline_trace` update.
 
 ---
@@ -311,7 +330,7 @@ Matches detected faces to known identities and appends `RecognizedIdentity` entr
 
 ### Data Flow
 
-- Input: `frame_packet.faces`
+- Input: `frame_packet.faces` plus face crops prepared through `face_embed_tensor_v1` requested from the Frame Transformation Layer.
 - Output: `frame_packet.identities` and `pipeline_trace` update.
 
 ---
@@ -324,12 +343,15 @@ Normalizes incoming frames into the canonical `FramePacket` used by the pipeline
 
 ### Responsibilities
 
-- Validate and decode incoming frame payloads.
+- Validate incoming raw frame payloads.
 - Populate `FramePacket` ingest fields.
+- Keep only the latest frame per camera (`camera_id`) in in-memory storage.
+- Overwrite the previously stored frame for the same camera by design.
 
 ### Components / Classes
 
-  - `FrameAdapter` (handles gRPC ingestion).
+  - `FrameReceiver` (handles gRPC ingestion and packet creation).
+  - `FrameStore` (stores latest frame per camera; pipeline pulls frames via `get_next_frame()`).
 
 ### Interfaces
 
@@ -342,8 +364,10 @@ message Frame {
   string frame_id = 3;
   int32 width = 4;
   int32 height = 5;
-  bytes image = 6;
-  string format = 7;
+  string pixel_format = 6;
+  int32 num_color_channels = 7;
+  int32 bits_per_pixel = 8;
+  bytes raw_frame = 9;
 }
 
 service FrameSource {
@@ -357,12 +381,14 @@ service FrameSource {
 
 ### Initialization
 
-- Start gRPC servers/IPC listeners; configure decoders and metrics.
+- Start gRPC servers/IPC listeners; configure ingress validators and metrics.
 
 ### Data Flow
 
 - Input: raw IPC/gRPC payload
-- Output: `FramePacket` with `camera_id`, `timestamp`, `frame_id`, `width`, `height`, `raw_frame`, `raw_metadata`.
+- Output: latest `FramePacket` per camera with `camera_id`, `timestamp`, `frame_id`, `width`, `height`, `raw_frame`, `raw_metadata`.
+
+Backpressure policy in this architecture is overwrite-based, not queue-based: when processing is slower than ingress, the newest frame replaces any older unprocessed frame for the same camera.
 
 Example ingestion flow:
 
@@ -373,7 +399,10 @@ frame_packet = FramePacket(
   frame_id=frame.frame_id,
   width=frame.width,
   height=frame.height,
-  raw_frame=decode_payload(frame.image, frame.format),
+  pixel_format=frame.pixel_format,
+  num_color_channels=frame.num_color_channels,
+  bits_per_pixel=frame.bits_per_pixel,
+  raw_frame=frame.raw_frame,
 )
 ```
 
