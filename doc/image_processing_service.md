@@ -59,7 +59,8 @@ flowchart TB
 IPS includes an internal Frame Transformation Layer that sits alongside the processing modules.
 
 - The Frame Adapter remains responsible for ingress parsing and canonical `FramePacket` creation.
-- The Frame Transformation Layer is responsible for interpreting `FramePacket` metadata, decoding payloads when necessary, and returning algorithm-specific working representations.
+- The Frame Transformation Layer is responsible for interpreting `FramePacket` metadata and returning algorithm-specific working representations.
+- A dedicated `PayloadDecoder` component inside the transformation boundary decodes `FramePacket` payload bytes into deterministic internal decode buffers used by the transformation pipeline.
 - Pipeline modules pull the specific representation they need from the transformation layer.
 - The Pipeline Orchestrator remains responsible for execution order and pipeline control decisions.
 

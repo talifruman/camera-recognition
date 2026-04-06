@@ -8,18 +8,26 @@ This document defines only the Object Detection Module responsible for person de
 - Detect humans (person class only) per frame.
 - Return person bounding boxes.
 - Return a boolean indicating if at least one person is detected.
-- Internal preprocessing, inference, and postprocessing required to produce module output.
+- Input validation, inference, postprocessing, and filtering required to produce module output.
+
+### Out of Scope
+
+The Object Detection Module does NOT:
+- Interpret raw camera payloads.
+- Decode encoded images.
+- Convert pixel formats.
+- Perform color conversion, normalization, resize, or tensor construction from raw bytes.
+
+All frame preparation belongs to upstream components (IPS / Frame Transformation Layer).
 
 ## 2. YOLO Model Decision (Architectural)
 
 - The module uses YOLO11m as the defined and default detection model.
-- The module is currently configured to use YOLO11m as the default model.
 - This is a fixed architectural decision for this module specification, not an optional behavior.
 - The module does not implement object detection from scratch.
 - YOLO11m is the actual detection engine used for inference.
 - YOLO11s may be supported as a lighter non-default alternative through configuration.
-- The architecture is intentionally designed to support future replacement of the selected YOLO model variant through configuration and inference engine flexibility.
-- This allows dynamic model evolution without changing the external API of the module.
+- The architecture supports changing the YOLO variant (YOLO11m / YOLO11s / future models), the inference backend (ONNX / TensorRT / etc.), and the model input contract through configuration — without changing the public API.
 
 ## 3. Module Goals and Non-Functional Requirements
 
@@ -50,32 +58,49 @@ The external API must not expose:
 
 ## 5. Input Definition
 
-### 5.1 FramePacket
+### 5.1 Model-Ready Input Assumption
 
-```text
-struct FramePacket {
-    int64 timestamp;            // epoch milliseconds or equivalent monotonic source
-    string camera_id;           // non-empty identifier of frame source
-    uint64 frame_id;            // monotonically increasing per camera stream
-    uint32 width;               // frame width in pixels
-    uint32 height;              // frame height in pixels
-    PixelFormat pixel_format;   // declared format of raw buffer
-    bytes raw_buffer;           // frame bytes in declared pixel format
-}
-```
+The Object Detection Module receives a frame that is already prepared for the YOLO model. This preparation is done upstream by IPS / Frame Transformation Layer.
 
-### 5.2 Validation Rules
-- timestamp must be present and valid numeric value.
-- camera_id must be present and non-empty.
-- frame_id must be present.
-- width > 0 and height > 0.
-- pixel_format must be supported by the module preprocessor.
-- raw_buffer must be present and size-consistent with width, height, and pixel_format.
+The module MUST NOT:
+- Convert image formats.
+- Perform color conversion.
+- Perform normalization.
+- Perform resize.
+- Construct tensors from raw bytes.
 
-### 5.3 Assumptions
-- FramePacket integrity is expected from upstream producer, but this module performs strict validation before processing.
-- The module may reject frames that do not satisfy format/size requirements.
-- Timestamp timezone semantics are not interpreted by this module.
+The module assumes the input is already compatible with the configured model.
+
+### 5.2 Required Input
+
+The module requires exactly:
+
+**Metadata:**
+- `camera_id` — non-empty identifier of frame source.
+- `frame_id` — monotonically increasing per camera stream.
+- `width` — frame width in pixels.
+- `height` — frame height in pixels.
+
+**Processing input:**
+- A model-ready frame representation, already prepared for the configured YOLO model.
+
+There is NO dependency on:
+- `raw_buffer`
+- `pixel_format`
+- `num_color_channels`
+- `bits_per_pixel`
+
+### 5.3 Validation Rules
+
+- `camera_id` must exist and be non-empty.
+- `frame_id` must exist.
+- `width` > 0 and `height` > 0.
+- Model-ready representation must exist.
+- Representation must match the expected model input contract.
+
+### 5.4 Assumptions
+- Input integrity is expected from the upstream producer, but this module performs strict validation before processing.
+- The module rejects inputs that do not satisfy metadata or model-ready representation requirements.
 
 ## 6. Output Definition
 
@@ -101,7 +126,7 @@ struct PersonDetectionResult {
 ```
 
 ### 6.3 Output Semantics
-- frame_id corresponds to the input FramePacket.frame_id to maintain traceability between input and output.
+- frame_id corresponds to the input frame_id to maintain traceability between input and output.
 - person_detected is derived as persons.size() > 0.
 - persons includes only valid person boxes after filtering and optional box validation.
 - The persons list may contain zero, one, or multiple bounding boxes depending on the number of detected persons in the frame.
@@ -115,7 +140,7 @@ struct PersonDetectionResult {
 
 The module is composed of internal components only:
 
-- Preprocessor
+- Input Validator
 - Inference Engine (abstracted)
 - Postprocessor
 - Person Filtering Layer
@@ -131,19 +156,25 @@ struct RawDetection {
 }
 ```
 
-RawDetection is strictly internal and must never be returned by the external API.
+- RawDetection is strictly internal and must never be returned by the external API.
+- `confidence` is used only internally for filtering. It is never exposed externally.
 
 ### 7.2 Component Responsibilities
 
-#### Preprocessor
-- Validates frame dimensions and format constraints.
-- If a general frame transformation layer exists, it handles generic transformations only.
-- Model-specific preprocessing remains inside this module.
-- Converts raw_buffer to model input tensor format.
-- Applies deterministic transforms required by YOLO11m, including resize to model input size, color conversion, normalization, and tensor preparation.
+#### Input Validator
+
+The Input Validator MUST ONLY:
+- Validate presence of required metadata fields (`camera_id`, `frame_id`, `width`, `height`).
+- Validate that the model-ready input exists.
+- Validate compatibility with the expected model input contract.
+
+The Input Validator MUST NOT:
+- Convert raw buffers.
+- Perform image preprocessing for YOLO.
+- Create tensors from raw image data.
 
 #### Inference Engine
-- Loads and runs the YOLO11m model using the preprocessed tensor.
+- Loads and runs the configured YOLO model using the model-ready input directly.
 - Returns raw detection outputs without applying person filtering or business-level filtering.
 
 #### Postprocessor
@@ -152,7 +183,7 @@ RawDetection is strictly internal and must never be returned by the external API
 - Non-Max Suppression (NMS) is applied using an IoU threshold to remove overlapping detections.
 - IoU (Intersection over Union) is a metric that measures the overlap between two bounding boxes. It is calculated as the ratio between the area of intersection and the area of union of the boxes.
 - During Non-Max Suppression (NMS), IoU is used to identify overlapping detections. If the IoU between two boxes exceeds a configured threshold, the lower-confidence detection is removed.
-- Maps decoded detection boxes back to the original frame resolution (before preprocessing resize).
+- Maps decoded detection boxes back to the original frame resolution.
 
 All bounding boxes must be transformed back to the original frame coordinate system before being included in the final output.
 
@@ -170,7 +201,7 @@ flowchart LR
 
 #### Person Filtering Layer
 - Retains only detections where label equals person.
-- Applies confidence threshold policy.
+- Applies confidence threshold from configuration (PersonDetectionConfig). Filtering rule: keep detection ONLY if confidence >= configured threshold. The threshold must NOT be hardcoded.
 - Performs optional bbox sanity checks (non-negative, in-frame, non-zero area).
 
 #### Result Builder
@@ -178,19 +209,145 @@ flowchart LR
 - Computes person_detected from resulting list size.
 - Constructs PersonDetectionResult.
 
+### 7.3 Module Class Diagram
+
+```mermaid
+classDiagram
+    class PipelineOrchestrator {
+        <<external caller>>
+        +run_stage(model_ready_input, metadata) PersonDetectionResult
+    }
+
+    class ObjectDetectionModule {
+        +process(model_ready_input, metadata) PersonDetectionResult
+    }
+
+    class InputValidator {
+        +validate_input(input_representation, metadata, config) void
+    }
+
+    class IInferenceEngine {
+        <<interface>>
+        +initialize(config) EngineStatus
+        +infer(model_ready_input) InferenceOutput
+        +shutdown() void
+    }
+
+    class ConcreteInferenceEngine {
+        +initialize(config) EngineStatus
+        +infer(model_ready_input) InferenceOutput
+        +shutdown() void
+    }
+
+    class Postprocessor {
+        +decode_and_nms(output_tensors, config) RawDetection[]
+    }
+
+    class PersonFilteringLayer {
+        +filter_persons(detections, config) RawDetection[]
+        +validate_boxes(detections, metadata) RawDetection[]
+    }
+
+    class ResultBuilder {
+        +build(frame_id, detections) PersonDetectionResult
+    }
+
+    class DetectionInput {
+        +frame_id: uint64
+        +camera_id: string
+        +width: uint32
+        +height: uint32
+        +model_ready_representation: ModelReadyFrame
+    }
+
+    class ModelReadyFrame
+    class InferenceOutput
+
+    class RawDetection {
+        +label: string
+        +confidence: float
+        +bbox: BoundingBox
+    }
+
+    class BoundingBox {
+        +x: int32
+        +y: int32
+        +width: int32
+        +height: int32
+    }
+
+    class PersonDetectionResult {
+        +frame_id: uint64
+        +person_detected: bool
+        +persons: BoundingBox[]
+    }
+
+    PipelineOrchestrator --> ObjectDetectionModule : process(model_ready_input, metadata)
+    ObjectDetectionModule --> InputValidator : validate_input()
+    ObjectDetectionModule --> IInferenceEngine : infer(model_ready_input)
+    ConcreteInferenceEngine ..|> IInferenceEngine
+    ObjectDetectionModule --> Postprocessor : decode_and_nms()
+    ObjectDetectionModule --> PersonFilteringLayer : filter_persons()/validate_boxes()
+    ObjectDetectionModule --> ResultBuilder : build()
+
+    InputValidator --> DetectionInput : validates
+    IInferenceEngine --> ModelReadyFrame : consumes
+    IInferenceEngine --> InferenceOutput : produces
+    Postprocessor --> InferenceOutput : consumes
+    Postprocessor --> RawDetection : produces
+    PersonFilteringLayer --> RawDetection : filters
+    ResultBuilder --> RawDetection : consumes
+    ResultBuilder --> BoundingBox : maps to
+    ResultBuilder --> PersonDetectionResult : returns
+```
+
+### 7.4 Module Sequence Diagram (Success Path)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Orch as Pipeline Orchestrator
+    participant ODM as ObjectDetectionModule
+    participant Val as InputValidator
+    participant Eng as IInferenceEngine
+    participant Post as Postprocessor
+    participant Filter as PersonFilteringLayer
+    participant Build as ResultBuilder
+
+    Orch->>ODM: process(model_ready_input, metadata)
+    ODM->>Val: validate_input(input_representation, metadata, config)
+    Val-->>ODM: valid
+
+    ODM->>Eng: infer(model_ready_input)
+    Eng-->>ODM: output_tensors
+
+    ODM->>Post: decode_and_nms(output_tensors, config)
+    Post-->>ODM: detections (RawDetection[])
+
+    ODM->>Filter: filter_persons(detections, config)
+    Filter-->>ODM: person_detections
+    ODM->>Filter: validate_boxes(person_detections, metadata)
+    Filter-->>ODM: validated_detections
+
+    ODM->>Build: build(metadata.frame_id, validated_detections)
+    Build-->>ODM: PersonDetectionResult
+    ODM-->>Orch: PersonDetectionResult
+```
+
 ## 8. How YOLO Is Used
 
-Practical flow for each input frame:
+- YOLO input preparation is handled upstream by IPS / Frame Transformation Layer.
+- This module only:
+  1. Validates the model-ready input and metadata.
+  2. Runs inference on the model-ready input.
+  3. Decodes model outputs into detections.
+  4. Applies NMS.
+  5. Filters persons (label == "person", confidence >= configured threshold).
+  6. Builds PersonDetectionResult.
 
-1. Frame is received as FramePacket.
-2. Model-specific preprocessing is applied inside this module.
-3. The inference engine loads and runs YOLO11m.
-4. YOLO11m produces raw detections.
-5. The module filters detections where label == "person".
-6. The configured confidence threshold is applied internally.
-7. The module outputs only:
-    - person_detected
-    - persons (list of BoundingBox)
+The module outputs only:
+- person_detected
+- persons (list of BoundingBox)
 
 Implementation note:
 - In the initial implementation, YOLO11m is expected to be executed using a Python-based runtime such as the Ultralytics YOLO library.
@@ -203,13 +360,14 @@ Implementation note:
 ```text
 interface IInferenceEngine {
     EngineStatus initialize(PersonDetectionConfig config);
-    InferenceOutput infer(Tensor input_tensor);
+    InferenceOutput infer(ModelReadyFrame model_ready_input);
     void shutdown();
 }
 ```
 
 The inference engine abstraction is intentionally simple:
-- The inference engine is an internal component responsible for loading and executing the YOLO11m model and returning raw detection outputs.
+- The inference engine is an internal component responsible for loading and executing the configured YOLO model and returning raw detection outputs.
+- The inference engine consumes the model-ready input directly — no tensor construction or image conversion is performed at this stage.
 - The inference engine must remain flexible enough to load a different configured YOLO variant, model path, or backend in future revisions without external API changes.
 
 ### 9.2 Implementations
@@ -226,48 +384,44 @@ Inference backend choice must not change the module public API.
 
 ## 10. Processing Pipeline
 
-For each FramePacket, processing order is:
-
 The module processes one frame at a time (batch size = 1).
 
-1. Frame validation.
-2. Preprocessing.
-3. Model inference using YOLO11m through the inference engine.
+1. Metadata validation (`camera_id`, `frame_id`, `width`, `height`).
+2. Model-ready input validation.
+3. Inference on the model-ready representation.
 4. Output decoding.
 5. Non-Max Suppression.
-6. Filtering:
+6. Person filtering:
    - label equals person
-   - confidence greater than or equal to configured threshold
+   - confidence >= configured threshold (from PersonDetectionConfig)
 7. Bounding box validation (optional).
 8. Result construction.
 
-Determinism requirement: with fixed model, fixed thresholds, fixed NMS parameters, and identical frame input, output must be reproducible.
+Determinism requirement: with fixed model, fixed thresholds, fixed NMS parameters, and identical model-ready input, output must be reproducible.
 
 ## 11. Module-Local Data Flow
 
 Data transformations inside this module:
 
-1. FramePacket.raw_buffer -> preprocessed tensor.
-2. Preprocessed tensor -> raw inference tensors.
-3. Raw inference tensors -> RawDetection list.
-4. RawDetection list -> NMS-pruned detections.
-5. NMS-pruned detections -> person-only filtered detections.
-6. Filtered detections -> validated BoundingBox list.
-7. BoundingBox list -> PersonDetectionResult.
+1. Model-ready representation -> inference output tensors.
+2. Inference output tensors -> RawDetection list.
+3. RawDetection list -> NMS-pruned detections.
+4. NMS-pruned detections -> person-only filtered detections.
+5. Filtered detections -> validated BoundingBox list.
+6. BoundingBox list -> PersonDetectionResult.
 
 No system-wide routing, orchestration, or external workflow behavior is defined here.
 
-## Data Flow Diagram
+### Data Flow Diagram
 
 ```mermaid
 flowchart TD
-    A[FramePacket.raw_buffer] --> B[Preprocessed Tensor]
-    B --> C[YOLO11m Output Tensors]
-    C --> D[RawDetection List]
-    D --> E[NMS Filtered Detections]
-    E --> F[Person-only Detections]
-    F --> G[BoundingBox List]
-    G --> H[PersonDetectionResult]
+    A[Model-Ready Representation] --> B[Inference Output Tensors]
+    B --> C[RawDetection List]
+    C --> D[NMS Filtered Detections]
+    D --> E[Person-only Detections]
+    E --> F[BoundingBox List]
+    F --> G[PersonDetectionResult]
 ```
 
 ## 12. Component Design
@@ -275,10 +429,12 @@ flowchart TD
 ### 12.1 ObjectDetectionModule
 - Owns processing pipeline orchestration for one frame at a time.
 - Depends on IInferenceEngine abstraction.
+- Receives model-ready input and minimal metadata.
 - Exposes only PersonDetectionResult as public output.
 
 ### 12.2 Concrete Inference Engine
 - Concrete class implementing IInferenceEngine using ONNX Runtime or TensorRT.
+- Consumes the model-ready input directly.
 - Responsible only for runtime interaction, not person filtering policy.
 
 ## 13. Performance Considerations
@@ -287,8 +443,7 @@ Module-level considerations only:
 
 - Inference latency is the dominant cost in most deployments.
 - The module is expected to operate within real-time constraints (for example, approximately 10-50 ms per frame depending on hardware).
-- Preprocessing should minimize allocations and redundant color/layout conversions.
-- CPU path should prefer efficient tensor preparation and bounded thread usage.
+- Input validation should be lightweight since all frame preparation is handled upstream.
 - GPU path should reduce host-device copy overhead where runtime allows.
 - Optional frame skipping may be configured to meet latency budgets under overload, but module remains stateless for each processed frame.
 
@@ -297,13 +452,13 @@ Module-level considerations only:
 The module emits only the following operational metrics:
 
 - inference_time_ms
-- preprocessing_time_ms
+- validation_time_ms
 - detected_people_count
 - invalid_frames
 
 Metric semantics:
 - inference_time_ms: elapsed inference runtime per processed frame.
-- preprocessing_time_ms: elapsed preprocessing time per processed frame.
+- validation_time_ms: elapsed input validation time per processed frame.
 - detected_people_count: number of returned person boxes per frame.
 - invalid_frames: count of frames rejected by validation.
 
@@ -314,7 +469,7 @@ Metric semantics:
 ```text
 enum DetectionStatus {
     Success,
-    InvalidFrame,
+    InvalidInput,
     InferenceError
 }
 ```
@@ -322,8 +477,8 @@ enum DetectionStatus {
 DetectionStatus is internal/operational and is not part of the external API contract.
 
 ### 15.2 Local Behavior
-- Success: valid frame processed; PersonDetectionResult returned.
-- InvalidFrame: validation failure; empty persons and person_detected false are returned with InvalidFrame status.
+- Success: valid input processed; PersonDetectionResult returned.
+- InvalidInput: validation failure (missing metadata or incompatible model-ready representation); empty persons and person_detected false are returned with InvalidInput status.
 - InferenceError: inference runtime/model execution failure; empty persons and person_detected false are returned with InferenceError status.
 
 The module does not define recovery behavior outside its own processing boundaries.
@@ -332,11 +487,12 @@ The module does not define recovery behavior outside its own processing boundari
 
 This module can evolve without changing its external contract:
 
-- Add additional detectable classes in future internal revisions while keeping current person-only API behavior by default.
-- Keep YOLO11m as the current default model while allowing future replacement with another YOLO variant through configuration.
+- Change the YOLO variant (YOLO11m / YOLO11s / future models) through configuration.
+- Change the inference backend (ONNX / TensorRT / etc.) through IInferenceEngine.
+- Change the model input contract by updating the upstream representation definition and the module's input validation rules.
 - Replace model weights and change model_path without changing the public API contract.
 - Tune confidence and NMS thresholds through configuration.
-- Update or replace inference backends through IInferenceEngine while preserving external response schema.
+- Add additional detectable classes in future internal revisions while keeping current person-only API behavior by default.
 
 Any extension must preserve current public API constraints unless a deliberate versioned API change is introduced.
 
@@ -345,14 +501,12 @@ Any extension must preserve current public API constraints unless a deliberate v
 ```text
 struct PersonDetectionConfig {
     string model_path;                  // default points to YOLO11m; can be updated for future model replacement
-    float person_confidence_threshold;
+    float person_confidence_threshold;  // filtering rule: keep only if confidence >= this value; must NOT be hardcoded
     float nms_iou_threshold;
-    int32 input_width;
-    int32 input_height;
-    string inference_backend;          // default: onnxruntime; backend is configurable for future evolution
+    string inference_backend;           // default: onnxruntime; backend is configurable for future evolution
     bool enable_bbox_validation;
     uint32 max_detections;
-    uint32 optional_frame_skip;        // 0 means disabled
+    uint32 optional_frame_skip;         // 0 means disabled
 }
 ```
 
@@ -367,6 +521,11 @@ The default person confidence threshold is typically set to 0.5 (configurable).
 - Internal label/confidence/model outputs remain private.
 - DetectionStatus is not part of the public API.
 - YOLO11m is the defined and default detection engine.
+- Module depends only on minimal metadata and model-ready input.
+- Module is fully decoupled from raw image formats.
+- Confidence threshold is configuration-driven.
+- Architecture supports model and backend changes without public API changes.
+- Aligned with IPS-driven transformation architecture.
 - No tracking/event/recognition logic is defined.
 - Module is stateless, deterministic, and real-time oriented.
 - Specification is self-contained and implementation-ready for this single module.

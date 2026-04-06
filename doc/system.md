@@ -16,6 +16,12 @@ Always use **Obra Superpowers: Brainstorming** in **Planning Mode**.
 - After each brainstorming session, update this file with new decisions, constraints, or trigger refinements.
 - If nothing changed, explicitly state that this file is already up to date.
 
+## Decision Updates
+- 2026-03-25: Frame Transformation Layer contract hard-switched to direct `FramePacket` flow.
+- 2026-03-25: `BaseImage` removed from transformation-layer architecture and method contracts.
+- 2026-03-25: `PayloadDecoder` introduced as an explicit component for deterministic payload decode before transformation.
+- 2026-03-25: No backward compatibility mode retained for `BaseImage` in documentation contracts.
+
 ## Plan: Smart Camera Monitoring System
 Learning-first microservices design that supports live/synthetic video, person recognition, event clips, and Telegram alerts while staying simple to evolve.
 

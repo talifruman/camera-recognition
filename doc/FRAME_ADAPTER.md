@@ -1,20 +1,20 @@
 # Frame Adapter
 
 ## Purpose
-The Frame Adapter in IPS is a gRPC client adapter. It receives frames from the Camera Service gRPC stream, validates ingress fields, and builds canonical FramePacket objects for IPS.
+The Frame Adapter in IPS is a server-side ingress receiver for Camera Service frame streams. IPS hosts the receiving gRPC endpoint, accepts incoming frame messages pushed by Camera Service, validates ingress fields, and builds canonical FramePacket objects for IPS.
 
-IPS does not connect directly to cameras. RTSP/USB/file connectivity and camera-side stream handling belong to Camera Service.
+IPS does not connect directly to cameras and does not dial Camera Service for frame pull. RTSP/USB/file connectivity and outbound streaming initiation belong to Camera Service.
 
 ## Architectural Role
 The Frame Adapter architecture is composed of two focused classes with clear boundaries:
 
-**GrpcFrameAdapter** - ingress and packet construction:
-- Acts as the gRPC client for Camera Service frame streaming.
-- Receives frame messages from Camera Service.
+**GrpcFrameIngressAdapter** - server-side ingress receiving and packet construction:
+- Hosts/exposes the gRPC receiving stream endpoint inside IPS.
+- Accepts Camera Service outbound streaming connections.
+- Handles accepted stream messages from Camera Service.
 - Parses ingress transport messages and validates required fields.
 - Builds canonical FramePacket objects (`frame_id`, `camera_id`, `timestamp_ms`, `width`, `height`, `pixel_format`, `num_color_channels`, `bits_per_pixel`, `image_bytes`, `metadata`).
-- Handles reconnect logic with exponential backoff.
-- Emits ingress metrics: `frames_in_total`, `adapter_reconnects_total`, `ingest_latency_ms`.
+- Emits ingress metrics: `frames_in_total`, `ingest_latency_ms`, `active_ingress_streams`.
 - Pushes every accepted frame to FrameStore using `store_or_replace(frame_packet)`.
 
 **FrameStore** - latest-frame-per-camera storage and retrieval only:
@@ -28,8 +28,10 @@ The Frame Adapter architecture is composed of two focused classes with clear bou
 **Key Principle:**
 Camera Service sends raw frame payload only. Frame Adapter does not decode or transcode ingress payloads.
 
-**Responsibility Boundary:**
-GrpcFrameAdapter owns ingress receive/parse/validation and FramePacket creation. FrameStore owns latest-frame storage and round-robin retrieval. Neither class performs downstream image processing.
+## Responsibility Boundary
+Camera Service owns outbound stream initiation, outbound stream maintenance, and reconnect behavior toward IPS.
+
+GrpcFrameIngressAdapter owns receiving endpoint lifecycle inside IPS (`bind`, `accept`, `handle inbound stream`, `shutdown`), ingress receive/parse/validation, and FramePacket creation. FrameStore owns latest-frame storage and round-robin retrieval. Neither class performs downstream image processing.
 
 ## Module Diagrams (mermaid)
 
@@ -44,13 +46,14 @@ classDiagram
         +health() AdapterHealth
     }
 
-    class GrpcFrameAdapter {
+    class GrpcFrameIngressAdapter {
         -store: FrameStore
         +configure(config)
         +start()
         +stop()
         +health() AdapterHealth
-        -run_receive_loop()
+        -bind_receiving_endpoint()
+        -handle_incoming_stream(stream)
         -ingress_to_framepacket(message)
     }
 
@@ -77,9 +80,9 @@ classDiagram
         +metadata: Dict
     }
 
-    FrameAdapter <|.. GrpcFrameAdapter
-    GrpcFrameAdapter *-- FrameStore : writes via store_or_replace
-    GrpcFrameAdapter ..> FramePacket : builds
+    FrameAdapter <|.. GrpcFrameIngressAdapter
+    GrpcFrameIngressAdapter *-- FrameStore : writes via store_or_replace
+    GrpcFrameIngressAdapter ..> FramePacket : builds
     FrameStore o-- FramePacket : latest per camera
 ```
 
@@ -88,19 +91,20 @@ classDiagram
 sequenceDiagram
     autonumber
     participant CS as Camera Service
-    participant A as GrpcFrameAdapter
-    participant S as FrameStore
+    participant A as GrpcFrameIngressAdapter (IPS)
+    participant S as FrameStore (IPS)
     participant L as IPS Processing Loop
 
-    Note over L,S: DI/factory wiring provides shared FrameStore instance to both adapter and IPS
+    Note over L,S: DI/factory wiring provides shared FrameStore instance to adapter and IPS loop
 
     L->>S: start()
     L->>A: start()
-    Note over A: internal receive loop/thread is started
+    A->>A: bind receiving endpoint and begin accepting streams
 
-    loop Adapter receive lifecycle
-        A->>CS: open gRPC stream
-        alt stream connected
+    loop Camera Service outbound lifecycle
+        CS->>A: initiate gRPC stream to IPS endpoint
+        alt stream accepted
+            A-->>CS: stream accepted
             loop Frame ingress stream
                 CS-->>A: frame message (raw bytes + metadata)
                 A->>A: validate required ingress fields
@@ -111,8 +115,8 @@ sequenceDiagram
                     A->>S: store_or_replace(frame_packet)
                 end
             end
-        else stream error/disconnect
-            A->>A: reconnect with exponential backoff
+        else connect error/disconnect
+            CS->>CS: reconnect with outbound backoff policy
         end
     end
 
@@ -128,22 +132,23 @@ sequenceDiagram
     end
 
     L->>A: stop()
-    A->>CS: close stream
+    A->>A: stop accepting streams and release ingress resources
     L->>S: stop()
 ```
 
 ## Supported Ingress Contract
-- gRPC streaming messages from Camera Service only.
+- gRPC streaming messages sent from Camera Service to IPS receiving endpoint.
 - Required ingress fields: `frame_id`, `camera_id`, `timestamp_ms`, `width`, `height`, `pixel_format`, `num_color_channels`, `bits_per_pixel`, raw payload bytes.
 - Encoded/compressed payload ingress is out of scope for this contract.
+- Adapter accepts ingress messages, validates required fields, and canonicalizes to FramePacket before storage.
 
 ## Base Interfaces
 
 ### FrameAdapter
 All concrete adapters implement the following conceptual interface:
-- `start()` - Non-blocking. Allocates resources and starts the gRPC receive loop.
-- `stop()` - Graceful shutdown: stop receive loop and close stream and network handles.
-- `configure(config: FrameAdapterConfig)` - Provide adapter configuration (service endpoint, stream name, filters, and retry options).
+- `start()` - Non-blocking. Allocates ingress resources, binds/starts the receiving gRPC service endpoint, and begins accepting Camera Service streams.
+- `stop()` - Graceful shutdown: stop accepting streams, end stream handlers, and release ingress server/network resources.
+- `configure(config: FrameAdapterConfig)` - Provide adapter configuration (bind address, service name, stream policy, and validation options).
 - `health() -> AdapterHealth` - Optional health/status report for monitoring.
 
 ### FrameStore
@@ -154,9 +159,9 @@ Frame retrieval is provided only by FrameStore:
 - `health() -> StoreHealth`
 
 ## Concurrency Model
-GrpcFrameAdapter runs a single gRPC receive thread (or async task). For each incoming message, it validates fields, builds a FramePacket, and writes to FrameStore via `store_or_replace(packet)`.
+GrpcFrameIngressAdapter runs one ingress receiving endpoint with one or more server-side stream handlers. Each handler processes incoming messages from an accepted Camera Service stream: validate fields, build FramePacket, then write to FrameStore via `store_or_replace(frame_packet)`.
 
-FrameStore is shared between producer (GrpcFrameAdapter) and consumer (IPS processing loop). IPS pulls frames directly from FrameStore by calling `get_next_frame()`.
+FrameStore is shared between ingress producer handlers (GrpcFrameIngressAdapter) and the IPS processing loop consumer. IPS pulls frames directly from FrameStore by calling `get_next_frame()`.
 
 ## Round-Robin Retrieval Rule (FrameStore)
 - Camera traversal order is fixed by configured camera list order.
@@ -169,35 +174,33 @@ FrameStore is shared between producer (GrpcFrameAdapter) and consumer (IPS proce
 Storage capacity is proportional to active camera count: one frame slot per camera. With 5 active cameras, maximum retained frames is 5.
 
 ## Lifecycle Ordering
-- `start()`: start FrameStore, then start GrpcFrameAdapter receive loop.
-- `stop()`: stop GrpcFrameAdapter receive loop, then stop FrameStore.
+- `start()`: start FrameStore, then start GrpcFrameIngressAdapter receiving endpoint.
+- `stop()`: stop GrpcFrameIngressAdapter receiving endpoint, then stop FrameStore.
 
 ## IPS Core Implementation
 
-### GrpcFrameAdapter
-Public adapter implementation for ingress.
+### GrpcFrameIngressAdapter
+Public adapter implementation for server-side ingress receiving.
 
-- Connects to Camera Service gRPC streaming endpoint and receives frame messages.
+- Binds and serves the IPS receiving gRPC endpoint on `start()`.
+- Accepts Camera Service outbound stream connections and handles inbound frame messages.
 - Parses envelope and metadata (`frame_id`, `camera_id`, `timestamp_ms`, `width`, `height`, `pixel_format`, `num_color_channels`, `bits_per_pixel`).
 - Creates FramePacket from raw ingress payload without altering representation.
-- Handles stream reconnect with exponential backoff.
-- Calls `FrameStore.store_or_replace` for each accepted frame.
+- Calls `FrameStore.store_or_replace(frame_packet)` for each accepted frame.
 
 **Interface:**
 - `configure(config)`
 - `start()` / `stop()`
 - `health() -> AdapterHealth`
 
-**Metrics owned:** `frames_in_total`, `ingest_latency_ms`, `adapter_reconnects_total`.
+**Metrics owned:** `frames_in_total`, `ingest_latency_ms`, `active_ingress_streams`, `ingress_rejected_total`.
 
 **Configuration fields owned:**
 ```yaml
-camera_service_endpoint: camera-service:50051
+bind_address: 0.0.0.0:50061
+service_name: ips.frame_ingress.v1.FrameIngressService
 stream_name: frames
-reconnect:
-  max_retries: 0    # 0 == infinite
-  base_backoff_ms: 500
-  max_backoff_ms: 10000
+max_concurrent_streams: 32
 ```
 
 ---
@@ -247,8 +250,15 @@ class FramePacket:
     metadata: Dict[str, Any]
 ```
 
+### Payload Handoff to Transformation Layer
+
+- `image_bytes` is the canonical payload field produced by Frame Adapter.
+- In transformation-layer contracts that use `payload`, `payload` maps directly to `FramePacket.image_bytes`.
+- `metadata` should carry `encoding` when payload is encoded (for example `JPEG`, `H264`) and `pixel_format` remains mandatory.
+- Frame Adapter does not decode or transcode payload bytes. Decoding is delegated to the transformation boundary `PayloadDecoder`.
+
 **Mutability Strategy:**
-- FramePacket carries ingest/core fields produced by adapter.
+- FramePacket carries ingest/core fields produced by the ingress receiver.
 - Raw payload fields are immutable by policy after creation.
 
 **Adapter Conversion Rules:**
@@ -259,20 +269,25 @@ class FramePacket:
 
 ## Communication and Integration
 
-- GrpcFrameAdapter receives gRPC frame messages from Camera Service.
-- GrpcFrameAdapter writes every accepted frame to FrameStore.
+- Camera Service owns outbound stream initiation toward IPS.
+- GrpcFrameIngressAdapter owns the receiving endpoint lifecycle and accepted-stream handling inside IPS.
+- GrpcFrameIngressAdapter receives gRPC frame messages from Camera Service and writes accepted frames to FrameStore.
 - IPS pipeline calls `FrameStore.get_next_frame()` directly to pull frames in round-robin order.
 
-**Initialization (DI/factory wiring):**
-1. Config loader reads adapter and store config (`camera_service_endpoint`, `stream_name`, storage/retry options).
-2. Composition root creates one shared `FrameStore` instance.
-3. Composition root creates `GrpcFrameAdapter`, injecting the shared `FrameStore`.
-4. Call `adapter.start()` to start ingress.
-5. Processing loop pulls frames directly from the shared `FrameStore`:
+**Explicit communication model note:**
+"Camera Service is the active streaming sender. IPS Frame Adapter is the passive receiving ingress endpoint. IPS does not dial Camera Service to pull frames in this architecture."
+
+## Initialization / DI Wiring
+1. Config loader reads adapter and store config (IPS bind address/service options, validation options, storage options).
+2. Composition root creates one shared FrameStore instance.
+3. Composition root creates GrpcFrameIngressAdapter, injecting the shared FrameStore.
+4. Call `adapter.start()` to bind/start the IPS receiving endpoint.
+5. Camera Service connects and pushes frame messages into IPS.
+6. Processing loop pulls frames directly from the shared FrameStore:
 
 ```python
 store = FrameStore(store_config)
-adapter = GrpcFrameAdapter(adapter_config, store)
+adapter = GrpcFrameIngressAdapter(adapter_config, store)
 
 adapter.start()
 
@@ -284,20 +299,24 @@ while running:
 ```
 
 ## Implementation Notes
-- Camera ingestion inside IPS is gRPC-only.
+- Camera ingestion inside IPS is gRPC-only and receiving-endpoint based.
 - Ingress payload is raw-only; encoded/compressed ingress is rejected.
-- Stream reconnect uses bounded exponential backoff (GrpcFrameAdapter).
+- Camera Service handles outbound reconnect policy when streams disconnect.
 - FrameStore intentionally overwrites stale frames for the same camera.
 - Retrieval order is round-robin across cameras using fixed configured camera list order.
 - Unit tests for FrameStore: overwrite semantics, round-robin order, per-camera isolation, max slot bounds.
 
 ## Verification Checklist
 
-**GrpcFrameAdapter**
-- [ ] Unit tests pass: gRPC parsing, FramePacket mapping, timestamp handling.
-- [ ] Reconnect with exponential backoff validated.
+**GrpcFrameIngressAdapter**
+- [ ] Unit tests pass: server-side stream handling, gRPC ingress parsing, FramePacket mapping, timestamp handling.
+- [ ] Endpoint lifecycle validated: bind/start accepts streams on `start()`, stop rejects new streams on `stop()`.
 - [ ] Ingress mapping validated (`frame_id`, `camera_id`, `pixel_format`, `num_color_channels`, `bits_per_pixel`).
 - [ ] Integration with FrameStore validated (`store_or_replace` called for accepted frames).
+
+**Camera Service integration contract**
+- [ ] Camera Service initiates outbound stream toward IPS ingress endpoint.
+- [ ] Camera Service reconnect behavior validated when IPS endpoint is unavailable or connection drops.
 
 **FrameStore**
 - [ ] One-slot-per-camera behavior validated.
@@ -308,17 +327,18 @@ while running:
 - [ ] FrameStore does not invoke downstream consumers; retrieval is pull-only via `get_next_frame()`.
 
 **End-to-end flow**
-- [ ] Integration test: Camera Service -> GrpcFrameAdapter -> FrameStore -> IPS pull loop.
+- [ ] Integration test: Camera Service -> GrpcFrameIngressAdapter -> FrameStore -> IPS pull loop.
 
 ## Design Goals
-- Clear separation: GrpcFrameAdapter owns ingress; FrameStore owns latest-frame storage and retrieval.
+- Clear separation: GrpcFrameIngressAdapter owns ingress receiving endpoint and canonicalization; FrameStore owns latest-frame storage and retrieval.
+- Camera Service remains the active outbound sender and reconnect owner.
 - Always prefer newest frame per camera over backlog processing.
 - Bound memory by camera count (one frame per camera).
 - Round-robin fairness across cameras in retrieval order.
 
 ---
 
-## Appendix: Minimal FramePacket Conversion Example (Python)
+## Appendix: Minimal Ingress-to-FramePacket Mapping Example (Python)
 ```python
 import time
 
@@ -337,3 +357,6 @@ def ingress_to_framepacket(payload_bytes, src_meta):
         metadata=src_meta,
     )
 ```
+
+**Appendix wording note:**
+The mapping example assumes payload bytes arrive from an already accepted Camera Service outbound stream into the IPS receiving endpoint. The adapter maps and validates only; it does not dial Camera Service and does not decode/transcode payload bytes.
