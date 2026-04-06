@@ -1,3 +1,4 @@
 tests/object_detection/rendered_assets/
 tests/object_detection/__pycache__/
+__pycache__/
 yolo11m.pt
