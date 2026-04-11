@@ -60,6 +60,7 @@ from image_processing.face_detection import (  # type: ignore[import-not-found]
     FaceDetectionInput,
     FaceDetectionModule,
     FaceDetectionOutput,
+    SCRFDFaceDetector,
 )
 from face_detection_stub_engine import StubFaceDetectorEngine  # type: ignore[import-not-found]
 
@@ -67,6 +68,29 @@ FRAME_COUNTER = count(1)
 
 GREEN = (0, 255, 0)
 LANDMARK_RADIUS = 3
+
+_VALID_FD_MODES = ("stub", "real")
+
+
+def _build_face_engine(mode: str):
+    """Instantiate the FaceDetectorEngine for the requested mode.
+
+    Parameters
+    ----------
+    mode:
+        ``"stub"``  — StubFaceDetectorEngine (deterministic, no model file).
+        ``"real"``  — SCRFDFaceDetector (auto-downloads SCRFD model on first use).
+
+    Raises
+    ------
+    ValueError
+        If *mode* is not one of the valid options.
+    """
+    if mode == "stub":
+        return StubFaceDetectorEngine()
+    if mode == "real":
+        return SCRFDFaceDetector(model_dir=_PROJECT_ROOT / "models" / "face_detection")
+    raise ValueError(f"fd_detector_mode must be one of: {', '.join(_VALID_FD_MODES)}")  # noqa: EM102
 
 
 # ---------------------------------------------------------------------------
@@ -126,8 +150,25 @@ def process_images(
     input_root: Path,
     output_root: Path,
     od_detector_mode: str = "real",
+    fd_detector_mode: str | None = None,
 ) -> int:
-    """Run the two-stage Object Detection → Face Detection pipeline."""
+    """Run the two-stage Object Detection → Face Detection pipeline.
+
+    Parameters
+    ----------
+    input_root:
+        Root directory containing source images.
+    output_root:
+        Root directory for timestamped output runs.
+    od_detector_mode:
+        ``"real"`` or ``"stub"`` — selects the Object Detection engine.
+    fd_detector_mode:
+        ``"real"`` or ``"stub"`` — selects the Face Detection engine.
+        Defaults to ``od_detector_mode`` when ``None``, so callers that
+        pass a single mode string continue to work unchanged.
+    """
+    resolved_fd_mode = fd_detector_mode if fd_detector_mode is not None else od_detector_mode
+
     processed_count = 0
     input_root = Path(input_root)
     output_root = Path(output_root)
@@ -135,10 +176,10 @@ def process_images(
     # Stage 1 engine: real or stub Object Detection
     od_process: Callable[[Any, Any], Any] = get_detector_process(od_detector_mode)
 
-    # Stage 2 engine: Face Detection with STUB detector engine
+    # Stage 2 engine: real SCRFD or stub Face Detection
     face_module = FaceDetectionModule(
         config=FaceDetectionConfig(),
-        detector_engine=StubFaceDetectorEngine(),
+        detector_engine=_build_face_engine(resolved_fd_mode),
     )
 
     run_output_root = build_run_output_root(output_root)
@@ -205,15 +246,18 @@ def process_images(
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    if len(args) != 3:
+    if len(args) not in (3, 4):
         raise ValueError(
-            "Expected 3 arguments: input_root output_root od_detector_mode"
+            "Expected 3 or 4 arguments: input_root output_root od_detector_mode [fd_detector_mode]"
         )
 
     input_root = Path(args[0])
     output_root = Path(args[1])
     od_detector_mode = args[2]
-    process_images(input_root, output_root, od_detector_mode)
+    if len(args) == 4:
+        process_images(input_root, output_root, od_detector_mode, args[3])
+    else:
+        process_images(input_root, output_root, od_detector_mode)
     return 0
 
 

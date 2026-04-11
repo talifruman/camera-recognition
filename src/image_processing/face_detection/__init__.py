@@ -19,6 +19,7 @@ from .module import (
     ProjectedDetection,
     RawFaceDetection,
 )
+from .scrfd_detector import SCRFDFaceDetector
 
 __all__ = [
     "AcceptedDetection",
@@ -38,4 +39,5 @@ __all__ = [
     "Point",
     "ProjectedDetection",
     "RawFaceDetection",
+    "SCRFDFaceDetector",
 ]
