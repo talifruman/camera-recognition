@@ -1,0 +1,54 @@
+{
+  "summary": {
+    "gallery_path": "C:\\Users\\talif\\Desktop\\Camera-regogintion\\data\\generated_face_gallery_real",
+    "total_person_folders": 4,
+    "folders_checked": 4,
+    "folders_passed": 4,
+    "folders_with_warnings": 0,
+    "folders_with_errors": 0,
+    "folders_single_embedding": 0,
+    "total_suspicious_embeddings": 0
+  },
+  "persons": [
+    {
+      "person_id": "1f007fe2-6eaf-5148-a240-a449664cb6eb",
+      "embedding_count": 14,
+      "status": "passed",
+      "min_pairwise_similarity": 0.501666,
+      "max_pairwise_similarity": 0.829005,
+      "mean_pairwise_similarity": 0.666368,
+      "suspicious_embeddings": [],
+      "load_errors": []
+    },
+    {
+      "person_id": "750d3e47-6abb-5694-8b62-ea056a7f29b1",
+      "embedding_count": 14,
+      "status": "passed",
+      "min_pairwise_similarity": 0.497531,
+      "max_pairwise_similarity": 0.78475,
+      "mean_pairwise_similarity": 0.637993,
+      "suspicious_embeddings": [],
+      "load_errors": []
+    },
+    {
+      "person_id": "872b1095-dff9-50b0-8eb1-22852095fcb6",
+      "embedding_count": 15,
+      "status": "passed",
+      "min_pairwise_similarity": 0.482793,
+      "max_pairwise_similarity": 0.780323,
+      "mean_pairwise_similarity": 0.639623,
+      "suspicious_embeddings": [],
+      "load_errors": []
+    },
+    {
+      "person_id": "b4de6bd4-d07e-5047-ac26-e4c98cd4baee",
+      "embedding_count": 14,
+      "status": "passed",
+      "min_pairwise_similarity": 0.463695,
+      "max_pairwise_similarity": 0.730987,
+      "mean_pairwise_similarity": 0.602096,
+      "suspicious_embeddings": [],
+      "load_errors": []
+    }
+  ]
+}
