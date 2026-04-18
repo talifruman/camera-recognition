@@ -135,6 +135,58 @@ class StubEmbeddingFileReader:
 
 
 # ---------------------------------------------------------------------------
+# NpyEmbeddingFileReader — real implementation (replaces StubEmbeddingFileReader)
+# ---------------------------------------------------------------------------
+
+
+class NpyEmbeddingFileReader:
+    """
+    Real implementation of EmbeddingFileReader that reads actual .npy files.
+
+    Validates the file extension, loads the array with np.load, and checks
+    that the shape and dtype match the configured contract.  Returns None
+    on any error (I/O failure, wrong shape, wrong dtype) to signal a
+    structured failure without raising.
+    """
+
+    def __init__(
+        self,
+        embedding_file_extension: str,
+        expected_embedding_dim: int,
+        expected_dtype: str,
+    ) -> None:
+        self._extension = embedding_file_extension
+        self._dim = expected_embedding_dim
+        self._dtype = expected_dtype
+
+    def read_embedding(self, file_path: str) -> FaceEmbedding | None:
+        """
+        Load a .npy embedding file and validate its contract.
+
+        Returns None (structured failure) if:
+          - the file does not exist
+          - the file extension does not match the configured extension
+          - the array shape is not (expected_embedding_dim,)
+          - the array dtype does not match expected_dtype
+          - any I/O or format error occurs
+        """
+        if not os.path.isfile(file_path):
+            return None
+        _, ext = os.path.splitext(file_path)
+        if ext.lower() != self._extension.lower():
+            return None
+        try:
+            arr = np.load(file_path)
+        except Exception:
+            return None
+        if arr.shape != (self._dim,):
+            return None
+        if arr.dtype != np.dtype(self._dtype):
+            return None
+        return arr.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
 # GalleryPathValidator — spec §8.2
 # ---------------------------------------------------------------------------
 

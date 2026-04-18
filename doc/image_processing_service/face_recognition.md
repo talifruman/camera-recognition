@@ -4,7 +4,7 @@
 
 ### Purpose
 
-The Face Recognition module is responsible for determining the identity of a single detected face. It receives a pre-cropped face ROI image and its canonical facial landmarks, and returns a single recognized `person_id` or `"UNKNOWN"`. This module is the final stage in the IPS pipeline. After this stage, the IPS forwards the result to an external system without further processing.
+The Face Recognition module is responsible for determining the identity of a single detected face. It receives a pre-cropped face ROI image and its canonical facial landmarks, and returns a `FaceRecognitionOutput` containing `person_found` and, when a valid match is accepted, `person_id`. This module is the final stage in the IPS pipeline. After this stage, the IPS forwards the result to an external system without further processing.
 
 ### In Scope
 
@@ -13,7 +13,7 @@ The Face Recognition module is responsible for determining the identity of a sin
 - Extracting a face embedding via the configured embedding engine
 - Comparing the embedding against the enrolled gallery
 - Applying threshold-based recognition acceptance
-- Returning a clean identity result (`person_id` or `"UNKNOWN"`)
+- Returning a clean identity result (`person_found` boolean, and `person_id` when a valid match is accepted)
 - Configuration-driven threshold — loaded at initialization, not passed per invocation
 
 ### Out of Scope
@@ -66,13 +66,24 @@ struct FaceRecognitionInput {
 
 `Image` is an opaque type. Its internal representation is not defined by this module. `FaceLandmarks` is a fully typed canonical struct defined above.
 
-### 2.3 Input Contract
+### 2.3 ROI Image Contract
 
-`face_roi_image` must satisfy the configured recognition engine contract before entering the module:
+`face_roi_image` must already match the configured embedding engine input contract before inference starts.
 
-- Contains only the detected face (pre-cropped; not the full frame)
-- Color format, layout, dtype, and value range match the configured `FaceEmbeddingEngine` input requirements
-- Dimensions match the requirements of the configured embedding model
+Default ArcFace-oriented contract (current default implementation — not a fixed public API requirement):
+
+- color format: `RGB`
+- layout: `HWC`
+- dtype: `float32`
+- value range: `[-1.0, 1.0]` (mean-normalized)
+- dimensions: `112 × 112` pixels (height × width × channels)
+- content: contains only the detected face, pre-cropped to a tight face region; the face is centered and occupies the full ROI extent
+
+The exact embedding contract is configuration-defined and depends on the currently configured AI embedding model and engine. This contract is dynamic — if the underlying embedding model is replaced, the expected color format, layout, dtype, value range, or dimensions may change without modifying the public module API.
+
+The Face Recognition module validates the incoming `face_roi_image` against the configured embedding contract before sending it to `FaceEmbeddingEngine`. The module does not perform any image preprocessing on the incoming ROI — no cropping, resizing, normalization, alignment, color conversion, layout conversion, or dtype conversion is applied. The ROI image arrives fully prepared from upstream processing.
+
+Any minimal runtime-specific adaptation required for inference — such as wrapping the validated image into the backend tensor type or adding a batch dimension — is handled internally by `FaceEmbeddingEngine` and does not modify the image data.
 
 `FaceLandmarks` provides the canonical 5 facial key points. All coordinates are relative to `face_roi_image`. No bounding boxes are present or required at this stage.
 
@@ -104,14 +115,16 @@ struct FaceRecognitionOutput {
     uint64 frame_id;
     string camera_id;
     uint64 timestamp_ms;
-    string person_id;
+    bool   person_found;
+    string person_id;     // populated only when person_found = true
 }
 ```
 
 ### 3.2 Output Semantics
 
 - `frame_id`, `camera_id`, `timestamp_ms` — copied unchanged from input for traceability
-- `person_id` — the unique identifier of the recognized identity; set to `"UNKNOWN"` if no valid match was found
+- `person_found` — `true` when a valid identity match was accepted; `false` when no valid identity was found
+- `person_id` — the unique identifier of the recognized identity; populated only when `person_found = true`; not a valid identity when `person_found = false`
 
 ### 3.3 Output Constraints
 
@@ -124,7 +137,7 @@ The output must NOT expose:
 - Bounding boxes
 - Match flags, confidence indicators, or candidate lists
 
-All matching logic and intermediate computation are strictly internal. The only externally visible result is `person_id`.
+All matching logic and intermediate computation are strictly internal. The only externally visible result is `person_found` and, when a match is accepted, `person_id`.
 
 ## 4. Public API
 
@@ -132,11 +145,11 @@ All matching logic and intermediate computation are strictly internal. The only 
 recognize_face(input: FaceRecognitionInput) -> FaceRecognitionOutput
 ```
 
-The API must remain stable regardless of which embedding engine is configured. Threshold is never a parameter — it is immutable internal configuration state loaded at initialization.
+The API must remain stable regardless of which embedding engine is configured. Threshold is never a parameter — it is immutable internal configuration state loaded at initialization. The output schema always includes `person_found`; `person_id` is present only when `person_found = true`.
 
 ## 5. Non-Functional Requirements
 
-- **Stateless per invocation** — no cross-frame memory, with the sole exception of `FaceGalleryStore`, which is read-only during recognition
+- **Stateless per invocation** — no cross-frame memory, with the sole exception of `FaceGalleryCache` (the preloaded in-memory enrolled gallery), which is immutable and read-only during recognition
 - **Single face per invocation** — upstream IPS is responsible for dispatching individual face crops; the module must not accept batched input
 - **Real-time capable** — suitable for per-frame online processing
 - **Deterministic** — same input + same configuration + same gallery state produce the same output
@@ -171,7 +184,7 @@ Recognition acceptance is threshold-based and exclusively managed by `FaceRecogn
 
 - `FaceMatcher` returns the best candidate and its raw similarity score from the gallery. If the gallery is empty, it returns no candidate.
 - `FaceRecognitionDecisionPolicy` applies `recognition_threshold`:
-  - If similarity ≥ `recognition_threshold` → return `person_id`, else `"UNKNOWN"`
+  - If similarity ≥ `recognition_threshold` → `person_found = true`, `person_id` = matched identity; otherwise `person_found = false`
 - The threshold is loaded from configuration at initialization. It is immutable and not adjustable per invocation.
 - No match flags or similarity scores are returned to the caller.
 - `FaceRecognitionDecisionPolicy` is the only place inside the module that makes accept or reject decisions.
@@ -189,7 +202,7 @@ Its responsibilities are:
 - pass results between components through the pipeline
 - return the final `FaceRecognitionOutput` to the caller
 
-During initialization, `FaceRecognitionModule` is responsible for loading the module configuration and wiring each internal subcomponent with its required settings, including injecting `recognition_threshold` into `FaceRecognitionDecisionPolicy` and `gallery_source` into `FaceGalleryStore`.
+During initialization, `FaceRecognitionModule` is responsible for loading the module configuration and wiring each internal subcomponent with its required settings, including injecting `recognition_threshold` into `FaceRecognitionDecisionPolicy` and building `FaceGalleryCache` from the enrolled embeddings provided at startup.
 
 `FaceRecognitionModule` must not embed validation, alignment, inference, matching, or decision logic directly. Each of those responsibilities belongs to a dedicated internal component.
 
@@ -234,17 +247,17 @@ Its responsibilities are:
 
 `ArcFaceEmbeddingEngine` is the current default implementation of `FaceEmbeddingEngine`. The module depends on the `FaceEmbeddingEngine` abstraction, not on `ArcFaceEmbeddingEngine` directly, so a different embedding model can be substituted without changing `FaceRecognitionInput`, `FaceRecognitionOutput`, or any other part of the public API.
 
-### 8.5 FaceGalleryStore
+### 8.5 FaceGalleryCache
 
-`FaceGalleryStore` provides read-only access to enrolled face embeddings. It is the only component with knowledge of the identity gallery.
+`FaceGalleryCache` is the internal in-memory store of enrolled face embeddings. It is the only component with knowledge of the identity gallery.
 
 Its responsibilities are:
 
-- load or connect to the configured gallery source at initialization
-- return the full set of `GalleryEntry[]` on retrieval request
-- remain read-only during recognition invocations; gallery state is not modified during recognition
+- receive the full set of enrolled `GalleryEntry[]` records once at module initialization
+- expose these entries read-only via `get_entries()` to `FaceMatcher` during recognition
+- hold the enrolled gallery as immutable in-memory state for the lifetime of the module
 
-`FaceGalleryStore` must not make matching or accept or reject decisions.
+`FaceGalleryCache` is initialized once at startup and never modified during recognition invocations. It performs no external I/O, does not connect to any storage source during recognition, and makes no matching or accept or reject decisions. Gallery updates require module reinitialization.
 
 ### 8.6 FaceMatcher
 
@@ -260,13 +273,14 @@ Its responsibilities are:
 
 ### 8.7 FaceRecognitionDecisionPolicy
 
-`FaceRecognitionDecisionPolicy` applies the recognition threshold and produces the final identity string.
+`FaceRecognitionDecisionPolicy` applies the recognition threshold and produces the final identity decision.
 
 Its responsibilities are:
 
 - receive a `MatchCandidate` (or empty result)
-- apply `recognition_threshold`: if similarity ≥ threshold, return `person_id`; otherwise return `"UNKNOWN"`
-- return `"UNKNOWN"` when no candidate is present (empty gallery)
+- apply `recognition_threshold`: if similarity ≥ threshold, set `person_found = true` and include the matched `person_id`; otherwise set `person_found = false`
+- return `person_found = false` when no candidate is present (empty gallery)
+- return a `RecognitionDecision` record containing `person_found` and, when accepted, `person_id`
 
 This component is the only place inside the module that decides whether a match result becomes an accepted identity. `FaceRecognitionDecisionPolicy` must not access the gallery directly or run inference.
 
@@ -276,8 +290,9 @@ This component is the only place inside the module that decides whether a match 
 
 Its responsibilities are:
 
-- receive frame metadata and the resolved `person_id`
+- receive frame metadata and the `RecognitionDecision` (containing `person_found` and, when accepted, `person_id`)
 - copy `frame_id`, `camera_id`, and `timestamp_ms` from the input for traceability
+- set `person_found` from the decision; populate `person_id` only when `person_found = true`
 - assemble and return the final `FaceRecognitionOutput`
 
 `FaceRecognitionOutputBuilder` must not perform matching, apply threshold logic, or make decision logic.
@@ -292,11 +307,10 @@ For one invocation of `recognize_face`, the internal pipeline follows this order
 2. `FaceRecognitionModule` calls `FaceRecognitionInputValidator.validate(input)`.
 3. `FaceRecognitionModule` calls `FaceAligner.align(face_roi_image, landmarks)` → `AlignedFace`.
 4. `FaceRecognitionModule` calls `FaceEmbeddingEngine.extract_embedding(AlignedFace)` → `FaceEmbedding`.
-5. `FaceRecognitionModule` calls `FaceGalleryStore.get_gallery()` → `GalleryEntry[]`.
-6. `FaceRecognitionModule` calls `FaceMatcher.find_best_match(FaceEmbedding, GalleryEntry[])` → `MatchCandidate`.
-7. `FaceRecognitionModule` calls `FaceRecognitionDecisionPolicy.decide(MatchCandidate)` → `person_id` or `"UNKNOWN"`.
-8. `FaceRecognitionModule` calls `FaceRecognitionOutputBuilder.build(frame_id, camera_id, timestamp_ms, person_id)` → `FaceRecognitionOutput`.
-9. `FaceRecognitionModule` returns `FaceRecognitionOutput` to the caller.
+5. `FaceRecognitionModule` calls `FaceMatcher.find_best_match(FaceEmbedding, FaceGalleryCache.get_entries())` → `MatchCandidate`.
+6. `FaceRecognitionModule` calls `FaceRecognitionDecisionPolicy.decide(MatchCandidate)` → `RecognitionDecision` (`person_found` + optional `person_id`).
+7. `FaceRecognitionModule` calls `FaceRecognitionOutputBuilder.build(frame_id, camera_id, timestamp_ms, RecognitionDecision)` → `FaceRecognitionOutput`.
+8. `FaceRecognitionModule` returns `FaceRecognitionOutput` to the caller.
 
 All intermediate data (aligned face, embedding, gallery entries, match scores) remain strictly internal to the module.
 
@@ -307,7 +321,6 @@ All intermediate data (aligned face, embedding, gallery entries, match scores) r
 ```text
 struct FaceRecognitionConfig {
     float  recognition_threshold;    // acceptance threshold; applied internally only
-    string gallery_source;           // "database" | "file" | "external_service"
 }
 ```
 
@@ -318,23 +331,24 @@ Configuration is loaded exactly once during module initialization. It is immutab
 Injection at construction time:
 
 - `recognition_threshold` → `FaceRecognitionDecisionPolicy`
-- `gallery_source` → `FaceGalleryStore`
+- Enrolled embeddings and associated person metadata are supplied to the module at construction time; the module builds `FaceGalleryCache` from these records and retains them as immutable in-memory state
 - `FaceEmbeddingEngine` is injected as an abstract dependency, with `ArcFaceEmbeddingEngine` as the default implementation
 
 ## 10. Internal Data Structures
 
 - **`AlignedFace`** — geometrically aligned face image ready for embedding extraction; produced by `FaceAligner`, consumed by `FaceEmbeddingEngine`; lifecycle: per-call
 - **`FaceEmbedding`** — fixed-dimension float vector representing face identity; produced by `FaceEmbeddingEngine`, consumed by `FaceMatcher`; lifecycle: per-call
-- **`GalleryEntry`** — enrolled identity record containing `person_id` (primary identifier), optional `person_name` (metadata only, not exposed externally), and stored embedding vector; provided by `FaceGalleryStore`; lifecycle: persistent (loaded at initialization or on demand from source)
+- **`GalleryEntry`** — enrolled identity record containing `person_id` (primary identifier), optional `person_name` (metadata only, not exposed externally), and stored embedding vector; held by `FaceGalleryCache`; lifecycle: persistent in module memory after initialization, read-only during recognition calls
 - **`MatchCandidate`** — best gallery match containing candidate `person_id` and raw similarity score; produced by `FaceMatcher`, consumed by `FaceRecognitionDecisionPolicy`; lifecycle: per-call
+- **`RecognitionDecision`** — identity decision record containing `person_found` (bool) and, when accepted, `person_id`; produced by `FaceRecognitionDecisionPolicy`, consumed by `FaceRecognitionOutputBuilder`; lifecycle: per-call
 
 ## 11. Error Handling
 
-- **Validation failure** (missing fields, null image, malformed landmarks) → return `FaceRecognitionOutput` with `person_id = "UNKNOWN"`
-- **Alignment failure** (degenerate landmarks, geometric error) → catch internally, return `person_id = "UNKNOWN"`
-- **Inference failure** (embedding engine runtime error) → catch internally, return `person_id = "UNKNOWN"`
-- **Empty gallery** (no enrolled identities) → `FaceMatcher` returns no candidate; `FaceRecognitionDecisionPolicy` returns `"UNKNOWN"`; normal operation
-- **No match above threshold** → return `person_id = "UNKNOWN"`; normal operation
+- **Validation failure** (missing fields, null image, malformed landmarks) → return `FaceRecognitionOutput` with `person_found = false`; no valid recognized identity returned
+- **Alignment failure** (degenerate landmarks, geometric error) → catch internally, return `person_found = false`; no valid recognized identity returned
+- **Inference failure** (embedding engine runtime error) → catch internally, return `person_found = false`; no valid recognized identity returned
+- **Empty gallery** (no enrolled identities) → `FaceMatcher` returns no candidate; `FaceRecognitionDecisionPolicy` returns `person_found = false`; normal operation
+- **No match above threshold** → return `person_found = false`; normal operation
 
 ## 12. Metrics / Observability
 
@@ -342,7 +356,7 @@ Injection at construction time:
 - `inference_time_ms` — `FaceEmbeddingEngine.extract_embedding()` duration
 - `total_recognition_time_ms` — full `recognize_face()` duration
 - `recognition_accepted_count` — invocations producing a named match
-- `recognition_unknown_count` — invocations returning `"UNKNOWN"`
+- `recognition_no_match_count` — invocations returning `person_found = false`
 - `validation_failure_count` — inputs rejected by `FaceRecognitionInputValidator`
 
 Metrics are internal and operational. Not part of the public API.
@@ -353,7 +367,8 @@ Metrics are internal and operational. Not part of the public API.
 
 - Load `FaceRecognitionConfig` from the configuration source
 - Initialize the configured `FaceEmbeddingEngine` implementation
-- Initialize `FaceGalleryStore` (connect to gallery source, load or index entries)
+- Receive the enrolled embeddings and associated person metadata at construction time; build `FaceGalleryCache` as an immutable in-memory structure
+- Gallery updates require module reinitialization
 - Wire all internal components with injected configuration values
 
 ### 13.2 Per Invocation
@@ -365,7 +380,6 @@ Stateless per invocation. No state carries between calls. One face ROI per call.
 ### 13.3 Shutdown
 
 - Release `FaceEmbeddingEngine` resources
-- Close `FaceGalleryStore` connection if applicable
 
 ## 14. Class Diagram
 
@@ -392,8 +406,9 @@ classDiagram
         +extract_embedding(aligned_face: AlignedFace) FaceEmbedding
     }
 
-    class FaceGalleryStore {
-        +get_gallery() GalleryEntry[]
+    class FaceGalleryCache {
+        -entries: GalleryEntry[]
+        +get_entries() GalleryEntry[]
     }
 
     class FaceMatcher {
@@ -401,11 +416,11 @@ classDiagram
     }
 
     class FaceRecognitionDecisionPolicy {
-        +decide(candidate: MatchCandidate) string
+        +decide(candidate: MatchCandidate) RecognitionDecision
     }
 
     class FaceRecognitionOutputBuilder {
-        +build(frame_id: uint64, camera_id: string, timestamp_ms: uint64, person_id: string) FaceRecognitionOutput
+        +build(frame_id: uint64, camera_id: string, timestamp_ms: uint64, decision: RecognitionDecision) FaceRecognitionOutput
     }
 
     class FaceRecognitionInput {
@@ -420,6 +435,7 @@ classDiagram
         +frame_id: uint64
         +camera_id: string
         +timestamp_ms: uint64
+        +person_found: bool
         +person_id: string
     }
 
@@ -439,7 +455,7 @@ classDiagram
     FaceRecognitionModule --> FaceRecognitionInputValidator : orchestrates
     FaceRecognitionModule --> FaceAligner : orchestrates
     FaceRecognitionModule --> FaceEmbeddingEngine : orchestrates
-    FaceRecognitionModule --> FaceGalleryStore : orchestrates
+    FaceRecognitionModule --> FaceGalleryCache : reads at startup
     FaceRecognitionModule --> FaceMatcher : orchestrates
     FaceRecognitionModule --> FaceRecognitionDecisionPolicy : orchestrates
     FaceRecognitionModule --> FaceRecognitionOutputBuilder : orchestrates
@@ -460,7 +476,7 @@ sequenceDiagram
     participant FaceRecognitionInputValidator
     participant FaceAligner
     participant FaceEmbeddingEngine
-    participant FaceGalleryStore
+    participant FaceGalleryCache
     participant FaceMatcher
     participant FaceRecognitionDecisionPolicy
     participant FaceRecognitionOutputBuilder
@@ -473,13 +489,12 @@ sequenceDiagram
     FaceRecognitionModule->>FaceEmbeddingEngine: extract_embedding(AlignedFace)
     FaceEmbeddingEngine->>FaceEmbeddingEngine: run inference
     FaceEmbeddingEngine-->>FaceRecognitionModule: FaceEmbedding
-    FaceRecognitionModule->>FaceGalleryStore: get_gallery()
-    FaceGalleryStore-->>FaceRecognitionModule: GalleryEntry[]
-    FaceRecognitionModule->>FaceMatcher: find_best_match(FaceEmbedding, GalleryEntry[])
+    Note over FaceGalleryCache: FaceGalleryCache is preloaded at startup and read-only
+    FaceRecognitionModule->>FaceMatcher: find_best_match(FaceEmbedding, FaceGalleryCache.get_entries())
     FaceMatcher-->>FaceRecognitionModule: MatchCandidate (person_id + similarity)
-    FaceRecognitionModule->>FaceRecognitionDecisionPolicy: decide(MatchCandidate (person_id + similarity))
-    FaceRecognitionDecisionPolicy-->>FaceRecognitionModule: person_id | "UNKNOWN"
-    FaceRecognitionModule->>FaceRecognitionOutputBuilder: build(frame_id, camera_id, timestamp_ms, person_id)
+    FaceRecognitionModule->>FaceRecognitionDecisionPolicy: decide(MatchCandidate)
+    FaceRecognitionDecisionPolicy-->>FaceRecognitionModule: RecognitionDecision (person_found + person_id)
+    FaceRecognitionModule->>FaceRecognitionOutputBuilder: build(frame_id, camera_id, timestamp_ms, RecognitionDecision)
     FaceRecognitionOutputBuilder-->>FaceRecognitionModule: FaceRecognitionOutput
     FaceRecognitionModule-->>Caller: FaceRecognitionOutput
 ```
@@ -488,21 +503,21 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    A["FaceRecognitionInput\nframe_id · camera_id · timestamp_ms\nface_roi_image · FaceLandmarks"]
-    B["FaceRecognitionInputValidator\nvalidated input"]
-    C["FaceAligner\nAlignedFace\n(geometrically corrected face image)"]
-    D["FaceEmbeddingEngine\nFaceEmbedding\n(float vector, dim N)"]
-    E["FaceGalleryStore\nGalleryEntry[]\n(person_id + stored embedding)"]
-    F["FaceMatcher\nMatchCandidate\n(best person_id + raw similarity score)"]
-    G["FaceRecognitionDecisionPolicy\nperson_id or UNKNOWN"]
-    H["FaceRecognitionOutputBuilder\nFaceRecognitionOutput"]
-    I["Caller / External System\nFaceRecognitionOutput"]
+    A["FaceRecognitionInput<br/>frame_id · camera_id · timestamp_ms<br/>face_roi_image · FaceLandmarks"]
+    B["FaceRecognitionInputValidator<br/>validated input"]
+    C["FaceAligner<br/>AlignedFace<br/>(geometrically corrected face image)"]
+    D["FaceEmbeddingEngine<br/>FaceEmbedding<br/>(float vector, dim N)"]
+    E["FaceGalleryCache<br/>GalleryEntry[]<br/>(preloaded in-memory enrolled gallery)"]
+    F["FaceMatcher<br/>MatchCandidate<br/>(best person_id + raw similarity score)"]
+    G["FaceRecognitionDecisionPolicy<br/>RecognitionDecision<br/>(person_found + person_id)"]
+    H["FaceRecognitionOutputBuilder<br/>FaceRecognitionOutput"]
+    I["Caller / External System<br/>FaceRecognitionOutput"]
 
     A --> B
     B --> C
     C --> D
     D --> F
-    E --> F
+    E -->|"preloaded at startup"| F
     F --> G
     G --> H
     A -->|"frame_id · camera_id · timestamp_ms"| H
@@ -515,14 +530,14 @@ flowchart TD
 
 - Embedding model (`ArcFaceEmbeddingEngine` → any engine implementing `FaceEmbeddingEngine`)
 - Inference backend (ONNX, TensorRT, etc.) — internal to the engine implementation
-- Gallery source (`database` / `file` / `external_service`, via configuration)
+- Enrolled gallery contents — supplied at initialization; the internal `FaceGalleryCache` is rebuilt on next startup
 - Recognition threshold (configuration-only change)
 
 **What must remain stable:**
 
 - `recognize_face(input: FaceRecognitionInput) -> FaceRecognitionOutput` signature
-- Output schema: `{ frame_id, camera_id, timestamp_ms, person_id }`
-- `"UNKNOWN"` semantics for the no-match case
+- Output schema: `{ frame_id, camera_id, timestamp_ms, person_found, person_id }`
+- Boolean `person_found` semantics: `true` → match accepted; `false` → no valid identity found
 
 ## 18. Module Compliance Checklist
 
@@ -535,7 +550,8 @@ flowchart TD
 - [ ] Engine abstraction respected — `FaceRecognitionModule` depends on `FaceEmbeddingEngine` interface, not on `ArcFaceEmbeddingEngine` directly
 - [ ] Preprocessing boundaries enforced — module performs no color conversion, resize, or normalization
 - [ ] Metadata preserved — `frame_id`, `camera_id`, `timestamp_ms` copied unchanged from input to output
-- [ ] `"UNKNOWN"` returned for all non-match scenarios — including empty gallery, threshold miss, validation failure, and runtime failure
-- [ ] Output uses `person_id` only
+- [ ] `person_found = false` returned for all non-match scenarios — including empty gallery, threshold miss, validation failure, and runtime failure
+- [ ] Output uses `person_found` and `person_id` only — `person_id` populated only when `person_found = true`
 - [ ] `person_name` is not exposed externally
 - [ ] Identity is stable and unique per enrolled person
+- [ ] No runtime access to any external gallery source — recognition invocations consume only the preloaded `FaceGalleryCache`

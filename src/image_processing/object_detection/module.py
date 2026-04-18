@@ -31,8 +31,8 @@ class PersonDetectionResult(TypedDict):
 @dataclass(slots=True)
 class PersonDetectionConfig:
     model_path: str = "yolo11m.pt"
-    person_confidence_threshold: float = 0.5
-    nms_iou_threshold: float = 0.45
+    person_confidence_threshold: float = 0.35
+    nms_iou_threshold: float = 0.35
     inference_backend: str = "ultralytics"
     enable_bbox_validation: bool = True
     max_detections: int = 100

@@ -1,362 +1,606 @@
-# Frame Adapter
+﻿# Frame Adapter Module Specification
 
-## Purpose
-The Frame Adapter in IPS is a server-side ingress receiver for Camera Service frame streams. IPS hosts the receiving gRPC endpoint, accepts incoming frame messages pushed by Camera Service, validates ingress fields, and builds canonical FramePacket objects for IPS.
+## 1. Scope
 
-IPS does not connect directly to cameras and does not dial Camera Service for frame pull. RTSP/USB/file connectivity and outbound streaming initiation belong to Camera Service.
+### Purpose
 
-## Architectural Role
-The Frame Adapter architecture is composed of two focused classes with clear boundaries:
+The Frame Adapter module is responsible for receiving raw ingress frame messages over a configured transport, validating all required fields and payload integrity, constructing immutable FramePacket objects from accepted messages, and writing each accepted FramePacket to FrameStore. It exposes a pull-based retrieval interface for consumers to obtain the latest frame per camera in round-robin order.
 
-**GrpcFrameIngressAdapter** - server-side ingress receiving and packet construction:
-- Hosts/exposes the gRPC receiving stream endpoint inside IPS.
-- Accepts Camera Service outbound streaming connections.
-- Handles accepted stream messages from Camera Service.
-- Parses ingress transport messages and validates required fields.
-- Builds canonical FramePacket objects (`frame_id`, `camera_id`, `timestamp_ms`, `width`, `height`, `pixel_format`, `num_color_channels`, `bits_per_pixel`, `image_bytes`, `metadata`).
-- Emits ingress metrics: `frames_in_total`, `ingest_latency_ms`, `active_ingress_streams`.
-- Pushes every accepted frame to FrameStore using `store_or_replace(frame_packet)`.
+### In Scope
 
-**FrameStore** - latest-frame-per-camera storage and retrieval only:
-- Owns in-memory storage with exactly one slot per `camera_id`.
-- Exposes `store_or_replace(frame_packet)` as ingestion target.
-- Replaces any older frame currently stored for the same camera with the newest frame.
-- Exposes `get_next_frame()` as the only frame retrieval API for IPS.
-- Does not parse ingress messages and does not perform gRPC operations.
-- Emits storage metrics: `frames_overwritten_total`, `active_camera_slots`, `frames_served_total`.
+- Receiving raw ingress frame messages over a configured transport connection
+- Performing structural validation on all required fields of each ingress message
+- Validating payload integrity: size consistency, pixel format acceptance, and field constraints
+- Rejecting invalid frames internally — no rejection state is propagated outside the module
+- Constructing immutable FramePacket objects from validated ingress messages
+- Writing each accepted FramePacket to FrameStore (one slot per camera)
+- Exposing `get_next_frame()` for round-robin pull-based retrieval of the latest frame per camera
+- Managing transport endpoint lifecycle: `start()`, `stop()`, `configure(config)`, `health()`
 
-**Key Principle:**
-Camera Service sends raw frame payload only. Frame Adapter does not decode or transcode ingress payloads.
+### Out of Scope
 
-## Responsibility Boundary
-Camera Service owns outbound stream initiation, outbound stream maintenance, and reconnect behavior toward IPS.
+The Frame Adapter Module does NOT:
 
-GrpcFrameIngressAdapter owns receiving endpoint lifecycle inside IPS (`bind`, `accept`, `handle inbound stream`, `shutdown`), ingress receive/parse/validation, and FramePacket creation. FrameStore owns latest-frame storage and round-robin retrieval. Neither class performs downstream image processing.
+- Decode, transcode, or decompress image payload — handled outside this module
+- Apply any image transformation or preprocessing — handled outside this module
+- Initiate outbound connections to frame sources — handled outside this module
+- Manage reconnection policy for transport streams — handled outside this module
+- Maintain frame history or multi-frame buffers per camera
+- Expose raw ingress messages, transport metadata, or validation flags
+- Perform any downstream processing or orchestrate any downstream component
 
-## Module Diagrams (mermaid)
+---
 
-### Class Diagram
+## 2. Input
+
+### 2.1 Input Responsibility Boundary
+
+The module receives raw ingress frame messages from an external source over the configured transport. The following have already been applied before the message arrives:
+
+- Frame capture at the originating source
+- Stream initiation — the source manages outbound connection setup
+- Transport-layer framing and delivery — the transport layer handles connection management
+
+The Frame Adapter module does not perform any of the above. Only ingress reception, field validation, payload integrity validation, and FramePacket construction are performed inside this module.
+
+### 2.2 Input Structure
+
+```text
+struct IngressFrameMessage {
+    string frame_id;
+    string camera_id;
+    uint64 timestamp_ms;
+    int32  width;
+    int32  height;
+    string pixel_format;
+    int32  num_color_channels;
+    int32  bits_per_pixel;
+    bytes  image_bytes;
+}
+```
+
+`image_bytes` is an opaque byte sequence. Its internal representation is not defined by this module. The module treats it strictly as raw unencoded pixel data. The contract it must satisfy is defined in Section 2.3.
+
+### 2.3 Input Contract
+
+`image_bytes` must satisfy the following preconditions before the frame is accepted:
+
+- Must contain raw, unencoded pixel data only — JPEG, H264, and any other compressed or encoded formats are NOT supported and must be rejected
+- Must not be null or empty
+- Byte length must equal `width × height × num_color_channels × (bits_per_pixel / 8)`
+- `pixel_format` must be one of the configured supported formats (e.g., `RGB`, `BGR`, `GRAY8`)
+- `width`, `height`, `num_color_channels`, and `bits_per_pixel` must be positive integers consistent with `image_bytes` size
+
+### 2.4 Validation Rules
+
+`FrameValidator` must verify:
+
+- `frame_id` must exist and be non-empty
+- `camera_id` must exist and be non-empty
+- `timestamp_ms` must exist
+- `image_bytes` must exist, be non-null, and be non-empty
+- `pixel_format` must be a value in the configured `supported_pixel_formats` list
+- `width`, `height`, `num_color_channels`, and `bits_per_pixel` must all be positive integers
+- Payload size must equal `width × height × num_color_channels × (bits_per_pixel / 8)`
+
+### 2.5 Input Semantics
+
+- `frame_id` — unique frame identifier assigned by the source; preserved unchanged for traceability
+- `camera_id` — source camera identifier; used as the FrameStore slot key and preserved for traceability
+- `timestamp_ms` — capture timestamp in milliseconds since epoch; preserved unchanged for traceability
+- `width` — frame width in pixels; used for payload size validation
+- `height` — frame height in pixels; used for payload size validation
+- `pixel_format` — pixel color space and layout descriptor; validated against `supported_pixel_formats` and preserved in FramePacket
+- `num_color_channels` — number of color channels per pixel; used for payload size validation
+- `bits_per_pixel` — bit depth per pixel; used for payload size validation
+- `image_bytes` — raw unencoded pixel data; the canonical payload field of the resulting FramePacket; not used for transport encoding identification
+
+---
+
+## 3. Output
+
+### 3.1 Output Structure
+
+```text
+struct FramePacket {
+    string frame_id;
+    string camera_id;
+    uint64 timestamp_ms;
+    int32  width;
+    int32  height;
+    string pixel_format;
+    int32  num_color_channels;
+    int32  bits_per_pixel;
+    bytes  image_bytes;
+}
+```
+
+FramePacket is immutable after construction. No field may be modified after `FramePacketBuilder.build()` returns.
+
+### 3.2 Output Semantics
+
+- `frame_id`, `camera_id`, `timestamp_ms` — copied unchanged from the validated IngressFrameMessage for traceability
+- `width`, `height` — frame dimensions copied unchanged from the validated message
+- `pixel_format` — pixel format descriptor copied unchanged; identifies the color space and layout of `image_bytes`
+- `num_color_channels`, `bits_per_pixel` — pixel depth fields copied unchanged from the validated message
+- `image_bytes` — raw unencoded pixel data copied unchanged from the validated message; no decoding or transformation is applied
+
+### 3.3 Output Constraints
+
+The output must NOT expose:
+
+- Transport metadata or ingress envelope fields not part of the canonical frame definition
+- Validation state, rejection flags, or validation error details
+- Intermediate construction state or partial FramePacket instances
+- Encoding hints, compression identifiers, or codec information
+- Internal transport stream identifiers or connection state
+
+All validation logic, transport parsing, and payload integrity checks are strictly internal. The only externally visible result is a fully validated, immutable `FramePacket`.
+
+---
+
+## 4. Public API
+
+```text
+FramePacket | None  get_next_frame()
+void                configure(config: FrameAdapterConfig)
+void                start()
+void                stop()
+AdapterHealth       health()
+```
+
+The API must remain stable regardless of which transport implementation is configured. `supported_pixel_formats`, `bind_address`, and all other configuration parameters are never arguments — they are immutable internal configuration state loaded at initialization.
+
+---
+
+## 5. Non-Functional Requirements
+
+- **Stateless per ingress invocation** — each frame message is received, validated, and stored independently; no cross-frame memory is maintained in the ingress path
+- **Single frame per `get_next_frame()` call** — the module returns exactly one `FramePacket` or `None` per retrieval call; the caller is responsible for its own pull loop
+- **Real-time capable** — suitable for per-frame online ingestion and retrieval at camera-stream rates
+- **Deterministic** — same ingress message and same configuration always produce the same FramePacket or the same rejection outcome
+- **Transport-agnostic API** — the public output schema (`FramePacket`) and `get_next_frame()` signature are independent of the underlying transport implementation
+- **Strict isolation** — no internal transport artifacts, stream identifiers, or ingress envelope data escape through the public API
+
+---
+
+## 6. Processing Engine
+
+### 6.1 Engine Abstraction Interface
+
+```text
+interface FrameIngressTransport {
+    void                bind_and_start(config: FrameAdapterConfig)
+    void                stop()
+    IngressFrameMessage receive_message()
+}
+```
+
+### 6.2 Current Default Implementation
+
+```text
+class GrpcFrameIngressTransport implements FrameIngressTransport
+```
+
+`GrpcFrameIngressTransport` is a protocol-based transport engine (gRPC streaming). It hosts a server-side receiving endpoint, accepts inbound frame streams, and delivers `IngressFrameMessage` objects to the orchestrator.
+
+### 6.3 Replaceability
+
+The module depends on the `FrameIngressTransport` interface, not on `GrpcFrameIngressTransport` directly. Any transport implementation (gRPC, WebSocket, shared memory, etc.) may be substituted without changing `FramePacket`, `get_next_frame()`, or any other part of the public API. Replacing the transport does NOT affect the public API.
+
+---
+
+## 7. Acceptance / Filtering Logic
+
+Frame acceptance is validation-based and exclusively managed by `FrameValidator`.
+
+- `FrameIngressTransport` delivers a raw `IngressFrameMessage` to the orchestrator. It does not inspect field values or payload integrity.
+- `FrameValidator` applies all acceptance rules:
+  - If any required field is missing or empty → reject the frame; increment `invalid_frames_total`; continue to the next message
+  - If `pixel_format` is not in the configured `supported_pixel_formats` list → reject; increment `ingress_rejected_total`; continue
+  - If `len(image_bytes) ≠ width × height × num_color_channels × (bits_per_pixel / 8)` → reject; increment `invalid_frames_total`; continue
+  - If `width`, `height`, `num_color_channels`, or `bits_per_pixel` is not a positive integer → reject; increment `invalid_frames_total`; continue
+  - If all rules pass → frame is accepted and passed to `FramePacketBuilder`
+- Validation rules are loaded from configuration at initialization. They are immutable and not adjustable per invocation.
+- No rejection flags or validation reasons are returned to the caller.
+- `FrameValidator` is the only place inside the module that makes accept or reject decisions.
+
+---
+
+## 8. Internal Pipeline
+
+### 8.1 FrameAdapterModule
+
+`FrameAdapterModule` is the orchestration layer only. It owns no ingress parsing, validation, packet construction, or storage logic.
+
+Its responsibilities are:
+
+- receive each `IngressFrameMessage` from `FrameIngressTransport`
+- invoke internal subcomponents in the correct order
+- pass results between components through the pipeline
+- expose `get_next_frame()` by delegating to `FrameStore`
+- return the final `FramePacket` or `None` to the caller
+
+During initialization, `FrameAdapterModule` is responsible for loading the module configuration and wiring each internal subcomponent with its required settings, including injecting `supported_pixel_formats` into `FrameValidator`, transport configuration into `FrameIngressTransport`, and storage configuration into `FrameStore`.
+
+`FrameAdapterModule` must not embed validation, payload inspection, packet construction, or storage logic directly. Each of those responsibilities belongs to a dedicated internal component.
+
+### 8.2 FrameAdapterInputValidator
+
+`FrameAdapterInputValidator` is responsible only for structural message presence validation. It verifies that the incoming `IngressFrameMessage` carries all required fields before deeper processing begins.
+
+Validation rules:
+
+- `frame_id` must exist and be non-empty
+- `camera_id` must exist and be non-empty
+- `timestamp_ms` must exist
+- `image_bytes` must exist and be non-null
+
+`FrameAdapterInputValidator` does not validate payload size, pixel format legality, or numeric field constraints. It does not make any acceptance decisions beyond field presence.
+
+### 8.3 FrameIngressTransport
+
+`FrameIngressTransport` is the internal transport reception abstraction used by the module.
+
+Its responsibilities are:
+
+- accept and maintain inbound transport connections from external frame sources
+- receive raw frame messages from each accepted connection
+- deliver `IngressFrameMessage` objects to the orchestrator
+
+`FrameIngressTransport` does not validate field values, payload sizes, or pixel formats. It returns raw transport messages only.
+
+`GrpcFrameIngressTransport` is the current default implementation of `FrameIngressTransport`. The module depends on the `FrameIngressTransport` abstraction, not on `GrpcFrameIngressTransport` directly, so a different transport can be substituted without changing `FramePacket`, `get_next_frame()`, or any other part of the public API.
+
+### 8.4 FrameValidator
+
+`FrameValidator` is responsible for payload integrity and format validation. It is the only component that makes accept or reject decisions.
+
+Its responsibilities are:
+
+- receive a structurally present `IngressFrameMessage` from the orchestrator
+- verify `pixel_format` is in the configured `supported_pixel_formats` list
+- verify `len(image_bytes) == width × height × num_color_channels × (bits_per_pixel / 8)`
+- verify `width`, `height`, `num_color_channels`, and `bits_per_pixel` are all positive integers
+- return `valid` or `invalid`; on `invalid`, increment the appropriate metric counter
+
+`FrameValidator` must not build `FramePacket` objects, access `FrameStore`, or perform any transport operations.
+
+### 8.5 FramePacketBuilder
+
+`FramePacketBuilder` constructs an immutable `FramePacket` from a validated `IngressFrameMessage`.
+
+Its responsibilities are:
+
+- receive a validated `IngressFrameMessage`
+- copy all canonical fields (`frame_id`, `camera_id`, `timestamp_ms`, `width`, `height`, `pixel_format`, `num_color_channels`, `bits_per_pixel`, `image_bytes`) without modification
+- return an immutable `FramePacket`
+
+`FramePacketBuilder` must not perform validation, apply any transformation to `image_bytes`, or write to `FrameStore`.
+
+### 8.6 FrameStore
+
+`FrameStore` provides exactly-one-latest-frame-per-camera storage and round-robin retrieval. It is the only component with knowledge of the frame storage state.
+
+Its responsibilities are:
+
+- maintain exactly one `FramePacket` slot per `camera_id`
+- accept `store_or_replace(frame_packet)` calls and overwrite the previously stored frame for the same camera
+- not maintain frame history; each stored frame is the latest frame only
+- return the next available `FramePacket` in round-robin camera order on `get_next_frame()`, or `None` if all slots are empty
+- advance the internal cursor after each returned frame; mark each returned slot as consumed until a new frame arrives
+- not modify any `FramePacket` after it has been stored
+
+`FrameStore` must not make validation or acceptance decisions, parse ingress messages, or perform transport operations.
+
+**Round-robin retrieval semantics:**
+
+- Camera traversal order is fixed by the configured camera list order
+- If a camera slot has no new frame, that slot is skipped and the cursor advances
+- Returning a frame marks that camera slot as consumed until a new frame arrives via `store_or_replace`
+- If all configured camera slots are empty, `get_next_frame()` returns `None` immediately
+- Storage capacity is bounded: one frame slot per configured camera; with N configured cameras, at most N frames are held in memory at any time
+
+### 8.7 End-to-End Processing Flow
+
+For each ingress message received, the internal pipeline follows this order:
+
+**receive message → structural validation → payload validation → build FramePacket → store**
+
+For retrieval:
+
+**get_next_frame → round-robin select → return FramePacket or None**
+
+**Ingress path (per received message):**
+
+1. `FrameAdapterModule` receives `IngressFrameMessage` from `FrameIngressTransport.receive_message()`.
+2. `FrameAdapterModule` calls `FrameAdapterInputValidator.validate(message)` → valid or invalid.
+3. On invalid: `FrameAdapterModule` discards the message and continues to the next message. No output is produced.
+4. On valid: `FrameAdapterModule` calls `FrameValidator.validate(message)` → valid or invalid.
+5. On invalid: `FrameAdapterModule` discards the message, increments the appropriate metric counter, and continues.
+6. On valid: `FrameAdapterModule` calls `FramePacketBuilder.build(message)` → `FramePacket`.
+7. `FrameAdapterModule` calls `FrameStore.store_or_replace(frame_packet)`.
+
+**Retrieval path:**
+
+8. Caller calls `FrameAdapterModule.get_next_frame()`.
+9. `FrameAdapterModule` calls `FrameStore.get_next_frame()` → `FramePacket | None`.
+10. `FrameAdapterModule` returns `FramePacket | None` to the caller.
+
+All intermediate data (`IngressFrameMessage`, validation state, construction intermediates) remain strictly internal to the module.
+
+---
+
+## 9. Configuration
+
+### 9.1 Configuration Parameters
+
+```text
+struct FrameAdapterConfig {
+    string         bind_address;              // transport receiving endpoint address; e.g., "0.0.0.0:50061"
+    string         service_name;              // transport service identifier
+    int32          max_concurrent_streams;    // maximum simultaneous ingress streams accepted
+    int32          max_camera_slots;          // maximum number of cameras tracked by FrameStore
+    string         camera_order_source;       // camera list ordering source for round-robin traversal
+    vector<string> supported_pixel_formats;   // allowed pixel_format values; frames with other values are rejected
+}
+```
+
+### 9.2 Loading Behavior
+
+Configuration is loaded exactly once during module initialization. It is immutable after initialization and reused unchanged across all invocations. No configuration parameter is part of `IngressFrameMessage` or `FramePacket`.
+
+Injection at construction time:
+
+- `supported_pixel_formats` → `FrameValidator`
+- `bind_address`, `service_name`, `max_concurrent_streams` → `FrameIngressTransport`
+- `max_camera_slots`, `camera_order_source` → `FrameStore`
+- `FrameIngressTransport` is injected as an abstract dependency, with `GrpcFrameIngressTransport` as the default implementation
+
+---
+
+## 10. Internal Data Structures
+
+- **`IngressFrameMessage`** — raw transport message containing all frame fields and raw pixel bytes; produced by `FrameIngressTransport`, consumed by `FrameAdapterInputValidator`, `FrameValidator`, and `FramePacketBuilder`; lifecycle: per-call
+- **`FramePacket`** — canonical immutable frame object containing all frame fields and `image_bytes`; produced by `FramePacketBuilder`, stored by `FrameStore`, returned by `get_next_frame()`; lifecycle: persistent (one per active camera slot)
+- **`AdapterHealth`** — health status report containing transport state and store state; produced by `FrameAdapterModule.health()`; lifecycle: per-call
+- **`StoreHealth`** — health status report for storage state; produced by `FrameStore.health()`; lifecycle: per-call
+
+---
+
+## 11. Error Handling
+
+- **Structural validation failure** (missing `frame_id`, `camera_id`, `timestamp_ms`, or `image_bytes`) → discard `IngressFrameMessage`; increment `invalid_frames_total`; continue to next message; no output produced
+- **Unsupported `pixel_format`** → discard message; increment `ingress_rejected_total`; continue
+- **Payload size mismatch** (`len(image_bytes) ≠ width × height × num_color_channels × (bits_per_pixel / 8)`) → discard message; increment `invalid_frames_total`; continue
+- **Non-positive dimension field** (`width`, `height`, `num_color_channels`, or `bits_per_pixel` ≤ 0) → discard message; increment `invalid_frames_total`; continue
+- **Transport stream disconnect** → `FrameIngressTransport` handles stream teardown internally; `FrameAdapterModule` continues accepting new streams; no change to `FrameStore` state
+- **Empty `FrameStore`** (no frame available for any camera) → `get_next_frame()` returns `None`; normal operation
+- **Camera slot overwrite** → new frame for the same `camera_id` overwrites the previously stored frame; `frames_overwritten_total` incremented; normal operation
+
+---
+
+## 12. Metrics / Observability
+
+**GrpcFrameIngressTransport metrics:**
+
+- `frames_in_total` — total ingress frame messages received by the transport
+- `ingest_latency_ms` — time from message receipt to `store_or_replace` completion
+- `active_ingress_streams` — number of currently active inbound transport streams
+- `ingress_rejected_total` — messages rejected due to unsupported `pixel_format`
+- `invalid_frames_total` — messages rejected due to payload size mismatch, structural validation failure, or non-positive dimension fields
+- `bytes_in_total` — total raw bytes received across all ingress messages
+
+**FrameStore metrics:**
+
+- `frames_overwritten_total` — number of times a new frame replaced an existing frame for the same camera
+- `active_camera_slots` — number of camera slots currently holding a frame
+- `frames_served_total` — number of `FramePacket` objects returned by `get_next_frame()`
+- `frames_dropped_total` — number of frames discarded due to slot unavailability
+
+Metrics are internal and operational. Not part of the public API.
+
+---
+
+## 13. Lifecycle
+
+### 13.1 Initialization
+
+- Load `FrameAdapterConfig` from the configuration source
+- Initialize the configured `FrameIngressTransport` implementation with `bind_address`, `service_name`, `max_concurrent_streams`
+- Initialize `FrameStore` with `max_camera_slots`, `camera_order_source`
+- Initialize `FrameValidator` with `supported_pixel_formats`
+- Wire all internal components with injected configuration values
+- Call `FrameIngressTransport.bind_and_start()` to begin accepting inbound streams
+
+### 13.2 Per Invocation
+
+**Ingress path:** receive message → structural validation → payload validation → build FramePacket → store
+
+**Retrieval path:** get_next_frame → round-robin select → return FramePacket or None
+
+Stateless per ingress invocation. No ingress state carries between calls. One frame per `get_next_frame()` call.
+
+### 13.3 Shutdown
+
+- Call `FrameIngressTransport.stop()` to stop accepting streams and release transport resources
+- Call `FrameStore.stop()` to release storage resources
+
+---
+
+## 14. Class Diagram
+
 ```mermaid
 classDiagram
-    class FrameAdapter {
-        <<interface>>
-        +start()
-        +stop()
-        +configure(config)
+    class FrameAdapterModule {
+        +configure(config: FrameAdapterConfig) void
+        +start() void
+        +stop() void
         +health() AdapterHealth
+        +get_next_frame() FramePacket
     }
 
-    class GrpcFrameIngressAdapter {
-        -store: FrameStore
-        +configure(config)
-        +start()
-        +stop()
-        +health() AdapterHealth
-        -bind_receiving_endpoint()
-        -handle_incoming_stream(stream)
-        -ingress_to_framepacket(message)
+    class FrameAdapterInputValidator {
+        +validate(message: IngressFrameMessage) void
+    }
+
+    class FrameIngressTransport {
+        <<interface>>
+        +bind_and_start(config: FrameAdapterConfig) void
+        +stop() void
+        +receive_message() IngressFrameMessage
+    }
+
+    class GrpcFrameIngressTransport {
+        +bind_and_start(config: FrameAdapterConfig) void
+        +stop() void
+        +receive_message() IngressFrameMessage
+    }
+
+    class FrameValidator {
+        +validate(message: IngressFrameMessage) bool
+    }
+
+    class FramePacketBuilder {
+        +build(message: IngressFrameMessage) FramePacket
     }
 
     class FrameStore {
-        -latest_by_camera: Map~camera_id, FramePacket~
-        -cursor: int
-        +store_or_replace(frame_packet)
-        +get_next_frame() FramePacket|None
-        +start()
-        +stop()
+        +store_or_replace(frame_packet: FramePacket) void
+        +get_next_frame() FramePacket
+        +start() void
+        +stop() void
         +health() StoreHealth
     }
 
-    class FramePacket {
-        +frame_id: str
-        +camera_id: str
-        +timestamp_ms: int
-        +width: int
-        +height: int
-        +pixel_format: str
-        +num_color_channels: int
-        +bits_per_pixel: int
+    class IngressFrameMessage {
+        +frame_id: string
+        +camera_id: string
+        +timestamp_ms: uint64
+        +width: int32
+        +height: int32
+        +pixel_format: string
+        +num_color_channels: int32
+        +bits_per_pixel: int32
         +image_bytes: bytes
-        +metadata: Dict
     }
 
-    FrameAdapter <|.. GrpcFrameIngressAdapter
-    GrpcFrameIngressAdapter *-- FrameStore : writes via store_or_replace
-    GrpcFrameIngressAdapter ..> FramePacket : builds
-    FrameStore o-- FramePacket : latest per camera
+    class FramePacket {
+        +frame_id: string
+        +camera_id: string
+        +timestamp_ms: uint64
+        +width: int32
+        +height: int32
+        +pixel_format: string
+        +num_color_channels: int32
+        +bits_per_pixel: int32
+        +image_bytes: bytes
+    }
+
+    class FrameAdapterConfig {
+        +bind_address: string
+        +service_name: string
+        +max_concurrent_streams: int32
+        +max_camera_slots: int32
+        +camera_order_source: string
+        +supported_pixel_formats: vector~string~
+    }
+
+    FrameAdapterModule --> FrameAdapterInputValidator : orchestrates
+    FrameAdapterModule --> FrameIngressTransport : orchestrates
+    FrameAdapterModule --> FrameValidator : orchestrates
+    FrameAdapterModule --> FramePacketBuilder : orchestrates
+    FrameAdapterModule --> FrameStore : orchestrates
+    GrpcFrameIngressTransport ..|> FrameIngressTransport : implements
+    FrameAdapterModule --> IngressFrameMessage : consumes
+    FrameAdapterModule --> FramePacket : returns
+    FrameAdapterModule --> FrameAdapterConfig : configured by
 ```
 
-### Sequence Diagram
+---
+
+## 15. Sequence Diagram
+
 ```mermaid
 sequenceDiagram
     autonumber
-    participant CS as Camera Service
-    participant A as GrpcFrameIngressAdapter (IPS)
-    participant S as FrameStore (IPS)
-    participant L as IPS Processing Loop
+    participant Caller
+    participant FrameAdapterModule
+    participant FrameIngressTransport
+    participant FrameAdapterInputValidator
+    participant FrameValidator
+    participant FramePacketBuilder
+    participant FrameStore
 
-    Note over L,S: DI/factory wiring provides shared FrameStore instance to adapter and IPS loop
+    Note over FrameIngressTransport,FrameAdapterModule: Ingress path (per received message)
+    FrameIngressTransport->>FrameAdapterModule: receive_message() IngressFrameMessage
+    FrameAdapterModule->>FrameAdapterInputValidator: validate(message)
+    FrameAdapterInputValidator-->>FrameAdapterModule: valid
+    FrameAdapterModule->>FrameValidator: validate(message)
+    FrameValidator->>FrameValidator: check pixel_format, payload size, field constraints
+    FrameValidator-->>FrameAdapterModule: valid
+    FrameAdapterModule->>FramePacketBuilder: build(message)
+    FramePacketBuilder-->>FrameAdapterModule: FramePacket (immutable)
+    FrameAdapterModule->>FrameStore: store_or_replace(frame_packet)
+    FrameStore-->>FrameAdapterModule: stored
 
-    L->>S: start()
-    L->>A: start()
-    A->>A: bind receiving endpoint and begin accepting streams
-
-    loop Camera Service outbound lifecycle
-        CS->>A: initiate gRPC stream to IPS endpoint
-        alt stream accepted
-            A-->>CS: stream accepted
-            loop Frame ingress stream
-                CS-->>A: frame message (raw bytes + metadata)
-                A->>A: validate required ingress fields
-                alt invalid ingress
-                    A->>A: reject frame and continue
-                else valid ingress
-                    A->>A: map to FramePacket
-                    A->>S: store_or_replace(frame_packet)
-                end
-            end
-        else connect error/disconnect
-            CS->>CS: reconnect with outbound backoff policy
-        end
-    end
-
-    loop Pull-based processing
-        L->>S: get_next_frame()
-        alt no available frame
-            S-->>L: None
-            L->>L: continue
-        else frame available
-            S-->>L: FramePacket
-            L->>L: process_frame(frame)
-        end
-    end
-
-    L->>A: stop()
-    A->>A: stop accepting streams and release ingress resources
-    L->>S: stop()
-```
-
-## Supported Ingress Contract
-- gRPC streaming messages sent from Camera Service to IPS receiving endpoint.
-- Required ingress fields: `frame_id`, `camera_id`, `timestamp_ms`, `width`, `height`, `pixel_format`, `num_color_channels`, `bits_per_pixel`, raw payload bytes.
-- Encoded/compressed payload ingress is out of scope for this contract.
-- Adapter accepts ingress messages, validates required fields, and canonicalizes to FramePacket before storage.
-
-## Base Interfaces
-
-### FrameAdapter
-All concrete adapters implement the following conceptual interface:
-- `start()` - Non-blocking. Allocates ingress resources, binds/starts the receiving gRPC service endpoint, and begins accepting Camera Service streams.
-- `stop()` - Graceful shutdown: stop accepting streams, end stream handlers, and release ingress server/network resources.
-- `configure(config: FrameAdapterConfig)` - Provide adapter configuration (bind address, service name, stream policy, and validation options).
-- `health() -> AdapterHealth` - Optional health/status report for monitoring.
-
-### FrameStore
-Frame retrieval is provided only by FrameStore:
-- `store_or_replace(frame_packet: FramePacket)`
-- `get_next_frame() -> FramePacket | None`
-- `start()` / `stop()`
-- `health() -> StoreHealth`
-
-## Concurrency Model
-GrpcFrameIngressAdapter runs one ingress receiving endpoint with one or more server-side stream handlers. Each handler processes incoming messages from an accepted Camera Service stream: validate fields, build FramePacket, then write to FrameStore via `store_or_replace(frame_packet)`.
-
-FrameStore is shared between ingress producer handlers (GrpcFrameIngressAdapter) and the IPS processing loop consumer. IPS pulls frames directly from FrameStore by calling `get_next_frame()`.
-
-## Round-Robin Retrieval Rule (FrameStore)
-- Camera traversal order is fixed by configured camera list order.
-- If a camera slot has no new frame, skip it and continue to next camera.
-- The internal cursor advances across calls and resumes from the next camera after each returned frame.
-- Returning a frame marks that camera slot as consumed until a new frame arrives.
-- If all configured camera slots are empty, `get_next_frame()` returns `None` immediately.
-
-## Storage Sizing
-Storage capacity is proportional to active camera count: one frame slot per camera. With 5 active cameras, maximum retained frames is 5.
-
-## Lifecycle Ordering
-- `start()`: start FrameStore, then start GrpcFrameIngressAdapter receiving endpoint.
-- `stop()`: stop GrpcFrameIngressAdapter receiving endpoint, then stop FrameStore.
-
-## IPS Core Implementation
-
-### GrpcFrameIngressAdapter
-Public adapter implementation for server-side ingress receiving.
-
-- Binds and serves the IPS receiving gRPC endpoint on `start()`.
-- Accepts Camera Service outbound stream connections and handles inbound frame messages.
-- Parses envelope and metadata (`frame_id`, `camera_id`, `timestamp_ms`, `width`, `height`, `pixel_format`, `num_color_channels`, `bits_per_pixel`).
-- Creates FramePacket from raw ingress payload without altering representation.
-- Calls `FrameStore.store_or_replace(frame_packet)` for each accepted frame.
-
-**Interface:**
-- `configure(config)`
-- `start()` / `stop()`
-- `health() -> AdapterHealth`
-
-**Metrics owned:** `frames_in_total`, `ingest_latency_ms`, `active_ingress_streams`, `ingress_rejected_total`.
-
-**Configuration fields owned:**
-```yaml
-bind_address: 0.0.0.0:50061
-service_name: ips.frame_ingress.v1.FrameIngressService
-stream_name: frames
-max_concurrent_streams: 32
+    Note over Caller,FrameStore: Retrieval path
+    Caller->>FrameAdapterModule: get_next_frame()
+    FrameAdapterModule->>FrameStore: get_next_frame()
+    FrameStore-->>FrameAdapterModule: FramePacket | None
+    FrameAdapterModule-->>Caller: FramePacket | None
 ```
 
 ---
 
-### FrameStore
-Pure latest-frame storage and retrieval. No gRPC parsing.
+## 16. Data Flow Diagram
 
-- Exposes `store_or_replace(frame_packet)` ingestion entry point.
-- Stores exactly one latest frame per camera key (`camera_id`).
-- Overwrites the previously stored frame for the same camera on every new arrival.
-- Exposes `get_next_frame()` for round-robin pull retrieval.
-- Does not execute downstream callbacks.
+```mermaid
+flowchart TD
+    A["IngressFrameMessage\nframe_id · camera_id · timestamp_ms\nwidth · height · pixel_format\nnum_color_channels · bits_per_pixel · image_bytes"]
+    B["FrameAdapterInputValidator\nstructurally present message\n(all required fields non-null)"]
+    C["FrameValidator\nvalidated message\n(pixel_format in supported_list · size == w×h×c×bpc)"]
+    D["FramePacketBuilder\nFramePacket\n(immutable · all canonical fields)"]
+    E["FrameStore\nFramePacket per camera_id\n(one slot per camera · latest only)"]
+    F["Caller\nFramePacket | None"]
 
-**Interface:**
-- `store_or_replace(frame_packet: FramePacket)`
-- `get_next_frame() -> FramePacket | None`
-- `start()` / `stop()`
-- `health() -> StoreHealth`
-
-**Metrics owned:** `frames_overwritten_total`, `active_camera_slots`, `frames_served_total`.
-
-**Configuration fields owned:**
-```yaml
-max_camera_slots: 128
-camera_order_source: configured_list
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    E -->|"get_next_frame()\nround-robin"| F
+    A -->|"frame_id · camera_id · timestamp_ms\n(preserved unchanged)"| D
 ```
-
-## Frame Object: FramePacket
-Canonical in-process frame model used by IPS pipeline.
-
-```python
-from dataclasses import dataclass
-from typing import Any, Dict
-
-
-@dataclass
-class FramePacket:
-    frame_id: str           # provided by Camera Service ingress
-    camera_id: str
-    timestamp_ms: int       # epoch milliseconds
-    width: int
-    height: int
-    pixel_format: str       # e.g., 'RGB', 'BGR', 'GRAY8', 'YUV420'
-    num_color_channels: int
-    bits_per_pixel: int
-    image_bytes: bytes      # raw ingress payload bytes only
-    metadata: Dict[str, Any]
-```
-
-### Payload Handoff to Transformation Layer
-
-- `image_bytes` is the canonical payload field produced by Frame Adapter.
-- In transformation-layer contracts that use `payload`, `payload` maps directly to `FramePacket.image_bytes`.
-- `metadata` should carry `encoding` when payload is encoded (for example `JPEG`, `H264`) and `pixel_format` remains mandatory.
-- Frame Adapter does not decode or transcode payload bytes. Decoding is delegated to the transformation boundary `PayloadDecoder`.
-
-**Mutability Strategy:**
-- FramePacket carries ingest/core fields produced by the ingress receiver.
-- Raw payload fields are immutable by policy after creation.
-
-**Adapter Conversion Rules:**
-- Preserve ingress representation; do not decode or transcode in Frame Adapter.
-- Populate `width`, `height`, `pixel_format`, `num_color_channels`, `bits_per_pixel` from ingress metadata.
-- Validate metadata consistency against payload expectations when possible.
-- `frame_id` and `camera_id` come from Camera Service ingress and are mandatory.
-
-## Communication and Integration
-
-- Camera Service owns outbound stream initiation toward IPS.
-- GrpcFrameIngressAdapter owns the receiving endpoint lifecycle and accepted-stream handling inside IPS.
-- GrpcFrameIngressAdapter receives gRPC frame messages from Camera Service and writes accepted frames to FrameStore.
-- IPS pipeline calls `FrameStore.get_next_frame()` directly to pull frames in round-robin order.
-
-**Explicit communication model note:**
-"Camera Service is the active streaming sender. IPS Frame Adapter is the passive receiving ingress endpoint. IPS does not dial Camera Service to pull frames in this architecture."
-
-## Initialization / DI Wiring
-1. Config loader reads adapter and store config (IPS bind address/service options, validation options, storage options).
-2. Composition root creates one shared FrameStore instance.
-3. Composition root creates GrpcFrameIngressAdapter, injecting the shared FrameStore.
-4. Call `adapter.start()` to bind/start the IPS receiving endpoint.
-5. Camera Service connects and pushes frame messages into IPS.
-6. Processing loop pulls frames directly from the shared FrameStore:
-
-```python
-store = FrameStore(store_config)
-adapter = GrpcFrameIngressAdapter(adapter_config, store)
-
-adapter.start()
-
-while running:
-    frame = store.get_next_frame()
-    if frame is None:
-        continue
-    process_frame(frame)
-```
-
-## Implementation Notes
-- Camera ingestion inside IPS is gRPC-only and receiving-endpoint based.
-- Ingress payload is raw-only; encoded/compressed ingress is rejected.
-- Camera Service handles outbound reconnect policy when streams disconnect.
-- FrameStore intentionally overwrites stale frames for the same camera.
-- Retrieval order is round-robin across cameras using fixed configured camera list order.
-- Unit tests for FrameStore: overwrite semantics, round-robin order, per-camera isolation, max slot bounds.
-
-## Verification Checklist
-
-**GrpcFrameIngressAdapter**
-- [ ] Unit tests pass: server-side stream handling, gRPC ingress parsing, FramePacket mapping, timestamp handling.
-- [ ] Endpoint lifecycle validated: bind/start accepts streams on `start()`, stop rejects new streams on `stop()`.
-- [ ] Ingress mapping validated (`frame_id`, `camera_id`, `pixel_format`, `num_color_channels`, `bits_per_pixel`).
-- [ ] Integration with FrameStore validated (`store_or_replace` called for accepted frames).
-
-**Camera Service integration contract**
-- [ ] Camera Service initiates outbound stream toward IPS ingress endpoint.
-- [ ] Camera Service reconnect behavior validated when IPS endpoint is unavailable or connection drops.
-
-**FrameStore**
-- [ ] One-slot-per-camera behavior validated.
-- [ ] With 5 active cameras, retained frames never exceed 5.
-- [ ] New frame for camera replaces prior stored frame for same camera.
-- [ ] `get_next_frame()` returns frames in round-robin fixed configured camera order.
-- [ ] Overwrite on camera A does not affect camera B.
-- [ ] FrameStore does not invoke downstream consumers; retrieval is pull-only via `get_next_frame()`.
-
-**End-to-end flow**
-- [ ] Integration test: Camera Service -> GrpcFrameIngressAdapter -> FrameStore -> IPS pull loop.
-
-## Design Goals
-- Clear separation: GrpcFrameIngressAdapter owns ingress receiving endpoint and canonicalization; FrameStore owns latest-frame storage and retrieval.
-- Camera Service remains the active outbound sender and reconnect owner.
-- Always prefer newest frame per camera over backlog processing.
-- Bound memory by camera count (one frame per camera).
-- Round-robin fairness across cameras in retrieval order.
 
 ---
 
-## Appendix: Minimal Ingress-to-FramePacket Mapping Example (Python)
-```python
-import time
+## 17. Extensibility
 
+**What can change without breaking the public API:**
 
-def ingress_to_framepacket(payload_bytes, src_meta):
-    return FramePacket(
-        frame_id=src_meta["frame_id"],
-        camera_id=src_meta["camera_id"],
-        timestamp_ms=src_meta.get("pts_ms") or int(time.time() * 1000),
-        width=src_meta["width"],
-        height=src_meta["height"],
-        pixel_format=src_meta["pixel_format"],
-        num_color_channels=src_meta["num_color_channels"],
-        bits_per_pixel=src_meta["bits_per_pixel"],
-        image_bytes=payload_bytes,
-        metadata=src_meta,
-    )
-```
+- Transport implementation (`GrpcFrameIngressTransport` → any implementation of `FrameIngressTransport`)
+- Transport protocol or gRPC version — internal to the transport implementation
+- `FrameStore` storage backend (in-memory → persistent store, via configuration)
+- `supported_pixel_formats` list (configuration-only change)
+- `max_camera_slots` and `camera_order_source` (configuration-only changes)
 
-**Appendix wording note:**
-The mapping example assumes payload bytes arrive from an already accepted Camera Service outbound stream into the IPS receiving endpoint. The adapter maps and validates only; it does not dial Camera Service and does not decode/transcode payload bytes.
+**What must remain stable:**
+
+- `get_next_frame() -> FramePacket | None` signature
+- Output schema: `{ frame_id, camera_id, timestamp_ms, width, height, pixel_format, num_color_channels, bits_per_pixel, image_bytes }`
+- `None` semantics for the no-frame-available and all-failure scenarios
+
+---
+
+## 18. Module Compliance Checklist
+
+- [ ] One frame per `get_next_frame()` call — module must not return batched frame output
+- [ ] RAW payload enforced — `image_bytes` must contain only raw unencoded pixel data; JPEG, H264, and any encoded format must be rejected by `FrameValidator`
+- [ ] No `metadata` field — `FramePacket` must not contain a `metadata` field or any transport envelope field
+- [ ] FramePacket immutable after construction — no field may be modified after `FramePacketBuilder.build()` returns
+- [ ] `FrameValidator` is the sole accept/reject decision maker — no other component may accept or discard frames based on content
+- [ ] Payload size formula enforced — `len(image_bytes) == width × height × num_color_channels × (bits_per_pixel / 8)` must be verified before acceptance
+- [ ] Transport abstraction respected — `FrameAdapterModule` depends on `FrameIngressTransport` interface, not on `GrpcFrameIngressTransport` directly
+- [ ] No transport artifacts in `FramePacket` — stream identifiers, envelope fields, and transport metadata must not appear in output
+- [ ] Field metadata preserved — `frame_id`, `camera_id`, `timestamp_ms` copied unchanged from input to `FramePacket`
+- [ ] `None` returned for all no-frame scenarios — empty store and all-slots-consumed result in `None`; invalid ingress frames are silently discarded (ingress path produces no output)

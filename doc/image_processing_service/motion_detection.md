@@ -19,12 +19,11 @@ The Motion Detection module is responsible for detecting motion between consecut
 
 The Motion Detection Module does NOT:
 
-- Perform image format conversion, color space conversion, layout conversion, dtype conversion, or normalization — handled outside this module
-- Detect specific objects, faces, or persons — handled outside this module
+- Perform image format conversion, color space conversion, layout conversion, dtype conversion, or normalization
+- Detect specific objects, faces, or persons
 - Perform identity matching or recognition
 - Maintain shared state across different `camera_id` values
 - Expose raw pixel difference values, motion fractions, or pixel counts in any output
-- Make downstream processing decisions based on the detection result
 
 ---
 
@@ -32,28 +31,13 @@ The Motion Detection Module does NOT:
 
 ### 2.1 Input Responsibility Boundary
 
-The module receives a fully prepared `FramePacket`. The `image` inside that packet already conforms to the module's expected image contract before `processFrame` is called. The following preparations have already been applied outside this module:
-
-- Image format conversion (color space, layout, dtype)
-- Value range normalization
-- Frame-level preprocessing
-
-The Motion Detection module does not perform any of the above. Only motion measurement computation, decision policy application, and result writing are performed inside this module.
+The module expects the input `FramePacket` to already conform to the required image contract before `processFrame` is called. Image format conversion, layout conversion, dtype conversion, and normalization are performed upstream. The Motion Detection module does not perform any preprocessing. The module enforces the image contract at the boundary via `InputValidator`.
 
 The module processes exactly one `FramePacket` per invocation.
 
 ### 2.2 Input Structure
 
 ```text
-struct Image {
-    uint32 width;
-    uint32 height;
-    string color_format;
-    string layout;
-    string dtype;
-    bytes  pixels;
-}
-
 struct FramePacket {
     uint64 frame_id;
     string camera_id;
@@ -62,7 +46,10 @@ struct FramePacket {
 }
 ```
 
-`Image` is an opaque type. Its internal pixel representation is not defined by this module. The module depends only on the stated contract in Section 2.3.
+- `frame_id` identifies the source frame for traceability.
+- `camera_id` identifies the source camera and is used to scope stored previous-frame state in `MotionFrameStore`.
+- `timestamp_ms` is the capture timestamp in milliseconds.
+- `image` is the prepared grayscale frame used as the current image for motion measurement.
 
 ### 2.3 Input Contract
 
@@ -73,7 +60,7 @@ struct FramePacket {
 - `dtype`: `uint8`
 - `value_range`: `[0, 255]`
 
-The module does not perform any image preprocessing. It depends on the upstream component to guarantee this contract.
+The module does not perform any image preprocessing. `InputValidator` enforces this contract and rejects any packet that does not satisfy it.
 
 ### 2.4 Validation Rules
 
@@ -88,13 +75,6 @@ The module does not perform any image preprocessing. It depends on the upstream 
 - `image.dtype` must be `uint8`
 - `image.width` and `image.height` must be greater than zero
 
-### 2.5 Input Semantics
-
-- `frame_id` — source frame identifier; preserved for traceability; not used in motion computation
-- `camera_id` — source camera identifier; used to scope stored frame state in `MotionFrameStore`
-- `timestamp_ms` — capture timestamp in milliseconds; preserved for traceability
-- `image` — the prepared grayscale frame; used as the current frame in motion measurement
-
 ---
 
 ## 3. Output
@@ -102,19 +82,11 @@ The module does not perform any image preprocessing. It depends on the upstream 
 ### 3.1 Output Structure
 
 ```text
-enum MotionControlResult {
-    MOTION_DETECTED,
-    NO_MOTION_DETECTED,
-    NO_PREVIOUS_FRAME,
-    INVALID_FRAME,
-    PROCESSING_ERROR
-}
-
 struct BoundingBox {
-    int32 x1;
-    int32 y1;
-    int32 x2;
-    int32 y2;
+    int32 x;       // x coordinate of the top-left corner, in full-frame pixel space
+    int32 y;       // y coordinate of the top-left corner, in full-frame pixel space
+    int32 width;   // width of the bounding box in pixels
+    int32 height;  // height of the bounding box in pixels
 }
 
 struct MotionResult {
@@ -123,12 +95,12 @@ struct MotionResult {
 }
 ```
 
-The module writes `MotionResult` into `FramePacket.motion` before `processFrame` returns. `FramePacket.motion` is set atomically and is considered immutable after the call returns. `processFrame` returns a `MotionControlResult` for caller control flow.
+The module writes `MotionResult` into `FramePacket.motion` before `processFrame` returns. `FramePacket.motion` is set atomically and is considered immutable after the call returns. `FramePacket.motion` is the ONLY external output of the module. All internal processing states are not exposed.
 
 ### 3.2 Output Semantics
 
 - `detected` — always present; `true` when motion was identified, `false` otherwise
-- `bboxes` — present only when `detected = true`; each entry is a bounding box in full-frame pixel coordinates; absent when `detected = false`; contains at least one entry when `detected = true`
+- `bboxes` — the module's authoritative spatial output for detected motion regions; each bounding box fully defines the spatial extent of a contiguous rectangular motion region; bounding boxes are axis-aligned and non-rotated; bounding boxes are the ONLY spatial output of the module; no masks, contours, or alternative spatial representations are exposed; all coordinates are expressed relative to the input image coordinate system, with the origin at the top-left corner of the image; present only when `detected = true`, absent when `detected = false`; at least one entry is always present when `detected = true`
 
 ### 3.3 Output Constraints
 
@@ -139,6 +111,10 @@ The output must NOT expose:
 - Per-pixel threshold results or binary motion masks
 - Internal state from `MotionFrameStore`
 - Algorithm-specific intermediate data or flags
+- Spatial artifacts other than `bboxes` — no contours, region maps, or other spatial representations are exposed
+- Bounding boxes must have strictly positive width and height
+
+`bboxes` are the module's only spatial output. No other spatial artifacts, masks, contours, or region maps cross the module boundary.
 
 All motion measurement computations and intermediate results remain strictly internal. The only externally visible result is `FramePacket.motion`.
 
@@ -147,8 +123,10 @@ All motion measurement computations and intermediate results remain strictly int
 ## 4. Public API
 
 ```text
-MotionControlResult processFrame(packet: FramePacket)
+FramePacket processFrame(packet: FramePacket)
 ```
+
+The method does not return a status enum. The result of the module is fully expressed through `FramePacket.motion`.
 
 The API must remain stable regardless of which motion detection algorithm is configured. `motion_fraction_threshold`, `motion_pixel_count_threshold`, `motion_threshold`, and `min_bbox_area` are never parameters — they are immutable internal configuration state loaded at initialization.
 
@@ -157,7 +135,7 @@ The API must remain stable regardless of which motion detection algorithm is con
 ## 5. Non-Functional Requirements
 
 - **Stateful** — `MotionFrameStore` retains exactly one previous frame per `camera_id` across invocations; all other processing is per-call with no cross-frame state
-- **Single frame per invocation** — the upstream component is responsible for dispatching individual `FramePacket` items; the module must not accept batched input
+- **Single frame per invocation** — the module processes exactly one `FramePacket` per invocation and must not accept batched input
 - **Real-time capable** — suitable for per-frame online processing
 - **Deterministic** — same input, same configuration, and same stored previous frame produce the same output
 - **Algorithm-agnostic API** — the public output schema is independent of the underlying motion detection algorithm
@@ -181,11 +159,20 @@ interface MotionDetectionAlgorithm {
 class FrameDifferencingMotionDetector implements MotionDetectionAlgorithm
 ```
 
-`FrameDifferencingMotionDetector` is an algorithmic engine (classical image processing). It computes per-pixel absolute frame differences, produces a binary motion mask, counts changed pixels, computes a motion fraction, and extracts contour bounding boxes filtered by `min_bbox_area`. It returns a `MotionMeasurementResult` containing only measurements — it does not decide whether motion occurred.
+`FrameDifferencingMotionDetector` is an algorithmic engine (classical image processing). Its internal pipeline performs the following steps in order:
+
+1. Compute per-pixel absolute difference between `previous` and `current` frames.
+2. Apply `motion_threshold` to the difference to produce a binary motion mask.
+3. Run contour or connected-component analysis on the binary mask to extract candidate motion regions.
+4. Convert each candidate region to a `BoundingBox` with fields `(x, y, width, height)` in full-frame pixel coordinates, where `(x, y)` is the top-left corner.
+5. Discard any `BoundingBox` whose area (`width * height`) is less than `min_bbox_area`.
+6. Return all surviving boxes together with `motion_pixel_count` and `motion_fraction` in a `MotionMeasurementResult`.
+
+It does not decide whether motion occurred.
 
 ### 6.3 Replaceability
 
-The module depends on the `MotionDetectionAlgorithm` interface, not on `FrameDifferencingMotionDetector` directly. Any algorithm that implements `MotionDetectionAlgorithm` may be substituted without changing the `FramePacket` input structure, `MotionResult` output structure, or calling code. Replacing the engine does NOT affect the public API.
+The module depends on the `MotionDetectionAlgorithm` interface, not on `FrameDifferencingMotionDetector` directly. Any algorithm that implements `MotionDetectionAlgorithm` may be substituted without changing the `FramePacket` input structure, `MotionResult` output structure, or calling code. Replacing the engine does NOT affect the public API. The module depends on the MotionDetectionAlgorithm abstraction and is not coupled to any specific implementation.
 
 ---
 
@@ -197,7 +184,9 @@ Detection acceptance is threshold-based and exclusively managed by `MotionDecisi
 - `MotionDecisionPolicy` applies `motion_fraction_threshold` and `motion_pixel_count_threshold`. If `motion_fraction >= motion_fraction_threshold` OR `motion_pixel_count >= motion_pixel_count_threshold`, the bboxes from `MotionMeasurementResult` are evaluated. If at least one bbox remains, `detected` is set to `true`.
 - If no bboxes remain in `MotionMeasurementResult.bboxes` after `min_bbox_area` filtering — regardless of whether pixel-count or fraction thresholds were met — `detected` MUST be set to `false`.
 - The thresholds are loaded from configuration at initialization. They are immutable and not adjustable per invocation.
-- No scores, fractions, or raw measurements are returned to the caller.
+- The decision rule is deterministic and evaluated independently for each invocation.
+- No scores, fractions, or raw measurements are returned.
+- The decision is strictly binary and does not produce confidence scores or probabilistic outputs.
 - `MotionDecisionPolicy` is the only place inside the module that sets `detected`.
 
 ---
@@ -214,7 +203,7 @@ Its responsibilities are:
 - invoke internal components in the correct pipeline order
 - pass results between components
 - write the final result into `FramePacket.motion` via `MotionOutputBuilder`
-- return a `MotionControlResult` to the caller
+- return the updated `FramePacket`
 
 During initialization, `MotionDetectionManager` is responsible for loading the module configuration and wiring each internal component with its required settings, including injecting `motion_threshold` and `min_bbox_area` into `FrameDifferencingMotionDetector`, and `motion_fraction_threshold` and `motion_pixel_count_threshold` into `MotionDecisionPolicy`.
 
@@ -230,7 +219,7 @@ Its responsibilities are:
 - verify that `camera_id` is non-empty
 - verify that `image` conforms to the input contract (`color_format = GRAY`, `layout = HWC`, `dtype = uint8`, positive dimensions)
 
-`InputValidator` must not perform image preprocessing, access `MotionFrameStore`, or make any acceptance decisions.
+`InputValidator` must not perform image preprocessing, access `MotionFrameStore`, or make any acceptance decisions. `InputValidator` must not modify the input `FramePacket`.
 
 ### 8.3 MotionDetectionAlgorithm
 
@@ -239,8 +228,11 @@ Its responsibilities are:
 Its responsibilities are:
 
 - accept a previous frame and a current frame from the orchestrator
-- compute motion measurements over the frame pair
-- return a `MotionMeasurementResult` containing `motion_pixel_count`, `motion_fraction`, and candidate `bboxes` filtered by `min_bbox_area`
+- compute per-pixel absolute frame differences and apply `motion_threshold` to produce a binary motion mask
+- extract candidate motion regions from the mask via contour or connected-component analysis
+- convert each candidate region to a `BoundingBox` `(x, y, width, height)` in full-frame pixel coordinates, where `(x, y)` is the top-left corner
+- discard any box whose area (`width * height`) is less than `min_bbox_area`
+- return a `MotionMeasurementResult` containing `motion_pixel_count`, `motion_fraction`, and the surviving `bboxes`
 
 `MotionDetectionAlgorithm` must not decide whether motion occurred, write to `FramePacket.motion`, or access `MotionFrameStore`.
 
@@ -258,7 +250,7 @@ Its responsibilities are:
 - set `detected = false` when no bboxes remain, regardless of threshold conditions
 - return a `MotionDetectionResultInternal` containing `detected` and the accepted `bboxes`
 
-`MotionDecisionPolicy` must not compute raw pixel measurements, access frame data, or access `MotionFrameStore`. It is the only component that sets `detected`.
+`MotionDecisionPolicy` must not compute raw pixel measurements, access frame data, or access `MotionFrameStore`. It is the only component that sets `detected`. The decision is strictly binary and does not produce confidence scores or probabilistic outputs.
 
 ### 8.5 MotionFrameStore
 
@@ -271,6 +263,8 @@ Its responsibilities are:
 - scope all state and synchronization per `camera_id` to avoid blocking across unrelated cameras
 
 `MotionFrameStore` must not share state across `camera_id` values, block processing for one camera due to another camera's lock, or make any motion detection decisions.
+
+The stored previous frame is strictly internal to the module. It must not be exposed outside the module boundary in any form.
 
 ### 8.6 MotionOutputBuilder
 
@@ -291,16 +285,16 @@ For one invocation of `processFrame`, the internal pipeline follows this order:
 **InputValidator → MotionFrameStore → MotionDetectionAlgorithm → MotionDecisionPolicy → MotionOutputBuilder**
 
 1. `MotionDetectionManager` receives `FramePacket`.
-2. `MotionDetectionManager` calls `InputValidator.validate(packet)` → void. On failure: calls `MotionOutputBuilder.write(packet, detected=false)` and returns `INVALID_FRAME`; current frame is not stored.
+2. `MotionDetectionManager` calls `InputValidator.validate(packet)` → void. On failure: calls `MotionOutputBuilder.write(packet, detected=false)`, writes `detected=false` and terminates processing; current frame is not stored.
 3. `MotionDetectionManager` calls `MotionFrameStore.retrieve(camera_id)` → `Image` or null.
-4. If retrieve returns null: calls `MotionOutputBuilder.write(packet, detected=false)`, then `MotionFrameStore.store(camera_id, currentFrame)`, and returns `NO_PREVIOUS_FRAME`.
+4. If retrieve returns null: calls `MotionOutputBuilder.write(packet, detected=false)`, then `MotionFrameStore.store(camera_id, currentFrame)`, writes `detected=false`, stores current frame, and terminates processing.
 5. `MotionDetectionManager` calls `MotionDetectionAlgorithm.measure(previousFrame, currentFrame)` → `MotionMeasurementResult`.
 6. `MotionDetectionManager` calls `MotionDecisionPolicy.decide(measurementResult)` → `MotionDetectionResultInternal`.
 7. `MotionDetectionManager` calls `MotionOutputBuilder.write(packet, resultInternal)` → void.
 8. `MotionDetectionManager` calls `MotionFrameStore.store(camera_id, currentFrame)` → void.
-9. `MotionDetectionManager` returns `MOTION_DETECTED` or `NO_MOTION_DETECTED` to the caller.
+9. `MotionDetectionManager` returns the updated `FramePacket`.
 
-All intermediate data (`MotionMeasurementResult`, `MotionDetectionResultInternal`) remain strictly internal to the module.
+All intermediate data remain strictly internal to the module.
 
 ---
 
@@ -331,18 +325,20 @@ Injection at construction time:
 
 ## 10. Internal Data Structures
 
-- **`MotionMeasurementResult`** — raw motion measurements; contains `motion_pixel_count: int32`, `motion_fraction: float`, and candidate `bboxes: vector<BoundingBox>` filtered by `min_bbox_area`; produced by `MotionDetectionAlgorithm`, consumed by `MotionDecisionPolicy`; lifecycle: per-call
+- **`MotionMeasurementResult`** — raw motion measurements; contains `motion_pixel_count: int32`, `motion_fraction: float`, and candidate `bboxes: vector<BoundingBox>` filtered by `min_bbox_area`; produced by `MotionDetectionAlgorithm`, consumed by `MotionDecisionPolicy`; strictly internal to the module; must never cross the module boundary; must never be written to `FramePacket.motion`; lifecycle: per-call
 - **`MotionDetectionResultInternal`** — binary detection decision; contains `detected: bool` and accepted `bboxes: vector<BoundingBox>`; produced by `MotionDecisionPolicy`, consumed by `MotionOutputBuilder`; lifecycle: per-call
-- **`BoundingBox`** — axis-aligned rectangle in full-frame pixel coordinates; fields: `x1: int32`, `y1: int32`, `x2: int32`, `y2: int32`; used in `MotionMeasurementResult` and `MotionDetectionResultInternal`; lifecycle: per-call
+- **`BoundingBox`** — axis-aligned rectangle in full-frame pixel coordinates; fields: `x: int32`, `y: int32`, `width: int32`, `height: int32`; `(x, y)` is the top-left corner of the region; `width` and `height` are measured in pixels; all coordinates are expressed relative to the full input frame; used in `MotionMeasurementResult` and `MotionDetectionResultInternal`; lifecycle: per-call
 
 ---
 
 ## 11. Error Handling
 
-- **Validation failure** (missing fields, contract mismatch, zero dimensions) → write `detected = false` to `FramePacket.motion`, return `INVALID_FRAME`; current frame is not stored
-- **Algorithm runtime failure** (`MotionDetectionAlgorithm.measure` error) → catch internally, write `detected = false` to `FramePacket.motion`, return `PROCESSING_ERROR`; current frame is not stored
-- **No previous frame** (`MotionFrameStore.retrieve` returns null) → write `detected = false`, store current frame, return `NO_PREVIOUS_FRAME`; normal first-frame operation
+- **Validation failure** (missing fields, contract mismatch, zero dimensions) → write `detected = false` to `FramePacket.motion`; current frame is not stored; error tracked via metrics/logs
+- **Algorithm runtime failure** (`MotionDetectionAlgorithm.measure` error) → catch internally, write `detected = false` to `FramePacket.motion`; current frame is not stored; error tracked via metrics/logs
+- **No previous frame** (`MotionFrameStore.retrieve` returns null) → write `detected = false`, store current frame; normal first-frame operation; tracked via metrics/logs
 - **No bboxes after filtering** (all contours below `min_bbox_area`) → `MotionDecisionPolicy` sets `detected = false`; normal operation
+
+All error states result in `detected = false` written to `FramePacket.motion`. In all error scenarios, no partial or intermediate results are exposed; `FramePacket.motion.detected = false` is the only output written. Error conditions are tracked via metrics and logs, not via API return values.
 
 ---
 
@@ -350,12 +346,12 @@ Injection at construction time:
 
 - `processing_time_ms` — total duration of `processFrame` per invocation
 - `algorithm_time_ms` — duration of `MotionDetectionAlgorithm.measure` per invocation
-- `motion_detected_count` — invocations that returned `MOTION_DETECTED`
-- `no_previous_frame_count` — invocations that returned `NO_PREVIOUS_FRAME`
+- `motion_detected_count` — invocations where motion was detected
+- `no_previous_frame_count` — invocations where no previous frame was available for the given `camera_id`
 - `invalid_frame_count` — invocations rejected by `InputValidator`
 - `processing_error_count` — invocations terminated by an algorithm runtime failure
 
-Metrics are internal and operational. Not part of the public API.
+Metrics are internal and operational. Not part of the public API. These counters replace the need for exposing control-flow enums via the public API.
 
 ---
 
@@ -388,7 +384,7 @@ The module is stateful. `MotionFrameStore` retains one frame per `camera_id` acr
 ```mermaid
 classDiagram
     class MotionDetectionManager {
-        +processFrame(packet: FramePacket) MotionControlResult
+        +processFrame(packet: FramePacket) FramePacket
     }
 
     class InputValidator {
@@ -442,10 +438,10 @@ classDiagram
     }
 
     class BoundingBox {
-        +x1: int32
-        +y1: int32
-        +x2: int32
-        +y2: int32
+        +x: int32
+        +y: int32
+        +width: int32
+        +height: int32
     }
 
     MotionDetectionManager --> InputValidator : orchestrates
@@ -483,7 +479,7 @@ sequenceDiagram
         Validator-->>Manager: validation error
         Manager->>Builder: write(packet, detected=false)
         Builder-->>Manager: void
-        Manager-->>Caller: INVALID_FRAME
+        Manager-->>Caller: FramePacket
     else valid input, no previous frame
         Manager->>Validator: validate(packet)
         Validator-->>Manager: input valid
@@ -493,7 +489,7 @@ sequenceDiagram
         Builder-->>Manager: void
         Manager->>Store: store(camera_id, currentFrame)
         Store-->>Manager: void
-        Manager-->>Caller: NO_PREVIOUS_FRAME
+        Manager-->>Caller: FramePacket
     else valid input, previous frame exists
         Manager->>Validator: validate(packet)
         Validator-->>Manager: input valid
@@ -507,7 +503,7 @@ sequenceDiagram
         Builder-->>Manager: void
         Manager->>Store: store(camera_id, currentFrame)
         Store-->>Manager: void
-        Manager-->>Caller: MOTION_DETECTED | NO_MOTION_DETECTED
+        Manager-->>Caller: FramePacket
     end
 ```
 
@@ -523,15 +519,13 @@ flowchart TD
     D["MotionDetectionAlgorithm\nMotionMeasurementResult\n(motion_pixel_count · motion_fraction · bboxes)"]
     E["MotionDecisionPolicy\nMotionDetectionResultInternal\n(detected · bboxes)"]
     F["MotionOutputBuilder\nFramePacket.motion\n(detected · bboxes)"]
-    G["Caller\nMotionControlResult"]
 
     A --> B
     B --> C
     C --> D
     D --> E
     E --> F
-    A -->|"frame_id · camera_id · timestamp_ms"| F
-    F --> G
+    A -->|"frame_id \u00b7 camera_id \u00b7 timestamp_ms"| F
 ```
 
 ---
@@ -543,12 +537,14 @@ flowchart TD
 - Motion detection algorithm (`FrameDifferencingMotionDetector` → any class implementing `MotionDetectionAlgorithm`)
 - Internal algorithm parameters and processing approach — internal to the algorithm implementation
 - Detection thresholds (`motion_fraction_threshold`, `motion_pixel_count_threshold`, `motion_threshold`, `min_bbox_area`) — configuration-only changes
+- MotionDecisionPolicy can be replaced independently of the motion detection algorithm.
 
 **What must remain stable:**
 
-- `processFrame(packet: FramePacket) -> MotionControlResult` signature
-- Output schema written to `FramePacket.motion`: `{ detected, bboxes }`
+- `processFrame(packet: FramePacket) -> FramePacket` signature
+- The module's external contract is defined exclusively by `FramePacket.motion`.
 - `detected = false` semantics for invalid input, no previous frame, and no-motion scenarios
+- The module produces spatial motion regions valid for direct geometric use without further normalization; the `bboxes` output is fully defined, axis-aligned, and coordinate-stable relative to the input frame
 
 ---
 
@@ -562,4 +558,7 @@ flowchart TD
 - [ ] `detected = false` when no bboxes remain — `MotionDecisionPolicy` must set `detected = false` when all bboxes are filtered by `min_bbox_area`, regardless of threshold conditions
 - [ ] Preprocessing boundary enforced — module performs no image format conversion, color conversion, layout conversion, dtype conversion, or normalization
 - [ ] State scoped per `camera_id` — `MotionFrameStore` must not share state or locks across different `camera_id` values
-- [ ] `detected = false` returned for all non-detection scenarios — including invalid input, no previous frame, threshold miss, empty bbox list, and runtime failure
+- [ ] `detected = false` written for all non-detection scenarios — including invalid input, no previous frame, threshold miss, empty bbox list, and runtime failure
+- [ ] Module does not expose control-flow enums via public API
+- [ ] All outcomes are expressed via `FramePacket.motion` only
+- [ ] MotionDecisionPolicy is the only component that sets detected

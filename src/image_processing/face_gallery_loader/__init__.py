@@ -11,6 +11,7 @@ from .module import (
     GalleryPathValidationError,
     GalleryPathValidator,
     GalleryDirectoryScanner,
+    NpyEmbeddingFileReader,
     PersonScanRecord,
     StubEmbeddingFileReader,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "GalleryLoadError",
     "GalleryPathValidationError",
     "GalleryPathValidator",
+    "NpyEmbeddingFileReader",
     "PersonScanRecord",
     "StubEmbeddingFileReader",
 ]

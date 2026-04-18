@@ -1,474 +1,567 @@
-detections = object_detector.detect(frame_packet)
-def build_pipeline(config):
-# Image Processing Service
+﻿# Image Processing Service Module Specification
 
-## Overview
+## 1. Overview
 
-The Image Processing Service (IPS) ingests frames from the Camera Service, normalizes them into a canonical `FramePacket`, exposes an internal Frame Transformation Layer for algorithm-specific data preparation, runs deterministic processing modules (motion, object, face, identity), and emits structured events to downstream services.
+### Purpose
 
-## Responsibilities
+The Image Processing Service (IPS) module is responsible for executing a deterministic internal processing pipeline over a single `FramePacket`. It receives a prepared `FramePacket`, orchestrates all internal detection and recognition stages, and returns a structured `IPSOutput` containing the set of recognized faces found in the frame.
 
-- Ingest frames via gRPC and normalize into `FramePacket`.
-- Provide a pull-based internal transformation layer that converts immutable `FramePacket` input into algorithm-specific working representations.
-- Execute pipeline modules in deterministic order and attach results to `FramePacket`.
-- Publish structured events to the Event Service according to configured rules.
-- Expose diagnostics and pipeline tracing for observability.
+IPS owns orchestration only. It does not implement detection algorithms, embedding logic, or preprocessing. Each processing responsibility belongs to a dedicated internal module. IPS wires those modules together, controls execution order, applies routing decisions, performs region cropping, and projects coordinates between stages.
 
-## Position in System Architecture
+### In Scope
 
-- Upstream: `Camera Service` (RTSP/USB/file/synthetic).
-- Downstream: `Event Service` (event streams), `Media Service` (clip generation via Frame Buffer Service).
-- The IPS is not responsible for storing video clips.
+- Executing the per-frame detection and recognition pipeline
+- Invoking internal modules in the defined execution order
+- Applying routing logic (stop conditions and per-person skip logic)
+- Cropping region-of-interest images at each pipeline stage via `FrameCroppingModule`
+- Projecting ROI-local detections to full-frame coordinates via `CoordinateProjector`
+- Requesting prepared input representations from `FrameTransformationLayer` before each module
+- Accumulating projected person bounding boxes and face detections into `FramePacket`
+- Aggregating all recognition results into a single `IPSOutput`
 
-## High-Level Architecture
+### Out of Scope
 
-```mermaid
-flowchart TB
-    subgraph CameraService[Camera Service]
-        CA1[UsbCameraAdapter]
-        CA2[RtspCameraAdapter]
-        CA3[FileReplayAdapter]
-        CA4[SyntheticGeneratorAdapter]
-        CA5[GrpcAdapter]
-    end
+The Image Processing Service does NOT:
 
-    subgraph ImageProcessing[Image Processing Service]
-        FA[Frame Adapter]
-      FTL[Frame Transformation Layer]
-        PO[Pipeline Orchestrator]
-        MD[Motion Detection]
-        OD[Object Detection]
-        FD[Face Detection]
-        IR[Identity Recognition]
-        EP[Event Publisher]
-    end
-
-    EventService[Event Service]
-
-  CameraService --> FA --> PO
-  MD -. requests representations .-> FTL
-  OD -. requests representations .-> FTL
-  FD -. requests representations .-> FTL
-  IR -. requests representations .-> FTL
-  PO --> MD --> OD --> FD --> IR --> EP
-    EP --> EventService
-```
-
-## Internal Data Preparation
-
-IPS includes an internal Frame Transformation Layer that sits alongside the processing modules.
-
-- The Frame Adapter remains responsible for ingress parsing and canonical `FramePacket` creation.
-- The Frame Transformation Layer is responsible for interpreting `FramePacket` metadata and returning algorithm-specific working representations.
-- A dedicated `PayloadDecoder` component inside the transformation boundary decodes `FramePacket` payload bytes into deterministic internal decode buffers used by the transformation pipeline.
-- Pipeline modules pull the specific representation they need from the transformation layer.
-- The Pipeline Orchestrator remains responsible for execution order and pipeline control decisions.
-
-The Frame Transformation Layer is not a replacement for the Frame Adapter and is not itself a detection stage. It is an internal data-preparation utility used by modules on demand. See `doc/FRAME_TRANSFORMATION_LAYER.md` for the full architecture and representation contracts.
+- Implement motion detection, object detection, face detection, or face recognition algorithms
+- Perform any image preprocessing — color conversion, resizing, normalization, layout conversion, or dtype conversion
+- Manage identity enrollment or gallery updates
+- Access the filesystem after initialization
+- Process multiple `FramePacket` instances concurrently within one pipeline execution
+- Accept batched input — one `FramePacket` per invocation
 
 ---
 
-# Modules
+## 2. Input Definition
 
-## Motion Detection
+### 2.1 Public API
 
-### Overview
-
-Motion Detection is an internal, first-stage module of the Image Processing Service (IPS) that determines whether a given `FramePacket` contains perceptible motion relative to a previously-stored frame for the same `camera_id`. It runs as a pipeline stage invoked by the Pipeline Orchestrator and is responsible for producing a deterministic motion result attached to the `FramePacket`.
-
-### Purpose & responsibilities (service-level)
-
-- Validate incoming `FramePacket` against configured limits (resolution, fields).
-- Compare the current frame to a stored previous frame for the same `camera_id` and determine whether motion exists.
-- Populate `FramePacket.motion` with a motion result (e.g., `motion_detected`, `score`, optional mask or ROIs) and emit lightweight metrics.
-- Provide a manager API for the orchestrator to call (e.g., `process(frame_packet) -> MotionResult`).
-
-Note: Motion Detection does NOT publish events. It annotates the `FramePacket` and returns a result to the Pipeline Orchestrator which decides whether to continue downstream processing and whether events should be emitted.
-
-### Inputs and outputs
-
-- Input: canonical `FramePacket` (normalized by the Frame Adapter). The packet must include `camera_id`, `timestamp_ms`, pixel data and resolution.
-- Output: the same `FramePacket` augmented with `frame_packet.motion` (and optional `pipeline_flags`, such as `skip_remaining`) and a `MotionResult` returned to the orchestrator.
-
-Motion Detection may request `motion_frame_v1` from the internal Frame Transformation Layer rather than owning payload decode and working-frame preparation itself.
-
-### Motion payload (contract)
-
-- The Motion Detection manager MUST attach a `frame_packet.motion` payload before returning from `process(frame_packet)`. The field is considered immutable for that packet after `process()` returns.
-- Recommended default shape (metadata-first):
-
-```yaml
-frame_packet.motion:
-  detected: bool
-  score: float            # optional, normalized (0.0 - 1.0)
-  motion_pixel_count: int
-  timestamp_ms: int
+```text
+process(frame_packet: FramePacket) -> IPSOutput
 ```
 
-- Optional `details` (mask, bboxes) may be included when configured; heavier payloads should be opt-in.
+IPS receives a single `FramePacket` per invocation and returns a single `IPSOutput`.
 
-### Interaction with Pipeline Orchestrator
+### 2.2 Input Structure
 
-- The Pipeline Orchestrator invokes Motion Detection as the first pipeline stage. Example flow:
-  1. Orchestrator calls `motion_manager.process(frame_packet)`.
-  2. The manager validates the packet and compares with a stored previous frame for `camera_id`.
-  3. The manager attaches the motion result to `frame_packet.motion` and returns a `MotionResult` value to the orchestrator.
-  4. The orchestrator uses that result (and configured rules) to decide whether to forward the `FramePacket` to downstream modules (Object Detection, Face Detection, Identity Recognition) or short-circuit further processing.
+```text
+struct Image {
+    uint32 width;
+    uint32 height;
+    string color_format;
+    string layout;
+    string dtype;
+    bytes  pixels;
+}
 
-Note: The orchestrator should consult both the `MotionResult` return value and the contents of `frame_packet.motion` when making forwarding or event-publishing decisions. The `MotionResult` provides a quick control signal, while `frame_packet.motion` carries the authoritative details for downstream use (scores, masks, ROIs).
+struct FramePacket {
+    string frame_id;
+    string camera_id;
+    int64  timestamp_ms;
+    int32  width;
+    int32  height;
+    string pixel_format;
+    Image  image;
+}
+```
 
-### Configuration (service-level keys)
+### 2.3 Input Contract
 
-Motion Detection configuration is provided under the `motion_detection` section of the IPS configuration. See `doc/MOTION_DETECTION.md` for the authoritative list and defaults. Representative keys (service-level reference):
+`FramePacket` must satisfy the following before `process` is called:
 
-- `motion_detection.motion_threshold`
-- `motion_detection.use_gaussian_blur`
-- `motion_detection.motion_fraction_threshold`
-- `motion_detection.motion_pixel_count_threshold`
-- `motion_detection.processing_width` / `processing_height`
-- `motion_detection.max_width` / `max_height`
+- `frame_id` must be present and non-empty
+- `camera_id` must be present and non-empty
+- `timestamp_ms` must be present
+- `image` must be present and non-null
+- `image.width` and `image.height` must be greater than zero
+- `image.pixels` must be non-empty
 
-The full configuration schema, eviction policy and tuning guidance live in `doc/MOTION_DETECTION.md`.
+The input `FramePacket` carries only ingress fields at the call boundary. IPS enriches the packet with detection and recognition results during pipeline execution.
 
-### Observability & side effects
+### 2.4 Input Semantics
 
-- Motion Detection increments metrics (`frames_processed`, `motion_detections`, `invalid_frames`) and exposes health for the manager.
-- It stores a per-stream previous frame (subject to eviction policies) for future comparisons; that storage is internal to the Motion Detection manager.
+- `frame_id` — unique identifier for the source frame; preserved for traceability throughout the pipeline
+- `camera_id` — identifies the source camera; used by `MotionDetectionModule` to scope per-camera state
+- `timestamp_ms` — capture timestamp in milliseconds; preserved for traceability
+- `image` — the decoded frame image; used by `FrameCroppingModule` and `FrameTransformationLayer`
 
-### Initialization
+---
 
-- On startup the orchestrator instantiates the Motion Detection manager with its configuration and registers it as the pipeline stage. The manager initializes internal buffers, eviction structures and metrics; no event publication occurs here.
+## 3. Output Definition
 
-### Details and implementation
+### 3.1 Output Structure
 
-The following implementation-level details are the authoritative, module-level descriptions moved from the Motion Detection module document. They include system-level diagrams, the IPS initialization flow for the module, and a textual data/sequence summary for integrators. For the algorithm, configuration keys, and testing guidance see `doc/MOTION_DETECTION.md`.
+```text
+struct CanonicalBoundingBox {
+    int32 x;
+    int32 y;
+    int32 width;
+    int32 height;
+}
 
-## Data Flow (mermaid, system-style)
+struct RecognitionResult {
+    string               person_id;
+    CanonicalBoundingBox face_bbox;
+}
+
+struct IPSOutput {
+    string                    frame_id;
+    vector<RecognitionResult> results;
+}
+```
+
+### 3.2 Output Semantics
+
+- `frame_id` — copied from `FramePacket.frame_id` for traceability
+- `results` — the set of recognized faces found in the frame; may be empty; each entry corresponds to one accepted face recognition result
+- `RecognitionResult.person_id` — the identity of the recognized person; present for every entry in `results`
+- `RecognitionResult.face_bbox` — the full-frame bounding box of the recognized face; coordinates are expressed relative to the full input frame with origin at the top-left corner
+
+### 3.3 Output Constraints
+
+- `results` is always present; it is empty when no persons were detected, no faces were detected, or no faces were recognized
+- Each entry in `results` corresponds to exactly one accepted face recognition result from one face-region crop
+- The output must not expose detection confidence scores, embeddings, rejected candidates, intermediate bounding boxes, or per-stage routing decisions
+- `IPSOutput` is always structurally valid; IPS never returns a partial or inconsistent output
+
+---
+
+## 4. Module Responsibilities
+
+IPS is a pipeline orchestration module. Its exclusive responsibilities are:
+
+- **Execution order** — invoke internal modules in the defined deterministic sequence
+- **Stage routing** — inspect results at each routing point and apply stop or skip conditions
+- **Region cropping** — invoke `FrameCroppingModule` at each crop stage to produce region-of-interest images
+- **Coordinate projection** — invoke `CoordinateProjector` after object detection and face detection to map ROI-local detections to full-frame coordinates
+- **Representation requests** — invoke `FrameTransformationLayer` before each module to obtain module-ready input representations
+- **Accumulation** — collect projected person bounding boxes and projected face detections into `FramePacket` enrichment fields
+- **Result aggregation** — collect all `person_found = true` recognition results and assemble the final `IPSOutput`
+
+IPS must not implement any detection, embedding, matching, preprocessing, or media handling logic. All such logic belongs to dedicated internal modules.
+
+---
+
+## 5. Internal Components
+
+### 5.1 PipelineOrchestrator
+
+`PipelineOrchestrator` is the internal execution controller. It owns no detection or processing logic.
+
+Its responsibilities are:
+
+- receive the incoming `FramePacket`
+- invoke internal modules in the defined order
+- invoke `FrameTransformationLayer` before each module requiring a prepared input
+- invoke `FrameCroppingModule` at each crop stage
+- invoke `CoordinateProjector` after object detection and face detection
+- apply routing decisions at each stage gate
+- accumulate projected person and face detections into `FramePacket` enrichment fields
+- collect accepted recognition results
+- construct and return `IPSOutput`
+
+`PipelineOrchestrator` must not embed detection algorithms, preprocessing logic, or coordinate arithmetic directly. It delegates all non-orchestration responsibilities to the appropriate internal module.
+
+### 5.2 FrameTransformationLayer
+
+`FrameTransformationLayer` is a request-driven internal representation service.
+
+Its responsibilities are:
+
+- accept a source image and a representation name
+- apply the transformation contract associated with that representation name
+- return a module-ready input representation
+
+Transformation contracts are configuration-defined and specify color format, layout, dtype, value range, and dimensions. `FrameTransformationLayer` applies all preprocessing: resizing, normalization, color format conversion, layout conversion, dtype conversion, and payload decoding. No module performs any of these operations independently.
+
+Representation names used by IPS:
+
+| Representation name        | Consumed by               |
+|----------------------------|---------------------------|
+| `motion_detection_input`   | MotionDetectionModule     |
+| `object_detection_input`   | ObjectDetectionModule     |
+| `face_detection_input`     | FaceDetectionModule       |
+| `face_recognition_input`   | FaceRecognitionModule     |
+
+### 5.3 FrameCroppingModule
+
+`FrameCroppingModule` is a stateless internal component that crops a rectangular region from the decoded frame image.
+
+Its responsibilities are:
+
+- accept a decoded frame image and a `CanonicalBoundingBox`
+- return the cropped region as an in-memory image
+
+`FrameCroppingModule` does not decode raw bytes and does not perform any pixel transformation. Cropped images exist only within the current frame-processing lifecycle.
+
+### 5.4 CoordinateProjector
+
+`CoordinateProjector` is a stateless internal component that translates ROI-local detections into full-frame coordinates.
+
+Its responsibilities are:
+
+- accept an array of ROI-local detections and the source ROI bounding box
+- add the ROI origin `(roi.x, roi.y)` to all coordinate fields of each detection
+- return the projected detections in full-frame coordinates
+
+`CoordinateProjector` does not apply any acceptance logic and does not modify detection content beyond coordinate offset.
+
+### 5.5 MotionDetectionModule
+
+`MotionDetectionModule` determines whether the frame contains motion relative to the previously processed frame for the same `camera_id`.
+
+Its responsibilities are:
+
+- receive a prepared `motion_detection_input` representation
+- compare against the previously stored frame for the given `camera_id`
+- produce a `MotionResult` containing a `detected` flag and, when `detected = true`, bounding boxes of motion regions in frame coordinates
+
+This module is stateful: it retains exactly one previous frame per `camera_id`. All other state is per-invocation.
+
+### 5.6 ObjectDetectionModule
+
+`ObjectDetectionModule` detects persons within a single motion-region crop.
+
+Its responsibilities are:
+
+- receive a prepared `object_detection_input` representation from a motion-region crop
+- detect persons within that region
+- return person bounding boxes in ROI-local coordinates
+
+It does not detect other object classes and does not perform coordinate projection.
+
+### 5.7 FaceDetectionModule
+
+`FaceDetectionModule` detects faces within a single person-region crop.
+
+Its responsibilities are:
+
+- receive a prepared `face_detection_input` representation from a person-region crop
+- detect faces within that region
+- return face bounding boxes and canonical 5-point landmarks in ROI-local coordinates
+
+One crop per invocation. The module is stateless per invocation.
+
+### 5.8 FaceRecognitionModule
+
+`FaceRecognitionModule` identifies a single detected face against the in-memory gallery.
+
+Its responsibilities are:
+
+- receive a prepared `face_recognition_input` representation from a face-region crop
+- extract a face embedding
+- compare the embedding against the loaded gallery
+- return `person_found` and, when a match is accepted, `person_id`
+
+The module does not access disk during recognition. It reads exclusively from the in-memory gallery loaded at initialization.
+
+### 5.9 FaceGalleryLoader
+
+`FaceGalleryLoader` is an initialization-only component.
+
+Its responsibilities are:
+
+- load precomputed face embeddings from the gallery directory at startup
+- validate embedding files (dimension, dtype, structure)
+- build the in-memory gallery cache used by `FaceRecognitionModule`
+
+`FaceGalleryLoader` does not participate in per-frame processing. After a successful load, the gallery is immutable for the IPS lifecycle.
+
+---
+
+## 6. Internal Pipeline
+
+For each `FramePacket` received by `process`, `PipelineOrchestrator` executes the following sequence.
+
+### 6.1 Execution Steps
+
+```
+1.  Request `motion_detection_input` from FrameTransformationLayer
+2.  Invoke MotionDetectionModule
+3.  MotionDetectionModule writes FramePacket.motion { detected, bboxes? }
+4.  If motion.detected == false → stop; return IPSOutput with empty results
+
+5.  For each bbox in FramePacket.motion.bboxes:
+    a. Invoke FrameCroppingModule → produce motion-region crop
+
+6.  For each motion-region crop:
+    a. Request `object_detection_input` from FrameTransformationLayer (scoped to this crop)
+    b. Invoke ObjectDetectionModule
+    c. Collect person detections in ROI-local coordinates
+    d. Invoke CoordinateProjector with motion-region bbox → project to full-frame coordinates
+    e. Accumulate projected person bboxes
+
+7.  Write accumulated person bboxes to FramePacket.detected_persons
+8.  If FramePacket.detected_persons is empty → stop; return IPSOutput with empty results
+
+9.  For each bbox in FramePacket.detected_persons:
+    a. Invoke FrameCroppingModule → produce person-region crop
+    b. Request `face_detection_input` from FrameTransformationLayer (scoped to this crop)
+    c. Invoke FaceDetectionModule (one crop per invocation)
+    d. If no face detected → skip this person; continue to next
+    e. Invoke CoordinateProjector with person-region bbox → project face bbox and landmarks to full-frame
+    f. Write projected DetectedFace to FramePacket.detected_faces
+    g. Invoke FrameCroppingModule on face bbox → produce face-region crop
+    h. Request `face_recognition_input` from FrameTransformationLayer (scoped to face crop)
+    i. Invoke FaceRecognitionModule
+    j. If person_found == true → add RecognitionResult { person_id, face_bbox } to results
+
+10. Construct and return IPSOutput { frame_id, results }
+```
+
+### 6.2 Routing Invariants
+
+- Object Detection is invoked once per motion-region crop; never on the full frame
+- Face Detection is invoked once per person-region crop; never on the full frame or multiple crops in one call
+- Face Recognition is invoked once per face-region crop
+- All coordinate projection is performed exclusively by `CoordinateProjector`; modules produce only ROI-local detections
+- `FrameTransformationLayer` is called by `PipelineOrchestrator` between stages; it is never called by a module directly
+
+---
+
+## 7. Data Structures
+
+### 7.1 FramePacket Enrichment Fields
+
+`FramePacket` carries enrichment fields written by IPS during pipeline execution. Each enrichment field is immutable once the stage responsible for it completes. Subsequent stages read these fields and do not rewrite them.
+
+```text
+struct FramePacket {
+    // Ingress fields — immutable throughout the pipeline
+    string frame_id;
+    string camera_id;
+    int64  timestamp_ms;
+    int32  width;
+    int32  height;
+    string pixel_format;
+    Image  image;
+
+    // Enrichment fields — written by the named stage; immutable after that stage completes
+    MotionResult             motion;            // written after Motion Detection
+    CanonicalBoundingBox[]   detected_persons;  // written after Object Detection + projection
+    DetectedFace[]           detected_faces;    // written after Face Detection + projection
+}
+```
+
+### 7.2 MotionResult
+
+```text
+struct MotionResult {
+    bool                   detected;
+    CanonicalBoundingBox[] bboxes;   // present only when detected = true; at least one entry
+}
+```
+
+- `detected` — always present; `true` when motion was identified, `false` otherwise
+- `bboxes` — present only when `detected = true`; each entry is an axis-aligned bounding box of a contiguous motion region in full-frame coordinates
+
+### 7.3 DetectedFace
+
+```text
+struct DetectedFace {
+    CanonicalBoundingBox face_bbox;   // in full-frame coordinates
+    FaceLandmarks        landmarks;  // canonical 5-point landmarks in full-frame coordinates
+}
+
+struct FaceLandmarks {
+    Point left_eye;
+    Point right_eye;
+    Point nose;
+    Point mouth_left;
+    Point mouth_right;
+}
+
+struct Point {
+    int32 x;
+    int32 y;
+}
+```
+
+### 7.4 CanonicalBoundingBox
+
+```text
+struct CanonicalBoundingBox {
+    int32 x;       // left edge in pixel coordinates; origin at top-left of the full frame
+    int32 y;       // top edge in pixel coordinates
+    int32 width;   // region width in pixels; strictly positive
+    int32 height;  // region height in pixels; strictly positive
+}
+```
+
+All bounding boxes produced by pipeline modules and projected by `CoordinateProjector` are expressed as `CanonicalBoundingBox`. Module-internal coordinate formats are converted before being stored in `FramePacket` or passed to `FrameCroppingModule`.
+
+---
+
+## 8. State Management
+
+- **IPS is stateless per frame.** Each invocation of `process` is independent. No data from one invocation carries to the next except as described below.
+- **MotionDetectionModule is stateful.** It retains exactly one previous frame per `camera_id` across invocations. This state is internal to `MotionDetectionModule` and is not exposed to `PipelineOrchestrator` or any other component.
+- **FaceRecognitionModule reads from an immutable in-memory gallery.** The gallery is loaded once at initialization by `FaceGalleryLoader`. It is read-only during frame processing. No disk access occurs during recognition.
+- **FramePacket enrichment fields are write-once.** Each field is written exactly once by the stage responsible for it and is immutable after that stage completes.
+- **Cropped images are transient.** Cropped images produced by `FrameCroppingModule` exist only within the current frame-processing lifecycle. They are not retained across invocations.
+
+---
+
+## 9. Error Handling
+
+All error states produce a structurally valid `IPSOutput`. IPS never returns a partial output.
+
+| Failure scenario | Behavior |
+|---|---|
+| Invalid `FramePacket` (missing fields, zero dimensions) | Return `IPSOutput` with empty `results`; stop processing |
+| `MotionDetectionModule` runtime failure | Return `IPSOutput` with empty `results`; stop processing |
+| `motion.detected = false` | Return `IPSOutput` with empty `results`; normal stop condition |
+| `ObjectDetectionModule` runtime failure for a motion-region crop | Skip that crop; continue with remaining motion-region crops |
+| No person detections across all motion regions | Return `IPSOutput` with empty `results`; normal stop condition |
+| `FaceDetectionModule` returns no face for a person-region crop | Skip that person; continue with remaining persons |
+| `FaceDetectionModule` runtime failure for a person-region crop | Skip that person; continue with remaining persons |
+| `FaceRecognitionModule` runtime failure for a face-region crop | Skip that face; continue with remaining faces |
+| `FaceRecognitionModule` returns `person_found = false` | Skip that face; normal operation |
+
+**Skip vs stop rules:**
+- A failure at the Motion Detection or person accumulation stage stops the entire pipeline for the current frame.
+- A failure at the per-person or per-face level skips only that person or face. The pipeline continues processing remaining items.
+- IPS never returns a partial `FramePacket`. The returned value is always a complete `IPSOutput`.
+
+---
+
+## 10. Class Diagram
 
 ```mermaid
-flowchart TB
-  subgraph CameraService[Camera Service]
-    Cam[Camera Adapter]
-  end
+classDiagram
+    class IPS {
+        +process(frame_packet: FramePacket) IPSOutput
+    }
 
-  subgraph IPS[Image Processing Service]
-    FA[Frame Adapter]
-    Mgr[MotionDetectionManager]
-    Alg[MotionDetectionAlgorithm]
-    Orch[Pipeline Orchestrator]
-  end
+    class PipelineOrchestrator {
+        +run(frame_packet: FramePacket) IPSOutput
+    }
 
-  EventSvc[Event Service]
+    class FrameTransformationLayer {
+        +get_representation(image: Image, name: string) PreparedInput
+    }
 
-  Cam --> FA
-  FA --> Orch
-  Orch --> Mgr
-  Mgr --> Alg
-  Alg --> Mgr
-  Mgr --> Orch
-  Orch --> EventSvc
+    class FrameCroppingModule {
+        +crop(image: Image, region: CanonicalBoundingBox) CroppedImage
+    }
+
+    class CoordinateProjector {
+        +project(detections: LocalDetection[], roi: CanonicalBoundingBox) FullFrameDetection[]
+    }
+
+    class MotionDetectionModule {
+        +process_frame(input: PreparedInput, camera_id: string) MotionResult
+    }
+
+    class ObjectDetectionModule {
+        +detect_persons(input: PreparedInput) PersonDetection[]
+    }
+
+    class FaceDetectionModule {
+        +detect_faces(input: PreparedInput) FaceDetection[]
+    }
+
+    class FaceRecognitionModule {
+        +recognize_face(input: PreparedInput) FaceRecognitionOutput
+    }
+
+    class FaceGalleryLoader {
+        +load_gallery(gallery_root_path: string) void
+    }
+
+    IPS --> PipelineOrchestrator : delegates to
+    PipelineOrchestrator --> FrameTransformationLayer : requests representations
+    PipelineOrchestrator --> FrameCroppingModule : crops regions
+    PipelineOrchestrator --> CoordinateProjector : projects detections
+    PipelineOrchestrator --> MotionDetectionModule : invokes
+    PipelineOrchestrator --> ObjectDetectionModule : invokes per motion-region
+    PipelineOrchestrator --> FaceDetectionModule : invokes per person-region
+    PipelineOrchestrator --> FaceRecognitionModule : invokes per face-region
+    FaceGalleryLoader ..> FaceRecognitionModule : loads gallery at startup
 ```
 
-## Sequence Diagram (mermaid, system-style)
+---
+
+## 11. Sequence Diagram
 
 ```mermaid
 sequenceDiagram
-  autonumber
-  participant Camera as Camera Service
-  participant Adapter as Frame Adapter
-  participant Orch as Pipeline Orchestrator
-  participant Mgr as MotionDetectionManager
-  participant Alg as MotionDetectionAlgorithm
-  participant Object as Object Detection
-  participant Event as Event Service
+    autonumber
+    participant Caller
+    participant IPS
+    participant FTL as FrameTransformationLayer
+    participant FC as FrameCroppingModule
+    participant CP as CoordinateProjector
+    participant MD as MotionDetectionModule
+    participant OD as ObjectDetectionModule
+    participant FD as FaceDetectionModule
+    participant FR as FaceRecognitionModule
 
-  Camera->>Adapter: send FramePacket(camera_id, timestamp, image)
-  Adapter->>Orch: push FramePacket
-  Orch->>Mgr: processFrame(FramePacket)
-  Mgr->>Mgr: validateFrame()
-  Mgr->>Mgr: getPreviousFrame(camera_id)
-  alt no previous
-    Mgr->>Mgr: storeFrame(currentFrame)
-    Mgr-->>Orch: NO_PREVIOUS_FRAME
-  else previous exists
-    Mgr->>Alg: detectMotion(previous_working, current_working)
-    Alg-->>Mgr: boolean result
-    Mgr->>Mgr: storeFrame(currentFrame)
-    alt motion detected
-      Mgr-->>Orch: MOTION_DETECTED
-      Orch->>Object: forward(FramePacket)
-    else no motion
-      Mgr-->>Orch: NO_MOTION_DETECTED
+    Caller->>IPS: process(frame_packet)
+
+    IPS->>FTL: get_representation(image, "motion_detection_input")
+    FTL-->>IPS: prepared_input
+    IPS->>MD: process_frame(prepared_input, camera_id)
+    MD-->>IPS: MotionResult { detected, bboxes? }
+    alt detected == false
+        IPS-->>Caller: IPSOutput { results: [] }
     end
-  end
-```
 
-## Initialization
-
-Initialization flow on IPS startup:
-
-1. Load global configuration and extract `motion_detection` section.
-2. Instantiate `MotionDetectionAlgorithm` with algorithm parameters (`motion_threshold`, blur settings, fraction thresholds, processing dims).
-3. Instantiate `MotionDetectionManager` with the algorithm instance and manager config (`max_width`, `max_height`, `store_downsampled_frame`, eviction policy).
-4. Register the manager in the IPS pipeline so the orchestrator calls `processFrame` for incoming `FramePacket`s.
-
-## Data Flow (textual)
-
-- Camera Service -> Frame Adapter -> `FramePacket` -> IPS Pipeline Orchestrator -> `MotionDetectionManager.processFrame(Frame)` -> `MotionDetectionAlgorithm.detectMotion(previous, current)` -> Manager updates stored frame and returns `MotionResult` (the motion result is attached to `FramePacket.motion`) -> Pipeline Orchestrator forwards the `FramePacket` to the next module (typically Object Detection). Event generation is performed only after downstream analysis (object/face/identity).
-
-## Sequence (textual)
-
-Camera Service
-  ↓ send Frame
-Image Processing Service (Frame Adapter)
-  ↓ call processFrame(currentFrame)
-MotionDetectionManager
-  ↓ validate frame resolution
-  ↓ getPreviousFrame()
-  ↓ if previous exists -> MotionDetectionAlgorithm.detectMotion(previousFrame, currentFrame)
-  ↓ algorithm returns boolean
-  ↓ storeFrame(currentFrame)
-  ↓ return MotionResult to IPS
-
-If motion detected: the manager stores the motion result on `FramePacket.motion` and returns `MOTION_DETECTED`; the Pipeline Orchestrator forwards the `FramePacket` to the next processing stage (typically Object Detection). Event generation is performed only after downstream analysis (object/face/identity).
----
-
-## Object Detection
-
-### Overview
-
-Detects objects of interest and populates `frame_packet.objects` for downstream processing and event emission.
-
-### Responsibilities
-
-- Produce `DetectedObject` entries with `class_id`, `class_name`, `confidence`, and `bbox`.
-
-### Components / Classes
-
-- `ObjectDetector` — module orchestrating preprocessing, inference call, and post-processing.
-- `ModelProvider` — a small abstraction used to load and run runtime-specific inference (keeps system docs implementation-agnostic).
-
-### Interfaces
-
-- `object_detector.detect(frame_packet: FramePacket) -> List[DetectedObject]`
-
-### Configuration
-
-- `object_detection.enabled`, `conf_threshold`, `iou_threshold`, `classes`, `trigger.require_motion`.
-
-### Initialization
-
-- Load model via `ModelProvider` at startup and optionally perform a warm-up.
-
-### Data Flow
-
-- Input: `frame_packet.raw_frame` (or ROIs from `frame_packet.motion.mask`).
-- Representation request: request `object_tensor_v1` from the Frame Transformation Layer.
-- Inference: call `ModelProvider.infer()` and obtain raw outputs.
-- Post-processing: confidence filtering, NMS (configured `iou_threshold`), coordinate transform back to original frame, class mapping.
-- Output: append detections to `frame_packet.objects` and update `pipeline_trace`.
-
----
-
-## Face Detection
-
-### Overview
-
-Locates faces for subsequent recognition; typically run within person bounding boxes.
-
-### Responsibilities
-
-- Populate `frame_packet.faces` with detected face regions and confidence.
-
-### Components / Classes
-
-- `FaceDetector`.
-
-### Interfaces
-
-- `face_detector.detect(frame_packet: FramePacket) -> List[DetectedFace]`
-
-### Configuration
-
-- `face_detection.enabled`.
-
-### Initialization
-
-- Load face detection assets as required.
-
-### Data Flow
-
-- Input: person ROIs or entire frame via `face_detect_frame_v1` requested from the Frame Transformation Layer.
-- Output: `frame_packet.faces` and `pipeline_trace` update.
-
----
-
-## Identity Recognition
-
-### Overview
-
-Matches detected faces to known identities and appends `RecognizedIdentity` entries to `frame_packet.identities`.
-
-### Responsibilities
-
-- Identify known individuals and provide confidence/hints for events.
-
-### Components / Classes
-
-- `IdentityRecognizer`.
-
-### Interfaces
-
-- `recognizer.identify(detected_face: DetectedFace) -> RecognizedIdentity | None`
-
-### Configuration
-
-- `identity.enabled` and credentials/access to identity store.
-
-### Initialization
-
-- Load identity references or connect to identity service.
-
-### Data Flow
-
-- Input: `frame_packet.faces` plus face crops prepared through `face_embed_tensor_v1` requested from the Frame Transformation Layer.
-- Output: `frame_packet.identities` and `pipeline_trace` update.
-
----
-    
-  ## Frame Processing (Frame Adapter)
-
-### Overview
-
-Normalizes incoming frames into the canonical `FramePacket` used by the pipeline.
-
-### Responsibilities
-
-- Validate incoming raw frame payloads.
-- Populate `FramePacket` ingest fields.
-- Keep only the latest frame per camera (`camera_id`) in in-memory storage.
-- Overwrite the previously stored frame for the same camera by design.
-
-### Components / Classes
-
-  - `FrameReceiver` (handles gRPC ingestion and packet creation).
-  - `FrameStore` (stores latest frame per camera; pipeline pulls frames via `get_next_frame()`).
-
-### Interfaces
-
-Example gRPC schema:
-
-```proto
-message Frame {
-  string camera_id = 1;
-  int64 timestamp_ms = 2;
-  string frame_id = 3;
-  int32 width = 4;
-  int32 height = 5;
-  string pixel_format = 6;
-  int32 num_color_channels = 7;
-  int32 bits_per_pixel = 8;
-  bytes raw_frame = 9;
-}
-
-service FrameSource {
-  rpc StreamFrames(stream Frame) returns (Ack);
-}
-```
-
-### Configuration
-
-- `ingest.grpc.port`, `ingest.ipc.enabled`, retry/backoff.
-
-### Initialization
-
-- Start gRPC servers/IPC listeners; configure ingress validators and metrics.
-
-### Data Flow
-
-- Input: raw IPC/gRPC payload
-- Output: latest `FramePacket` per camera with `camera_id`, `timestamp`, `frame_id`, `width`, `height`, `raw_frame`, `raw_metadata`.
-
-Backpressure policy in this architecture is overwrite-based, not queue-based: when processing is slower than ingress, the newest frame replaces any older unprocessed frame for the same camera.
-
-Example ingestion flow:
-
-```python
-frame_packet = FramePacket(
-  camera_id=frame.camera_id,
-  timestamp=parse_timestamp(frame.timestamp_ms),
-  frame_id=frame.frame_id,
-  width=frame.width,
-  height=frame.height,
-  pixel_format=frame.pixel_format,
-  num_color_channels=frame.num_color_channels,
-  bits_per_pixel=frame.bits_per_pixel,
-  raw_frame=frame.raw_frame,
-)
+    loop for each motion bbox
+        IPS->>FC: crop(image, motion_bbox) → motion_crop
+        IPS->>FTL: get_representation(motion_crop, "object_detection_input")
+        FTL-->>IPS: prepared_input
+        IPS->>OD: detect_persons(prepared_input)
+        OD-->>IPS: person_detections (ROI-local)
+        IPS->>CP: project(person_detections, motion_bbox)
+        CP-->>IPS: full-frame person bboxes
+    end
+
+    alt detected_persons is empty
+        IPS-->>Caller: IPSOutput { results: [] }
+    end
+
+    loop for each person bbox
+        IPS->>FC: crop(image, person_bbox) → person_crop
+        IPS->>FTL: get_representation(person_crop, "face_detection_input")
+        FTL-->>IPS: prepared_input
+        IPS->>FD: detect_faces(prepared_input)
+        FD-->>IPS: face_detections (ROI-local) or empty
+        alt no face detected
+            Note over IPS: skip this person
+        else face detected
+            IPS->>CP: project(face_detection, person_bbox)
+            CP-->>IPS: full-frame face bbox + landmarks
+            IPS->>FC: crop(image, face_bbox) → face_crop
+            IPS->>FTL: get_representation(face_crop, "face_recognition_input")
+            FTL-->>IPS: prepared_input
+            IPS->>FR: recognize_face(prepared_input)
+            FR-->>IPS: FaceRecognitionOutput { person_found, person_id? }
+            alt person_found == true
+                Note over IPS: add RecognitionResult to results
+            end
+        end
+    end
+
+    IPS-->>Caller: IPSOutput { frame_id, results }
 ```
 
 ---
 
-## Event Emission (Event Publisher)
+## 12. Design Principles
 
-### Overview
+- **Deterministic pipeline.** The execution sequence is fixed. Given the same input, the same stored motion state, and the same gallery, IPS produces identical results.
 
-Serializes and publishes structured events derived from pipeline results to the configured Event Service transport.
+- **Strict separation of concerns.** Each internal component owns exactly one responsibility. `PipelineOrchestrator` orchestrates and routes. `FrameCroppingModule` crops. `CoordinateProjector` projects. Detection and recognition modules compute. No component duplicates another's responsibility.
 
-### Responsibilities
+- **No preprocessing inside modules.** All image preprocessing — resizing, normalization, color format conversion, layout conversion, dtype conversion — is the exclusive responsibility of `FrameTransformationLayer`. Modules receive fully prepared representations and send them directly to their processing engines without modification.
 
-- Format event payloads with source metadata and detection details.
-- Send events reliably with configured retry and backoff.
+- **Geometric consistency.** All detections produced by modules are in ROI-local coordinates. `CoordinateProjector` is the single point of responsibility for translating ROI-local coordinates to full-frame coordinates. No coordinate arithmetic is performed outside `CoordinateProjector`.
 
-### Components / Classes
+- **Write-once enrichment.** Each `FramePacket` enrichment field is written exactly once by the stage responsible for it and is treated as immutable by all subsequent stages.
 
-- `EventPublisher`.
+- **No external side effects.** IPS produces only a structured `IPSOutput`. It does not access the filesystem during frame processing, does not write to shared stores, and does not communicate with external systems.
 
-### Interfaces
+- **Fail safe.** Any stage failure produces a structurally valid `IPSOutput`. Failures at the per-person or per-face level skip only that item. No partial or inconsistent output is ever returned.
 
-- `event_publisher.publish(event_payload) -> Ack`
-
-### Configuration
-
-- `event.transport` (type and connection parameters), `event.rules`.
-
-### Initialization
-
-- Initialize transport clients and health checks.
-
-### Data Flow
-
-- Input: `FramePacket` detection fields and orchestrator decision.
-- Output: structured event message (example below).
-
-Example event payload:
-
-```json
-{
-  "camera_id": "cam-123",
-  "timestamp": 1670000000000,
-  "frame_id": "uuid-...",
-  "type": "OBJECT_DETECTED",
-  "detections": [ { "class_name": "person", "confidence": 0.92, "bbox": [x,y,w,h] } ]
-}
-```
-
----
-
-## Integration Guidance
-
-- Keep system docs implementation-agnostic: include `ModelProvider` abstraction (with `load_model()` and `infer()`), but avoid listing vendor-specific tooling in system-level docs.
-- Use DI/factory patterns to create pipeline modules from configuration.
-
----
-
-## Glossary
-
-- **FramePacket**: canonical frame structure passed through modules.
-- **Pipeline Orchestrator**: executes modules in order and decides event emission.
-- **Event Service**: external stream/topic consumer.
-
-## Revision Notes
-
-Update this document when input contracts, pipeline order, or event payloads change.
-
+- **Algorithm-agnostic API.** The `process(frame_packet) -> IPSOutput` contract is stable regardless of which detection or recognition engines are configured internally. Replacing an internal engine does not change the public API.
