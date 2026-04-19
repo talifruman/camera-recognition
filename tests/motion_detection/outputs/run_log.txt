@@ -1,0 +1,29 @@
+﻿  [no_motion] IMG_2036_case_001: NO MOTION (0 bbox(s))
+  [no_motion] IMG_2036_case_002: NO MOTION (0 bbox(s))
+  [no_motion] IMG_2036_case_003: NO MOTION (0 bbox(s))
+  [no_motion] IMG_2036_case_004: NO MOTION (0 bbox(s))
+  [no_motion] IMG_2036_case_005: NO MOTION (0 bbox(s))
+  [small_motion] IMG_2038_case_001: NO MOTION (0 bbox(s))
+  [small_motion] IMG_2038_case_002: NO MOTION (0 bbox(s))
+  [small_motion] IMG_2038_case_003: NO MOTION (0 bbox(s))
+  [small_motion] IMG_2038_case_004: DETECTED (31 bbox(s))
+  [small_motion] IMG_2038_case_005: DETECTED (39 bbox(s))
+  [small_motion] IMG_2038_case_006: DETECTED (78 bbox(s))
+  [small_motion] IMG_2038_case_007: DETECTED (60 bbox(s))
+  [small_motion] IMG_2038_case_008: DETECTED (64 bbox(s))
+  [clear_motion] IMG_2037_case_001: NO MOTION (0 bbox(s))
+  [clear_motion] IMG_2037_case_002: NO MOTION (0 bbox(s))
+  [clear_motion] IMG_2037_case_003: NO MOTION (0 bbox(s))
+  [clear_motion] IMG_2037_case_004: DETECTED (42 bbox(s))
+  [clear_motion] IMG_2037_case_005: DETECTED (65 bbox(s))
+  [clear_motion] IMG_2037_case_006: DETECTED (453 bbox(s))
+
+============================================================
+Motion Detection Visual Test ק Summary
+============================================================
+  Cases processed : 19
+  Detected        : 8
+  Not detected    : 11
+  Errors          : 0
+  Outputs saved to: C:\Users\talif\Desktop\Camera-regogintion\tests\motion_detection\outputs
+============================================================
