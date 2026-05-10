@@ -332,7 +332,7 @@ def process_images(
                 width, height = rgb_image.size
                 metadata: FrameMetadata = {
                     "camera_id": "visual-test-camera",
-                    "frame_id": next(FRAME_COUNTER),
+                    "frame_id": f"frame_{next(FRAME_COUNTER):04d}",
                     "width": width,
                     "height": height,
                 }

@@ -86,13 +86,13 @@ def build_motion_input(
     camera_id = case_name
 
     previous_frame: FramePacket = {
-        "frame_id": 1,
+        "frame_id": "frame_0001",
         "camera_id": camera_id,
         "timestamp_ms": 1000,
         "image": prev_img,
     }
     current_frame: FramePacket = {
-        "frame_id": 2,
+        "frame_id": "frame_0002",
         "camera_id": camera_id,
         "timestamp_ms": 2000,
         "image": curr_img,

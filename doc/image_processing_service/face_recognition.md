@@ -1,5 +1,15 @@
 # Face Recognition Module Specification
 
+## Shared Contract Types
+
+The following types used by this module are defined in [shared_contracts.md](shared_contracts.md) and must not be duplicated here:
+
+- `Image` — the canonical shared public image struct; carries `data`, `width`, `height`, `color_format`, `layout`, `dtype`, and `value_range`; pixel format is described by the embedding engine input contract (§6)
+- `Point` — the pixel coordinate type (§7); coordinate space must be stated by context
+- `FaceLandmarks` — the canonical 5-point landmark struct (§8); coordinate space must be stated by the owning field
+
+---
+
 ## 1. Scope
 
 ### Purpose
@@ -41,30 +51,17 @@ The Face Recognition module does not perform any generic image preprocessing. It
 
 ### 2.2 Input Structure
 
+`Point` is defined in [shared_contracts.md §7](shared_contracts.md). `FaceLandmarks` is defined in [shared_contracts.md §8](shared_contracts.md). `Image` is defined in [shared_contracts.md §6](shared_contracts.md) — the canonical shared public image struct carrying explicit metadata fields.
+
 ```text
-struct Point {
-    int32 x;
-    int32 y;
-}
-
-struct FaceLandmarks {
-    Point left_eye;
-    Point right_eye;
-    Point nose;
-    Point mouth_left;
-    Point mouth_right;
-}
-
 struct FaceRecognitionInput {
-    uint64        frame_id;
+    string        frame_id;
     string        camera_id;
     uint64        timestamp_ms;
-    Image         face_roi_image;
-    FaceLandmarks landmarks;
+    Image         face_roi_image;   // See shared_contracts.md §6 — shared Image struct; metadata fields must match the embedding engine input contract
+    FaceLandmarks landmarks;        // See shared_contracts.md §8 — 5-point canonical landmarks; all coordinates ROI-local relative to face_roi_image
 }
 ```
-
-`Image` is an opaque type. Its internal representation is not defined by this module. `FaceLandmarks` is a fully typed canonical struct defined above.
 
 ### 2.3 ROI Image Contract
 
@@ -79,9 +76,9 @@ Default ArcFace-oriented contract (current default implementation — not a fixe
 - dimensions: `112 × 112` pixels (height × width × channels)
 - content: contains only the detected face, pre-cropped to a tight face region; the face is centered and occupies the full ROI extent
 
-The exact embedding contract is configuration-defined and depends on the currently configured AI embedding model and engine. This contract is dynamic — if the underlying embedding model is replaced, the expected color format, layout, dtype, value range, or dimensions may change without modifying the public module API.
+The exact embedding contract is configuration-defined and depends on the currently configured AI embedding model and engine. `face_roi_image.color_format`, `face_roi_image.layout`, `face_roi_image.dtype`, and `face_roi_image.value_range` carry this information explicitly as part of the shared `Image` contract. `face_roi_image.width` and `face_roi_image.height` are explicit fields carrying the pixel dimensions of the prepared face crop (default: 112 × 112 for ArcFace).
 
-The Face Recognition module validates the incoming `face_roi_image` against the configured embedding contract before sending it to `FaceEmbeddingEngine`. The module does not perform any image preprocessing on the incoming ROI — no cropping, resizing, normalization, alignment, color conversion, layout conversion, or dtype conversion is applied. The ROI image arrives fully prepared from upstream processing.
+The Face Recognition module validates the incoming `face_roi_image` against the configured embedding contract using these metadata fields before sending it to `FaceEmbeddingEngine`. The module does not perform any image preprocessing on the incoming ROI — no cropping, resizing, normalization, alignment, color conversion, layout conversion, or dtype conversion is applied. The ROI image arrives fully prepared from upstream processing.
 
 Any minimal runtime-specific adaptation required for inference — such as wrapping the validated image into the backend tensor type or adding a batch dimension — is handled internally by `FaceEmbeddingEngine` and does not modify the image data.
 
@@ -95,6 +92,10 @@ Any minimal runtime-specific adaptation required for inference — such as wrapp
 - `camera_id` must exist and be non-empty
 - `timestamp_ms` must exist
 - `face_roi_image` must exist and be non-null
+- `face_roi_image.data` must be non-null and contain valid pixel data
+- `face_roi_image.width` must be > 0 and `face_roi_image.height` must be > 0
+- `face_roi_image.color_format`, `face_roi_image.layout`, `face_roi_image.dtype`, and `face_roi_image.value_range` must match the configured embedding engine input contract
+- `face_roi_image.data.shape` must be consistent with `face_roi_image.width`, `face_roi_image.height`, `face_roi_image.layout`, and `face_roi_image.color_format`
 - `landmarks` must be present with all 5 points defined
 - Each landmark point must have finite coordinates within `face_roi_image` bounds
 
@@ -112,7 +113,7 @@ Any minimal runtime-specific adaptation required for inference — such as wrapp
 
 ```text
 struct FaceRecognitionOutput {
-    uint64 frame_id;
+    string frame_id;
     string camera_id;
     uint64 timestamp_ms;
     bool   person_found;
@@ -165,6 +166,8 @@ interface FaceEmbeddingEngine {
     extract_embedding(aligned_face: AlignedFace) -> FaceEmbedding
 }
 ```
+
+> **Internal-only type for `aligned_face`.** `AlignedFace` is an FTL-internal type produced by `FaceAligner`. It is not part of the public shared image contract. The public shared contract authority is the shared `Image` struct (which `face_roi_image` carries in `FaceRecognitionInput`). `FaceEmbeddingEngine` is an internal interface; it is not part of the public module API.
 
 ### 6.2 Current Default Implementation
 
@@ -420,11 +423,11 @@ classDiagram
     }
 
     class FaceRecognitionOutputBuilder {
-        +build(frame_id: uint64, camera_id: string, timestamp_ms: uint64, decision: RecognitionDecision) FaceRecognitionOutput
+        +build(frame_id: string, camera_id: string, timestamp_ms: uint64, decision: RecognitionDecision) FaceRecognitionOutput
     }
 
     class FaceRecognitionInput {
-        +frame_id: uint64
+        +frame_id: string
         +camera_id: string
         +timestamp_ms: uint64
         +face_roi_image: Image
@@ -432,7 +435,7 @@ classDiagram
     }
 
     class FaceRecognitionOutput {
-        +frame_id: uint64
+        +frame_id: string
         +camera_id: string
         +timestamp_ms: uint64
         +person_found: bool

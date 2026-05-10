@@ -20,18 +20,29 @@ from image_processing.face_detection import (  # type: ignore[import-not-found]
     FaceDetectionModule,
     FaceDetectionOutput,
     FaceLandmarks,
+    Image,
     Point,
     RawFaceDetection,
 )
 from face_detection_stub_engine import StubFaceDetectorEngine  # type: ignore[import-not-found]
 
 
+def _make_roi_image(roi_w: int, roi_h: int) -> Image:
+    return {
+        "data": np.zeros((roi_h, roi_w, 3), dtype=np.uint8),
+        "width": roi_w,
+        "height": roi_h,
+        "color_format": "RGB",
+        "layout": "HWC",
+        "dtype": "uint8",
+        "value_range": "[0, 255]",
+    }
+
+
 def _make_input(
     roi_w: int = 100,
     roi_h: int = 200,
-    roi_x: int = 50,
-    roi_y: int = 30,
-    frame_id: int = 1,
+    frame_id: str = "frame_0001",
     camera_id: str = "cam-a",
     timestamp_ms: int = 1000,
 ) -> FaceDetectionInput:
@@ -39,13 +50,7 @@ def _make_input(
         "frame_id": frame_id,
         "camera_id": camera_id,
         "timestamp_ms": timestamp_ms,
-        "roi_image": np.zeros((roi_h, roi_w, 3), dtype=np.uint8),
-        "roi_bbox_frame": {
-            "x": roi_x,
-            "y": roi_y,
-            "width": roi_w,
-            "height": roi_h,
-        },
+        "roi_image": _make_roi_image(roi_w, roi_h),
     }
 
 
@@ -73,26 +78,26 @@ class FaceDetectionModuleOutputContractTests(unittest.TestCase):
     def test_output_preserves_input_metadata(self) -> None:
         module = _make_module()
         result = module.detect_faces(
-            _make_input(frame_id=42, camera_id="cam-x", timestamp_ms=9999)
+            _make_input(frame_id="frame_0042", camera_id="cam-x", timestamp_ms=9999)
         )
 
-        self.assertEqual(result["frame_id"], 42)
+        self.assertEqual(result["frame_id"], "frame_0042")
         self.assertEqual(result["camera_id"], "cam-x")
         self.assertEqual(result["timestamp_ms"], 9999)
 
-    def test_detections_contain_face_bbox_frame_and_landmarks(self) -> None:
+    def test_detections_contain_face_bbox_and_landmarks(self) -> None:
         module = _make_module()
         result = module.detect_faces(_make_input())
 
         self.assertGreater(len(result["detections"]), 0)
         face = result["detections"][0]
-        self.assertEqual(set(face), {"face_bbox_frame", "landmarks"})
+        self.assertEqual(set(face), {"face_bbox", "landmarks"})
 
-    def test_face_bbox_frame_has_correct_fields(self) -> None:
+    def test_face_bbox_has_correct_fields(self) -> None:
         module = _make_module()
         result = module.detect_faces(_make_input())
 
-        bbox = result["detections"][0]["face_bbox_frame"]
+        bbox = result["detections"][0]["face_bbox"]
         self.assertEqual(set(bbox), {"x", "y", "width", "height"})
         self.assertGreater(bbox["width"], 0)
         self.assertGreater(bbox["height"], 0)
@@ -112,64 +117,49 @@ class FaceDetectionModuleOutputContractTests(unittest.TestCase):
             self.assertIsInstance(pt["y"], int)
 
 
-class CoordinateProjectionTests(unittest.TestCase):
-    """Verify face coordinates are projected from ROI to frame space."""
+class RoiLocalOutputTests(unittest.TestCase):
+    """Verify face detection output coordinates are ROI-local (no full-frame projection)."""
 
-    def test_face_bbox_is_offset_by_roi_origin(self) -> None:
-        roi_x, roi_y = 100, 200
+    def test_face_bbox_is_roi_local(self) -> None:
         module = _make_module()
-        result = module.detect_faces(
-            _make_input(roi_x=roi_x, roi_y=roi_y, roi_w=150, roi_h=300)
-        )
-
-        bbox = result["detections"][0]["face_bbox_frame"]
-        # bbox.x must be >= roi_x and bbox.y >= roi_y (projected from ROI)
-        self.assertGreaterEqual(bbox["x"], roi_x)
-        self.assertGreaterEqual(bbox["y"], roi_y)
-
-    def test_landmarks_are_offset_by_roi_origin(self) -> None:
-        roi_x, roi_y = 50, 80
-        module = _make_module()
-        result = module.detect_faces(
-            _make_input(roi_x=roi_x, roi_y=roi_y, roi_w=120, roi_h=240)
-        )
-
-        landmarks = result["detections"][0]["landmarks"]
-        for key in ("left_eye", "right_eye", "nose", "mouth_left", "mouth_right"):
-            pt = landmarks[key]
-            self.assertGreaterEqual(pt["x"], roi_x)
-            self.assertGreaterEqual(pt["y"], roi_y)
-
-    def test_projection_math_is_correct(self) -> None:
-        """Run with known ROI offset; verify exact projection arithmetic."""
-        roi_x, roi_y = 60, 40
-        roi_w, roi_h = 100, 200
-        module = _make_module()
-
-        # Get ROI-local detection from stub directly
         stub = StubFaceDetectorEngine()
-        roi_image = np.zeros((roi_h, roi_w, 3), dtype=np.uint8)
+        roi_image = np.zeros((200, 150, 3), dtype=np.uint8)
         raw = stub.detect(roi_image)[0]
 
-        result = module.detect_faces(
-            _make_input(roi_x=roi_x, roi_y=roi_y, roi_w=roi_w, roi_h=roi_h)
-        )
-        face = result["detections"][0]
+        result = module.detect_faces(_make_input(roi_w=150, roi_h=200))
+        bbox = result["detections"][0]["face_bbox"]
 
-        # Face bbox: projected = raw + roi offset
-        self.assertEqual(face["face_bbox_frame"]["x"], raw.bbox["x"] + roi_x)
-        self.assertEqual(face["face_bbox_frame"]["y"], raw.bbox["y"] + roi_y)
-        self.assertEqual(face["face_bbox_frame"]["width"], raw.bbox["width"])
-        self.assertEqual(face["face_bbox_frame"]["height"], raw.bbox["height"])
+        # Output coordinates must equal the raw ROI-local coordinates — no offset added
+        self.assertEqual(bbox["x"], raw.bbox["x"])
+        self.assertEqual(bbox["y"], raw.bbox["y"])
+        self.assertEqual(bbox["width"], raw.bbox["width"])
+        self.assertEqual(bbox["height"], raw.bbox["height"])
 
-        # Landmarks: same offset logic
+    def test_landmarks_are_roi_local(self) -> None:
+        module = _make_module()
+        stub = StubFaceDetectorEngine()
+        roi_image = np.zeros((240, 120, 3), dtype=np.uint8)
+        raw = stub.detect(roi_image)[0]
+
+        result = module.detect_faces(_make_input(roi_w=120, roi_h=240))
+        landmarks = result["detections"][0]["landmarks"]
+
         for i, key in enumerate(
             ("left_eye", "right_eye", "nose", "mouth_left", "mouth_right")
         ):
-            expected_x = raw.landmarks[i]["x"] + roi_x
-            expected_y = raw.landmarks[i]["y"] + roi_y
-            self.assertEqual(face["landmarks"][key]["x"], expected_x)
-            self.assertEqual(face["landmarks"][key]["y"], expected_y)
+            self.assertEqual(landmarks[key]["x"], raw.landmarks[i]["x"])
+            self.assertEqual(landmarks[key]["y"], raw.landmarks[i]["y"])
+
+    def test_output_coordinates_within_roi_bounds(self) -> None:
+        roi_w, roi_h = 150, 300
+        module = _make_module()
+        result = module.detect_faces(_make_input(roi_w=roi_w, roi_h=roi_h))
+
+        bbox = result["detections"][0]["face_bbox"]
+        self.assertGreaterEqual(bbox["x"], 0)
+        self.assertGreaterEqual(bbox["y"], 0)
+        self.assertLessEqual(bbox["x"] + bbox["width"], roi_w)
+        self.assertLessEqual(bbox["y"] + bbox["height"], roi_h)
 
 
 class DeterminismTests(unittest.TestCase):
@@ -191,38 +181,23 @@ class ErrorHandlingTests(unittest.TestCase):
     def test_missing_camera_id_returns_empty_detections(self) -> None:
         module = _make_module()
         bad_input: FaceDetectionInput = {
-            "frame_id": 1,
+            "frame_id": "frame_0001",
             "camera_id": "",
             "timestamp_ms": 100,
             "roi_image": np.zeros((10, 10, 3), dtype=np.uint8),
-            "roi_bbox_frame": {"x": 0, "y": 0, "width": 10, "height": 10},
         }
         result = module.detect_faces(bad_input)
 
         self.assertEqual(set(result), {"frame_id", "camera_id", "timestamp_ms", "detections"})
         self.assertEqual(result["detections"], [])
 
-    def test_zero_size_roi_returns_empty_detections(self) -> None:
-        module = _make_module()
-        bad_input: FaceDetectionInput = {
-            "frame_id": 1,
-            "camera_id": "cam-a",
-            "timestamp_ms": 100,
-            "roi_image": np.zeros((10, 10, 3), dtype=np.uint8),
-            "roi_bbox_frame": {"x": 0, "y": 0, "width": 0, "height": 10},
-        }
-        result = module.detect_faces(bad_input)
-
-        self.assertEqual(result["detections"], [])
-
     def test_wrong_dtype_roi_returns_empty_detections(self) -> None:
         module = _make_module()
         bad_input: FaceDetectionInput = {
-            "frame_id": 1,
+            "frame_id": "frame_0001",
             "camera_id": "cam-a",
             "timestamp_ms": 100,
             "roi_image": np.zeros((10, 10, 3), dtype=np.float32),
-            "roi_bbox_frame": {"x": 0, "y": 0, "width": 10, "height": 10},
         }
         result = module.detect_faces(bad_input)
 
@@ -231,11 +206,10 @@ class ErrorHandlingTests(unittest.TestCase):
     def test_none_roi_image_returns_empty_detections(self) -> None:
         module = _make_module()
         bad_input: FaceDetectionInput = {
-            "frame_id": 1,
+            "frame_id": "frame_0001",
             "camera_id": "cam-a",
             "timestamp_ms": 100,
             "roi_image": None,
-            "roi_bbox_frame": {"x": 0, "y": 0, "width": 10, "height": 10},
         }
         result = module.detect_faces(bad_input)
 
@@ -304,6 +278,108 @@ class StubEngineTests(unittest.TestCase):
         self.assertEqual(d1.bbox, d2.bbox)
         self.assertEqual(d1.landmarks, d2.landmarks)
         self.assertEqual(d1.confidence, d2.confidence)
+
+
+class ImageContractValidationTests(unittest.TestCase):
+    """Verify FaceDetectionInputValidator enforces shared Image struct contract."""
+
+    def test_accepts_valid_image_struct(self) -> None:
+        module = _make_module()
+        result = module.detect_faces(_make_input())
+        self.assertGreater(len(result["detections"]), 0)
+
+    def test_rejects_missing_data_field(self) -> None:
+        module = _make_module()
+        bad_roi: FaceDetectionInput = {
+            "frame_id": "f1",
+            "camera_id": "cam-a",
+            "timestamp_ms": 100,
+            "roi_image": {"data": None, "width": 100, "height": 200,
+                          "color_format": "RGB", "layout": "HWC",
+                          "dtype": "uint8", "value_range": "[0, 255]"},
+        }
+        result = module.detect_faces(bad_roi)
+        self.assertEqual(result["detections"], [])
+
+    def test_rejects_wrong_color_format(self) -> None:
+        module = _make_module()
+        roi = _make_roi_image(100, 200)
+        roi["color_format"] = "BGR"
+        result = module.detect_faces(
+            {"frame_id": "f1", "camera_id": "cam-a", "timestamp_ms": 100, "roi_image": roi}
+        )
+        self.assertEqual(result["detections"], [])
+
+    def test_rejects_wrong_layout(self) -> None:
+        module = _make_module()
+        roi = _make_roi_image(100, 200)
+        roi["layout"] = "CHW"
+        result = module.detect_faces(
+            {"frame_id": "f1", "camera_id": "cam-a", "timestamp_ms": 100, "roi_image": roi}
+        )
+        self.assertEqual(result["detections"], [])
+
+    def test_rejects_wrong_dtype(self) -> None:
+        module = _make_module()
+        roi = _make_roi_image(100, 200)
+        roi["dtype"] = "float32"
+        result = module.detect_faces(
+            {"frame_id": "f1", "camera_id": "cam-a", "timestamp_ms": 100, "roi_image": roi}
+        )
+        self.assertEqual(result["detections"], [])
+
+    def test_rejects_wrong_value_range(self) -> None:
+        module = _make_module()
+        roi = _make_roi_image(100, 200)
+        roi["value_range"] = "[0, 1]"
+        result = module.detect_faces(
+            {"frame_id": "f1", "camera_id": "cam-a", "timestamp_ms": 100, "roi_image": roi}
+        )
+        self.assertEqual(result["detections"], [])
+
+    def test_rejects_zero_width(self) -> None:
+        module = _make_module()
+        roi = _make_roi_image(100, 200)
+        roi["width"] = 0
+        result = module.detect_faces(
+            {"frame_id": "f1", "camera_id": "cam-a", "timestamp_ms": 100, "roi_image": roi}
+        )
+        self.assertEqual(result["detections"], [])
+
+    def test_rejects_zero_height(self) -> None:
+        module = _make_module()
+        roi = _make_roi_image(100, 200)
+        roi["height"] = 0
+        result = module.detect_faces(
+            {"frame_id": "f1", "camera_id": "cam-a", "timestamp_ms": 100, "roi_image": roi}
+        )
+        self.assertEqual(result["detections"], [])
+
+    def test_no_roi_bbox_frame_required(self) -> None:
+        """FaceDetectionInput must not require roi_bbox_frame — spec §8.5.3."""
+        module = _make_module()
+        inp = _make_input()
+        self.assertNotIn("roi_bbox_frame", inp)
+        result = module.detect_faces(inp)
+        self.assertGreater(len(result["detections"]), 0)
+
+    def test_engine_receives_ndarray(self) -> None:
+        """FaceDetectionModule must extract Image.data before calling the engine."""
+        received: list[object] = []
+
+        class CapturingEngine:
+            def detect(self, roi_image: np.ndarray) -> list[RawFaceDetection]:  # type: ignore[override]
+                received.append(roi_image)
+                return []
+
+        module = FaceDetectionModule(
+            config=FaceDetectionConfig(),
+            detector_engine=CapturingEngine(),  # type: ignore[arg-type]
+        )
+        module.detect_faces(_make_input())
+
+        self.assertEqual(len(received), 1)
+        self.assertIsInstance(received[0], np.ndarray)
 
 
 if __name__ == "__main__":

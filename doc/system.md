@@ -143,7 +143,7 @@ flowchart TB
 		UV2[Object Detection]
 		UV3[Face Detection]
 		UV4[Face Recognition]
-		UV5[gRPC Client Frame Adapter]
+		UV5[gRPC Client Frame Ingestion Gateway]
 	end
 
 	EventService[Event Service]

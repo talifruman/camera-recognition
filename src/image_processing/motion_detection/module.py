@@ -20,7 +20,7 @@ class BoundingBox(TypedDict):
 
 
 class FramePacket(TypedDict):
-    frame_id: int
+    frame_id: str
     camera_id: str
     timestamp_ms: int
     image: Any  # numpy.ndarray at runtime

@@ -60,6 +60,7 @@ from image_processing.face_detection import (  # type: ignore[import-not-found]
     FaceDetectionInput,
     FaceDetectionModule,
     FaceDetectionOutput,
+    Image as ImageStruct,
     SCRFDFaceDetector,
 )
 from face_detection_stub_engine import StubFaceDetectorEngine  # type: ignore[import-not-found]
@@ -107,7 +108,7 @@ def draw_face_detections(
     draw = ImageDraw.Draw(annotated)
 
     for face in face_output["detections"]:
-        bbox = face["face_bbox_frame"]
+        bbox = face["face_bbox"]
         left = bbox["x"]
         top = bbox["y"]
         right = left + bbox["width"]
@@ -191,7 +192,7 @@ def process_images(
                 width, height = rgb_image.size
                 metadata: FrameMetadata = {
                     "camera_id": "visual-test-camera",
-                    "frame_id": next(FRAME_COUNTER),
+                    "frame_id": f"frame_{next(FRAME_COUNTER):04d}",
                     "width": width,
                     "height": height,
                 }
@@ -212,11 +213,22 @@ def process_images(
                     if roi_image.size == 0:
                         continue
 
+                    roi_h, roi_w = roi_image.shape[:2]
+                    roi_image_struct: ImageStruct = {
+                        "data": roi_image,
+                        "width": roi_w,
+                        "height": roi_h,
+                        "color_format": "RGB",
+                        "layout": "HWC",
+                        "dtype": "uint8",
+                        "value_range": "[0, 255]",
+                    }
+
                     face_input: FaceDetectionInput = {
                         "frame_id": metadata["frame_id"],
                         "camera_id": metadata["camera_id"],
                         "timestamp_ms": 0,
-                        "roi_image": roi_image,
+                        "roi_image": roi_image_struct,
                         "roi_bbox_frame": {
                             "x": person_bbox["x"],
                             "y": person_bbox["y"],

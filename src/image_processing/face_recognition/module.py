@@ -61,7 +61,7 @@ class FaceLandmarks(TypedDict):
 
 
 class FaceRecognitionInput(TypedDict):
-    frame_id: int
+    frame_id: str
     camera_id: str
     timestamp_ms: int
     face_roi_image: Any  # np.ndarray at runtime
@@ -69,7 +69,7 @@ class FaceRecognitionInput(TypedDict):
 
 
 class FaceRecognitionOutput(TypedDict):
-    frame_id: int
+    frame_id: str
     camera_id: str
     timestamp_ms: int
     person_found: bool
@@ -325,7 +325,7 @@ class FaceRecognitionOutputBuilder:
 
     def build(
         self,
-        frame_id: int,
+        frame_id: str,
         camera_id: str,
         timestamp_ms: int,
         decision: RecognitionDecision,
@@ -479,7 +479,7 @@ class FaceRecognitionModule:
     def _no_match_output(face_input: FaceRecognitionInput) -> FaceRecognitionOutput:
         """Return a valid no-match output for any error or failure path."""
         return FaceRecognitionOutput(
-            frame_id=face_input.get("frame_id", 0),  # type: ignore[call-overload]
+            frame_id=face_input.get("frame_id", ""),
             camera_id=face_input.get("camera_id", ""),  # type: ignore[call-overload]
             timestamp_ms=face_input.get("timestamp_ms", 0),  # type: ignore[call-overload]
             person_found=False,

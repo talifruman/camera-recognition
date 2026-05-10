@@ -1,10 +1,28 @@
 # Face Detection Module Specification
 
+## Shared Contract Types
+
+The following types used by this module are defined in [shared_contracts.md](shared_contracts.md) and must not be duplicated here:
+
+- `BoundingBox` — the single shared bounding-box type (§1); coordinate space must be stated at the usage site
+- `ResizePolicy` — the resize behavior enum (§2)
+- `GeometrySpec` — the geometry transformation struct (§3)
+- `OutputImageType` — the pixel representation enum (§4)
+- `PipelineStageInputContract` — the stage initialization contract (§5)
+- `Image` — the canonical shared public image struct; carries `data`, `width`, `height`, `color_format`, `layout`, `dtype`, and `value_range`; pixel format is described by `OutputImageType` (§6)
+- `Point` — the pixel coordinate type; coordinate space must be stated by context (§7)
+- `FaceLandmarks` — the canonical 5-point landmark struct; coordinate space must be stated by the owning field (§8)
+- Coordinate-space terminology (`FULL_FRAME`, `ROI_LOCAL`, `CROP_LOCAL`) — see §9 for definitions and usage rules
+
+---
+
 ## 1. Purpose
 
 The Face Detection module is responsible only for detecting faces inside an already prepared person ROI image.
 
-The module does not crop images, does not detect persons, and does not perform face recognition or identity matching. Its responsibility starts after upstream processing has already produced person-specific ROI images and ends when the module returns accepted face locations in full-frame coordinates.
+The module does not crop images, does not detect persons, and does not perform face recognition or identity matching. Its responsibility starts after upstream processing has already produced person-specific ROI images and ends when the module returns accepted face locations in **ROI-local coordinates relative to `roi_image`**.
+
+The module does not perform full-frame coordinate projection.
 
 The module does not describe or manage any external system responsibilities. External components such as the upstream person ROI preparation pipeline are treated as black boxes.
 
@@ -28,28 +46,23 @@ The module processes exactly one person ROI per invocation. If multiple people e
 
 ### 2.2 Input Structure
 
-```text
-struct BoundingBox {
-    int32 x;
-    int32 y;
-    int32 width;
-    int32 height;
-}
+`BoundingBox` is defined in [shared_contracts.md §1](shared_contracts.md). `Image` is defined in [shared_contracts.md §6](shared_contracts.md) — the canonical shared public image struct carrying explicit metadata fields.
 
+```text
 struct FaceDetectionInput {
-    uint64 frame_id;
+    string frame_id;
     string camera_id;
     uint64 timestamp_ms;
-    Image roi_image;
-    BoundingBox roi_bbox_frame;
+    Image  roi_image;  // shared Image struct; metadata fields (color_format, layout, dtype, value_range) must match the configured detector input contract
 }
 ```
 
 - `frame_id` identifies the source frame for traceability.
 - `camera_id` identifies the source camera.
-- `timestamp_ms` is the capture timestamp in milliseconds.
-- `roi_image` is the prepared person ROI image.
-- `roi_bbox_frame` is the bounding box of that ROI in the original frame coordinate system.
+- `timestamp_ms` is the capture timestamp in milliseconds. In the Python implementation it is represented as `int` and must be non-negative (milliseconds since epoch).
+- `roi_image` is the prepared person ROI image. All detections produced by the module are expressed in ROI-local coordinates relative to this image.
+
+`FaceDetectionInput` does not carry `roi_bbox_frame` or any spatial metadata. The ROI position in full-frame coordinates is maintained by `PipelineOrchestrator` and is used there after receiving the module's output to project face locations to full-frame coordinates if needed.
 
 ### 2.3 ROI Image Contract
 
@@ -62,7 +75,7 @@ Default SCRFD-oriented contract:
 - dtype: `uint8`
 - value range: `[0, 255]`
 
-The exact detector contract is configuration-defined, but the module expects the ROI to be consistent with that contract. The module validates the incoming ROI image shape, layout compatibility, dtype, and range assumptions before sending it to the detector engine.
+The exact detector contract is configuration-defined. The `roi_image.color_format`, `roi_image.layout`, `roi_image.dtype`, and `roi_image.value_range` fields carry this information explicitly as part of the shared `Image` contract. The module validates the incoming `roi_image` against the configured `DetectorInputContract` using these metadata fields before sending it to the detector engine. `roi_image.width` and `roi_image.height` are explicit fields carrying the pixel dimensions of the prepared ROI.
 
 The ROI image therefore arrives fully prepared. The Face Detection module does not perform any image preprocessing. Any minimal runtime-specific adaptation required for inference, such as wrapping the validated image into the backend's tensor type or adding a batch dimension, is handled internally by `FaceDetectorEngine` and does not modify the image data.
 
@@ -81,11 +94,13 @@ struct DetectorInputContract {
 struct FaceDetectionConfig {
     float32 confidence_threshold;
     DetectorInputContract detector_input_contract;
+    GeometrySpec geometry_spec;
 }
 ```
 
 - `confidence_threshold` is the minimum confidence score a raw detection must meet to be accepted as a valid face detection.
 - `detector_input_contract` defines the expected properties of the incoming ROI image, including color format, layout, dtype, and value range.
+- `geometry_spec` defines the target spatial dimensions and resize policy expected by the configured detector engine. It is returned to `RPM` via `get_input_contract()` so the Frame Transformation Layer can prepare the model-ready ROI image at the correct size.
 
 ### 3.2 Configuration Loading Behavior
 
@@ -141,9 +156,10 @@ Validation rules:
 - `camera_id` must exist and be non-empty
 - `timestamp_ms` must exist
 - `roi_image` must exist
-- `roi_bbox_frame` must exist
-- `roi_bbox_frame.width` and `roi_bbox_frame.height` must be greater than zero
-- `roi_image` must match the configured detector input contract
+- `roi_image.data` must be non-null and contain valid pixel data
+- `roi_image.width` must be > 0 and `roi_image.height` must be > 0
+- `roi_image.color_format`, `roi_image.layout`, `roi_image.dtype`, and `roi_image.value_range` must match the configured `DetectorInputContract`
+- `roi_image.data.shape` must be consistent with `roi_image.width`, `roi_image.height`, `roi_image.layout`, and `roi_image.color_format`
 
 `FaceDetectionInputValidator` does not perform any image preprocessing and makes no acceptance decisions.
 
@@ -179,49 +195,35 @@ The `confidence_threshold` is read from the module configuration file exactly on
 
 This component is the only place inside the module that decides whether a raw detector result becomes an accepted face detection. `FaceDetectionPostprocessor` does not project coordinates and does not construct output structures.
 
-### 5.5 FaceCoordinateProjector
+### 5.5 FaceDetectionOutputBuilder
 
-`FaceCoordinateProjector` is responsible for the geometric transformation that converts accepted detections from ROI-local coordinates into full-frame coordinates.
-
-Its responsibilities are:
-
-- offset each accepted face bounding box by `roi_bbox_frame.x` and `roi_bbox_frame.y` to produce `face_bbox_frame` in frame coordinates
-- map landmarks from ROI space into full-frame space using the same ROI offset
-- ensure all coordinates passed to `FaceDetectionOutputBuilder` are expressed in frame coordinates
-
-`FaceCoordinateProjector` receives only detections already accepted by `FaceDetectionPostprocessor`. It does not apply acceptance logic.
-
-### 5.6 FaceDetectionOutputBuilder
-
-`FaceDetectionOutputBuilder` is responsible for constructing the final `FaceDetectionOutput` from already projected detections and preserved input metadata.
+`FaceDetectionOutputBuilder` is responsible for constructing the final `FaceDetectionOutput` from accepted ROI-local detections and preserved input metadata.
 
 Its responsibilities are:
 
-- create `DetectedFace` entries from projected detections
-- map projected raw landmarks into the canonical `FaceLandmarks` structure
+- create `DetectedFace` entries from accepted detections in ROI-local coordinates
+- map accepted raw landmarks into the canonical `FaceLandmarks` structure (`left_eye`, `right_eye`, `nose`, `mouth_left`, `mouth_right`)
 - assemble the final `FaceDetectionOutput`
 - copy `frame_id`, `camera_id`, and `timestamp_ms` from the input for traceability
 
-`FaceDetectionOutputBuilder` acts as the internal adaptation layer that decouples model-specific landmark formats from the public contract. It receives whatever landmark format the detector produced (after coordinate projection by `FaceCoordinateProjector`) and produces the canonical 5-point `FaceLandmarks` output. Model-specific landmark formats do not escape this component.
+`FaceDetectionOutputBuilder` acts as the internal adaptation layer that decouples model-specific landmark formats from the public contract. It receives whatever landmark format the detector produced (after acceptance by `FaceDetectionPostprocessor`) and produces the canonical 5-point `FaceLandmarks` output. Model-specific landmark formats do not escape this component.
 
-`FaceDetectionOutputBuilder` receives only frame-space coordinates from `FaceCoordinateProjector`. It does not project coordinates and does not apply acceptance logic.
+All coordinates in the output are ROI-local relative to `roi_image`. `FaceDetectionOutputBuilder` does not project coordinates, does not apply acceptance logic, and does not perform full-frame mapping.
 
-### 5.7 End-to-End Processing Flow
+### 5.6 End-to-End Processing Flow
 
 For one invocation of `detect_faces`, the internal pipeline follows this order:
 
-**validation → inference → postprocessing/acceptance → coordinate projection → output construction**
+**validation → inference → postprocessing/acceptance → output construction**
 
 1. `FaceDetectionModule` receives `FaceDetectionInput`.
 2. `FaceDetectionModule` calls `FaceDetectionInputValidator` to validate the input.
 3. `FaceDetectionModule` sends the validated `roi_image` to `FaceDetectorEngine`.
-4. `FaceDetectorEngine` runs inference and returns raw detections in ROI coordinates.
+4. `FaceDetectorEngine` runs inference and returns raw detections in ROI-local coordinates.
 5. `FaceDetectionModule` sends the raw detections to `FaceDetectionPostprocessor`.
-6. `FaceDetectionPostprocessor` applies acceptance rules and returns only accepted detections. Rejected detections are discarded.
-7. `FaceDetectionModule` sends the accepted detections and `roi_bbox_frame` to `FaceCoordinateProjector`.
-8. `FaceCoordinateProjector` returns projected detections in full-frame coordinates.
-9. `FaceDetectionModule` calls `FaceDetectionOutputBuilder` with frame metadata and projected detections.
-10. `FaceDetectionOutputBuilder` constructs and returns the final `FaceDetectionOutput`.
+6. `FaceDetectionPostprocessor` applies acceptance rules and returns only accepted detections in ROI-local coordinates. Rejected detections are discarded.
+7. `FaceDetectionModule` calls `FaceDetectionOutputBuilder` with frame metadata and accepted ROI-local detections.
+8. `FaceDetectionOutputBuilder` constructs and returns the final `FaceDetectionOutput` with all coordinates expressed in ROI-local space.
 
 All raw model outputs, confidence scores, rejected detections, and intermediate backend-specific artifacts remain internal to the module.
 
@@ -230,34 +232,22 @@ All raw model outputs, confidence scores, rejected detections, and intermediate 
 All intermediate representations below are strictly internal and never exposed through the public API.
 
 - **`RawFaceDetections`** — Raw bounding boxes, confidence scores, and model-specific landmarks in ROI-local coordinates. Produced by `FaceDetectorEngine`, consumed by `FaceDetectionPostprocessor`.
-- **`AcceptedDetections`** — Detections that passed confidence threshold and validation checks, still in ROI-local coordinates. Produced by `FaceDetectionPostprocessor`, consumed by `FaceCoordinateProjector`.
-- **`ProjectedDetections`** — Accepted detections with all coordinates transformed to full-frame space. Produced by `FaceCoordinateProjector`, consumed by `FaceDetectionOutputBuilder`.
+- **`AcceptedDetections`** — Detections that passed confidence threshold and validation checks, still in ROI-local coordinates. Produced by `FaceDetectionPostprocessor`, consumed by `FaceDetectionOutputBuilder`.
 
 ## 7. Output
 
 ### 7.1 Output Structure
 
+`Point` is defined in [shared_contracts.md §7](shared_contracts.md). `FaceLandmarks` is defined in [shared_contracts.md §8](shared_contracts.md). `BoundingBox` is defined in [shared_contracts.md §1](shared_contracts.md).
+
 ```text
-struct Point {
-    int32 x;
-    int32 y;
-}
-
-struct FaceLandmarks {
-    Point left_eye;
-    Point right_eye;
-    Point nose;
-    Point mouth_left;
-    Point mouth_right;
-}
-
 struct DetectedFace {
-    BoundingBox face_bbox_frame;
-    FaceLandmarks landmarks;
+    BoundingBox   face_bbox;   // ROI-local, relative to roi_image
+    FaceLandmarks landmarks;  // ROI-local, relative to roi_image
 }
 
 struct FaceDetectionOutput {
-    uint64 frame_id;
+    string frame_id;
     string camera_id;
     uint64 timestamp_ms;
     vector<DetectedFace> detections;
@@ -268,8 +258,8 @@ struct FaceDetectionOutput {
 
 - `frame_id`, `camera_id`, and `timestamp_ms` are copied from the input for traceability.
 - `detections` contains only accepted face detections.
-- `face_bbox_frame` is always expressed in full-frame coordinates, not ROI coordinates.
-- `landmarks` are always present in every `DetectedFace`. The module exposes a canonical 5-point landmark representation: `left_eye`, `right_eye`, `nose`, `mouth_left`, and `mouth_right`.
+- `face_bbox` is expressed in ROI-local coordinates relative to `roi_image`. Full-frame projection is not performed by this module — that responsibility belongs to `RPM` / `PipelineOrchestrator`.
+- `landmarks` are always present in every `DetectedFace` and are expressed in ROI-local coordinates relative to `roi_image`. The module exposes a canonical 5-point landmark representation: `left_eye`, `right_eye`, `nose`, `mouth_left`, and `mouth_right` (see [shared_contracts.md §8](shared_contracts.md)).
 
 The `FaceLandmarks` structure is a fixed, model-agnostic public contract. It does not change based on the underlying detector. Model-specific landmark formats are never exposed outside the module. The public API remains stable even if the detector engine is replaced.
 
@@ -297,8 +287,11 @@ Only accepted detections proceed to coordinate projection. If no detections surv
 The public module contract is:
 
 ```text
+get_input_contract() -> PipelineStageInputContract
 detect_faces(input: FaceDetectionInput) -> FaceDetectionOutput
 ```
+
+`get_input_contract()` is called once during `RecognitionPipelineManager` initialization. It returns the `PipelineStageInputContract` (containing `output_image_type` and `geometry_spec`) that the Frame Transformation Layer uses to prepare model-ready ROI images for this stage. The return value is stable across invocations.
 
 The public API must not expose detector confidence, raw inference tensors, rejection reasons, internal state, or any model-specific data. The contract is stable regardless of which detector engine is configured.
 
@@ -308,9 +301,11 @@ The detector backend is abstracted behind an internal interface:
 
 ```text
 interface FaceDetectorEngine {
-    detect(prepared_roi: PreparedROI) -> RawFaceDetections
+    detect(roi_image: np.ndarray) -> RawFaceDetections
 }
 ```
+
+> **Engine receives raw ndarray, not `Image` struct.** `FaceDetectionModule` validates `FaceDetectionInput.roi_image` as an `Image` struct (see shared_contracts.md §6) and extracts `roi_image.data` before passing it to `FaceDetectorEngine.detect()`. The engine interface is kept free of `Image` struct dependency — it operates on the raw pixel buffer only. `FaceDetectorEngine` is an internal interface; it is not part of the public module API.
 
 Default implementation:
 
@@ -333,11 +328,11 @@ All errors are handled internally. The caller never receives exceptions or parti
 ### 11.1 Initialization
 
 - Load `FaceDetectionConfig` from the configuration source
-- Wire subcomponents: `FaceDetectionInputValidator` (with `detector_input_contract`), `FaceDetectorEngine` (with configured backend + model loading), `FaceDetectionPostprocessor` (with `confidence_threshold`), `FaceCoordinateProjector`, `FaceDetectionOutputBuilder`
+- Wire subcomponents: `FaceDetectionInputValidator` (with `detector_input_contract`), `FaceDetectorEngine` (with configured backend + model loading), `FaceDetectionPostprocessor` (with `confidence_threshold`), `FaceDetectionOutputBuilder`
 
 ### 11.2 Per-Invocation
 
-**validation → inference → postprocessing → coordinate projection → output construction**
+**validation → inference → postprocessing → output construction**
 
 Stateless per invocation. No state carries between calls. One person ROI per call.
 
@@ -355,6 +350,7 @@ Metrics are internal and operational. Not part of the public API.
 ```mermaid
 classDiagram
     class FaceDetectionModule {
+        +get_input_contract() PipelineStageInputContract
         +detect_faces(input: FaceDetectionInput) FaceDetectionOutput
     }
 
@@ -364,19 +360,15 @@ classDiagram
 
     class FaceDetectorEngine {
         <<interface>>
-        +detect(prepared_roi: PreparedROI) RawFaceDetections
+        +detect(roi_image: np.ndarray) RawFaceDetections
     }
 
     class SCRFDFaceDetector {
-        +detect(prepared_roi: PreparedROI) RawFaceDetections
+        +detect(roi_image: np.ndarray) RawFaceDetections
     }
 
     class FaceDetectionPostprocessor {
         +accept(raw_detections) AcceptedDetections
-    }
-
-    class FaceCoordinateProjector {
-        +project(detections, roi_bbox_frame) ProjectedDetections
     }
 
     class FaceDetectionOutputBuilder {
@@ -384,51 +376,36 @@ classDiagram
     }
 
     class FaceDetectionInput {
-        +frame_id: uint64
+        +frame_id: string
         +camera_id: string
         +timestamp_ms: uint64
         +roi_image: Image
-        +roi_bbox_frame: BoundingBox
     }
 
     class FaceDetectionOutput {
-        +frame_id: uint64
+        +frame_id: string
         +camera_id: string
         +timestamp_ms: uint64
         +detections: DetectedFace[]
     }
 
     class DetectedFace {
-        +face_bbox_frame: BoundingBox
-        +landmarks: FaceLandmarks
+        +face_bbox: BoundingBox %% ROI-local — defined in shared_contracts.md §1
+        +landmarks: FaceLandmarks %% ROI-local — defined in shared_contracts.md §8
     }
 
-    class FaceLandmarks {
-        +left_eye: Point
-        +right_eye: Point
-        +nose: Point
-        +mouth_left: Point
-        +mouth_right: Point
-    }
-
-    class BoundingBox {
-        +x: int32
-        +y: int32
-        +width: int32
-        +height: int32
-    }
+    %% BoundingBox defined in shared_contracts.md §1
+    %% Point defined in shared_contracts.md §7
+    %% FaceLandmarks defined in shared_contracts.md §8
 
     FaceDetectionModule --> FaceDetectionInputValidator : orchestrates
     FaceDetectionModule --> FaceDetectorEngine : orchestrates
     FaceDetectionModule --> FaceDetectionPostprocessor : orchestrates
-    FaceDetectionModule --> FaceCoordinateProjector : orchestrates
     FaceDetectionModule --> FaceDetectionOutputBuilder : orchestrates
     SCRFDFaceDetector ..|> FaceDetectorEngine : implements
     FaceDetectionModule --> FaceDetectionInput : consumes
     FaceDetectionModule --> FaceDetectionOutput : returns
     FaceDetectionOutput --> DetectedFace : contains
-    DetectedFace --> BoundingBox : uses
-    DetectedFace --> FaceLandmarks : uses
 ```
 
 ## 14. Sequence Diagram
@@ -441,7 +418,6 @@ sequenceDiagram
     participant FaceDetectionInputValidator
     participant FaceDetectorEngine
     participant FaceDetectionPostprocessor
-    participant FaceCoordinateProjector
     participant FaceDetectionOutputBuilder
 
     Caller->>FaceDetectionModule: detect_faces(input)
@@ -449,12 +425,10 @@ sequenceDiagram
     FaceDetectionInputValidator-->>FaceDetectionModule: input valid
     FaceDetectionModule->>FaceDetectorEngine: detect(roi_image)
     FaceDetectorEngine->>FaceDetectorEngine: run inference
-    FaceDetectorEngine-->>FaceDetectionModule: raw face detections
+    FaceDetectorEngine-->>FaceDetectionModule: raw face detections (ROI-local)
     FaceDetectionModule->>FaceDetectionPostprocessor: filter(raw detections)
-    FaceDetectionPostprocessor-->>FaceDetectionModule: accepted detections
-    FaceDetectionModule->>FaceCoordinateProjector: project(accepted detections, roi_bbox_frame)
-    FaceCoordinateProjector-->>FaceDetectionModule: projected detections
-    FaceDetectionModule->>FaceDetectionOutputBuilder: build(frame metadata, projected detections)
+    FaceDetectionPostprocessor-->>FaceDetectionModule: accepted detections (ROI-local)
+    FaceDetectionModule->>FaceDetectionOutputBuilder: build(frame metadata, accepted detections)
     FaceDetectionOutputBuilder-->>FaceDetectionModule: FaceDetectionOutput
     FaceDetectionModule-->>Caller: FaceDetectionOutput
 ```
@@ -471,4 +445,4 @@ The Face Detection module must not:
 - expose raw detector outputs externally
 - expose raw detector confidence externally
 
-The module is limited to face detection inside a prepared person ROI and to returning accepted face locations in full-frame coordinates.
+The module is limited to face detection inside a prepared person ROI and to returning accepted face locations in **ROI-local coordinates relative to `roi_image`**. Full-frame projection is the responsibility of `RPM` / `PipelineOrchestrator`.

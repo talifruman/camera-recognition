@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol, TypedDict, runtime_checkable
+from typing import Protocol, TypedDict, runtime_checkable
 
 import numpy as np
+
+from image_processing.shared.contracts import (
+    GeometrySpec,
+    Image,
+    OutputImageType,
+    PipelineStageInputContract,
+    ResizePolicy,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -32,20 +40,19 @@ class FaceLandmarks(TypedDict):
 
 
 class DetectedFace(TypedDict):
-    face_bbox_frame: BoundingBox
-    landmarks: FaceLandmarks
+    face_bbox: BoundingBox  # ROI-local, relative to roi_image
+    landmarks: FaceLandmarks  # ROI-local, relative to roi_image
 
 
 class FaceDetectionInput(TypedDict):
-    frame_id: int
+    frame_id: str
     camera_id: str
     timestamp_ms: int
-    roi_image: Any  # numpy.ndarray at runtime
-    roi_bbox_frame: BoundingBox
+    roi_image: Image
 
 
 class FaceDetectionOutput(TypedDict):
-    frame_id: int
+    frame_id: str
     camera_id: str
     timestamp_ms: int
     detections: list[DetectedFace]
@@ -70,6 +77,11 @@ class FaceDetectionConfig:
     detector_input_contract: DetectorInputContract = field(
         default_factory=DetectorInputContract,
     )
+    geometry_spec: GeometrySpec = field(
+        default_factory=lambda: GeometrySpec(
+            width=0, height=0, resize_policy=ResizePolicy.NONE
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -86,13 +98,6 @@ class RawFaceDetection:
 
 @dataclass(slots=True)
 class AcceptedDetection:
-    bbox: BoundingBox
-    confidence: float
-    landmarks: list[Point]
-
-
-@dataclass(slots=True)
-class ProjectedDetection:
     bbox: BoundingBox
     confidence: float
     landmarks: list[Point]
@@ -133,27 +138,54 @@ class FaceDetectionInputValidator:
         roi_image = face_input.get("roi_image")
         if roi_image is None:
             raise ValueError("roi_image is required")
-        if not isinstance(roi_image, np.ndarray):
-            raise TypeError("roi_image must be a numpy.ndarray")
+        if not isinstance(roi_image, dict):
+            raise TypeError("roi_image must be an Image struct (dict)")
 
-        roi_bbox = face_input.get("roi_bbox_frame")
-        if roi_bbox is None:
-            raise ValueError("roi_bbox_frame is required")
-        if roi_bbox["width"] <= 0 or roi_bbox["height"] <= 0:
-            raise ValueError("roi_bbox_frame width and height must be greater than zero")
+        data = roi_image.get("data")
+        if data is None:
+            raise ValueError("roi_image.data is required")
+        if not isinstance(data, np.ndarray):
+            raise TypeError("roi_image.data must be a numpy.ndarray")
+        if roi_image.get("width", 0) <= 0:
+            raise ValueError("roi_image.width must be positive")
+        if roi_image.get("height", 0) <= 0:
+            raise ValueError("roi_image.height must be positive")
 
         self._validate_roi_contract(roi_image)
 
-    def _validate_roi_contract(self, roi_image: np.ndarray) -> None:
-        if self._contract.layout == "HWC" and roi_image.ndim not in (2, 3):
-            raise ValueError("roi_image must be a 2D or 3D array for HWC layout")
-
-        expected_dtype = np.dtype(self._contract.dtype)
-        if roi_image.dtype != expected_dtype:
+    def _validate_roi_contract(self, roi_image: Image) -> None:
+        color_format = roi_image.get("color_format")
+        if color_format != self._contract.color_format:
             raise ValueError(
-                f"roi_image dtype {roi_image.dtype} does not match "
-                f"detector contract dtype {expected_dtype}"
+                f"roi_image.color_format must be '{self._contract.color_format}', "
+                f"got {color_format!r}"
             )
+        layout = roi_image.get("layout")
+        if layout != self._contract.layout:
+            raise ValueError(
+                f"roi_image.layout must be '{self._contract.layout}', "
+                f"got {layout!r}"
+            )
+        dtype = roi_image.get("dtype")
+        if dtype != self._contract.dtype:
+            raise ValueError(
+                f"roi_image.dtype must be '{self._contract.dtype}', "
+                f"got {dtype!r}"
+            )
+        value_range = roi_image.get("value_range")
+        # Normalize expected value_range for comparison (contract uses "[0, 255]" with space)
+        # shared_contracts.md §6 uses "[0,255]" without space; DetectorInputContract uses "[0, 255]"
+        # Accept both forms by stripping spaces from both sides
+        expected_vr = self._contract.value_range.replace(" ", "")
+        actual_vr = value_range.replace(" ", "") if isinstance(value_range, str) else value_range
+        if actual_vr != expected_vr:
+            raise ValueError(
+                f"roi_image.value_range must be '{self._contract.value_range}', "
+                f"got {value_range!r}"
+            )
+        data = roi_image["data"]
+        if self._contract.layout == "HWC" and data.ndim not in (2, 3):
+            raise ValueError("roi_image.data must be a 2D or 3D array for HWC layout")
 
 
 # ---------------------------------------------------------------------------
@@ -186,43 +218,6 @@ class FaceDetectionPostprocessor:
 
 
 # ---------------------------------------------------------------------------
-# FaceCoordinateProjector — spec §5.5
-#
-# Offsets ROI-local coordinates into full-frame coordinates using the
-# roi_bbox_frame origin.
-# ---------------------------------------------------------------------------
-
-
-class FaceCoordinateProjector:
-    def project(
-        self,
-        detections: list[AcceptedDetection],
-        roi_bbox_frame: BoundingBox,
-    ) -> list[ProjectedDetection]:
-        ox = roi_bbox_frame["x"]
-        oy = roi_bbox_frame["y"]
-        projected: list[ProjectedDetection] = []
-        for det in detections:
-            projected_bbox: BoundingBox = {
-                "x": det.bbox["x"] + ox,
-                "y": det.bbox["y"] + oy,
-                "width": det.bbox["width"],
-                "height": det.bbox["height"],
-            }
-            projected_landmarks: list[Point] = [
-                {"x": lm["x"] + ox, "y": lm["y"] + oy} for lm in det.landmarks
-            ]
-            projected.append(
-                ProjectedDetection(
-                    bbox=projected_bbox,
-                    confidence=det.confidence,
-                    landmarks=projected_landmarks,
-                )
-            )
-        return projected
-
-
-# ---------------------------------------------------------------------------
 # FaceDetectionOutputBuilder — spec §5.6
 #
 # Constructs the final FaceDetectionOutput from projected detections.
@@ -236,17 +231,17 @@ _LANDMARK_KEYS = ("left_eye", "right_eye", "nose", "mouth_left", "mouth_right")
 class FaceDetectionOutputBuilder:
     def build(
         self,
-        frame_id: int,
+        frame_id: str,
         camera_id: str,
         timestamp_ms: int,
-        projected_detections: list[ProjectedDetection],
+        accepted_detections: list[AcceptedDetection],
     ) -> FaceDetectionOutput:
         detections: list[DetectedFace] = []
-        for det in projected_detections:
+        for det in accepted_detections:
             landmarks = self._build_landmarks(det.landmarks)
             detections.append(
                 DetectedFace(
-                    face_bbox_frame=det.bbox,
+                    face_bbox=det.bbox,
                     landmarks=landmarks,
                 )
             )
@@ -278,7 +273,7 @@ class FaceDetectionOutputBuilder:
 #
 # Orchestration layer only.  Owns no detection logic.
 # Wires subcomponents and invokes them in order:
-#   validation → inference → postprocessing → coordinate projection → output
+#   validation → inference → postprocessing → output
 #
 # Error handling (spec §10): all errors are caught internally; the caller
 # never receives exceptions.  In every failure scenario the module returns
@@ -308,10 +303,15 @@ class FaceDetectionModule:
         self._postprocessor = FaceDetectionPostprocessor(
             self._config.confidence_threshold,
         )
-        self._coordinate_projector = FaceCoordinateProjector()
         self._output_builder = FaceDetectionOutputBuilder()
 
     # ---- public API (spec §9.1) ------------------------------------------
+
+    def get_input_contract(self) -> PipelineStageInputContract:
+        return PipelineStageInputContract(
+            output_image_type=OutputImageType.RGB_UINT8_HWC,
+            geometry_spec=self._config.geometry_spec,
+        )
 
     def detect_faces(self, face_input: FaceDetectionInput) -> FaceDetectionOutput:
         try:
@@ -328,29 +328,24 @@ class FaceDetectionModule:
         # Step 1: validate
         self._input_validator.validate(face_input)
 
-        # Step 2: inference — send validated roi_image to detector engine
-        raw_detections = self._detector_engine.detect(face_input["roi_image"])
+        # Step 2: inference — extract raw ndarray from Image struct and send to detector engine
+        raw_detections = self._detector_engine.detect(face_input["roi_image"]["data"])
 
         # Step 3: postprocessing / acceptance
         accepted = self._postprocessor.accept(raw_detections)
 
-        # Step 4: coordinate projection (ROI-local → frame coordinates)
-        projected = self._coordinate_projector.project(
-            accepted, face_input["roi_bbox_frame"]
-        )
-
-        # Step 5: output construction
+        # Step 4: output construction — coordinates remain ROI-local (spec §7.2)
         return self._output_builder.build(
             frame_id=face_input["frame_id"],
             camera_id=face_input["camera_id"],
             timestamp_ms=face_input["timestamp_ms"],
-            projected_detections=projected,
+            accepted_detections=accepted,
         )
 
     @staticmethod
     def _empty_output(face_input: FaceDetectionInput) -> FaceDetectionOutput:
         return FaceDetectionOutput(
-            frame_id=face_input.get("frame_id", 0),
+            frame_id=face_input.get("frame_id", ""),
             camera_id=face_input.get("camera_id", ""),
             timestamp_ms=face_input.get("timestamp_ms", 0),
             detections=[],

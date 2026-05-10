@@ -1,567 +1,727 @@
-﻿# Image Processing Service Module Specification
+# Image Processing Service Module Specification
 
-## 1. Overview
+## 1. Scope
 
 ### Purpose
 
-The Image Processing Service (IPS) module is responsible for executing a deterministic internal processing pipeline over a single `FramePacket`. It receives a prepared `FramePacket`, orchestrates all internal detection and recognition stages, and returns a structured `IPSOutput` containing the set of recognized faces found in the frame.
+The Image Processing Service is responsible for owning the runtime machinery that connects frame ingestion to recognition. It owns all worker threads, all per-camera queues, all worker lifecycle, and all service state transitions. It configures and wires the `FrameIngestionGateway`, one `GatewayFramePacketSource` per camera, a `FramePacketSourceRegistry`, the `RecognitionPipelineManager`, one `RecognitionWorker` per camera, and the `ResultHandler`. It starts, coordinates, and stops all owned components in the defined order.
 
-IPS owns orchestration only. It does not implement detection algorithms, embedding logic, or preprocessing. Each processing responsibility belongs to a dedicated internal module. IPS wires those modules together, controls execution order, applies routing decisions, performs region cropping, and projects coordinates between stages.
+The Image Processing Service does not implement detection, recognition, or image preprocessing. All pipeline execution is delegated to `RecognitionPipelineManager`.
 
 ### In Scope
 
-- Executing the per-frame detection and recognition pipeline
-- Invoking internal modules in the defined execution order
-- Applying routing logic (stop conditions and per-person skip logic)
-- Cropping region-of-interest images at each pipeline stage via `FrameCroppingModule`
-- Projecting ROI-local detections to full-frame coordinates via `CoordinateProjector`
-- Requesting prepared input representations from `FrameTransformationLayer` before each module
-- Accumulating projected person bounding boxes and face detections into `FramePacket`
-- Aggregating all recognition results into a single `IPSOutput`
+- Loading and validating service configuration at startup
+- Configuring the `FrameIngestionGateway`
+- Creating one `GatewayFramePacketSource` per configured `camera_id`
+- Creating and owning the `FramePacketSourceRegistry`
+- Initializing `RecognitionPipelineManager` with pipeline stage engines
+- Creating and owning one `RecognitionWorker` per configured `camera_id`
+- Creating and owning the `ResultHandler`
+- Starting and stopping the `FrameIngestionGateway`
+- Starting and stopping all `RecognitionWorker` threads
+- Managing service state transitions: `CREATED → RUNNING → STOPPING → STOPPED`
+- Enforcing the per-camera `GatewayFramePacketSource` queue overflow policy
+- Exposing service health via `health()`
+- Reporting service-level metrics
 
 ### Out of Scope
 
 The Image Processing Service does NOT:
 
-- Implement motion detection, object detection, face detection, or face recognition algorithms
-- Perform any image preprocessing — color conversion, resizing, normalization, layout conversion, or dtype conversion
-- Manage identity enrollment or gallery updates
+- Implement motion detection, object detection, face detection, or face recognition — handled outside this module
+- Perform image preprocessing (color conversion, resize, normalization, dtype conversion) — handled outside this module
+- Execute the recognition pipeline — handled outside this module
+- Access raw pixel data or `BaseImage` contents — handled outside this module
+- Manage the `FrameIngestionGateway` ingestion thread — the Gateway owns and manages its own ingestion thread
+- Maintain frame identity state across calls — handled outside this module
+- Implement transport connections or camera protocols — handled outside this module
+- Manage identity enrollment or gallery updates — handled outside this module
 - Access the filesystem after initialization
-- Process multiple `FramePacket` instances concurrently within one pipeline execution
-- Accept batched input — one `FramePacket` per invocation
 
 ---
 
-## 2. Input Definition
+## 2. Input
 
-### 2.1 Public API
+### 2.1 Input Responsibility Boundary
 
-```text
-process(frame_packet: FramePacket) -> IPSOutput
-```
+The service does not receive frames through a public method. Frames are produced by the `FrameIngestionGateway` on its own ingestion thread. Each produced `FramePacket` is pushed into the `GatewayFramePacketSource` registered for that `camera_id`. The service does not call the Gateway to fetch frames — the Gateway pushes, and `RecognitionWorker` threads pull directly via the `FramePacketSource` interface.
 
-IPS receives a single `FramePacket` per invocation and returns a single `IPSOutput`.
+The following have already been applied before a `FramePacket` enters the service's internal queues:
+
+- Frame capture at the originating camera source
+- Transport framing and delivery
+- Field validation by `FrameIngestionGateway`
+- Normalization to canonical RGB, HWC, uint8, [0,255] by `FrameIngestionGateway`
+- `FramePacket` construction by `FrameIngestionGateway`
+
+The Image Processing Service does not perform any of the above. Only queue management, worker dispatch, and lifecycle coordination are performed inside this module.
 
 ### 2.2 Input Structure
+
+The service receives `FramePacket` objects into its internal queues. `FramePacket` is defined by the `FrameIngestionGateway`:
 
 ```text
 struct Image {
     uint32 width;
     uint32 height;
-    string color_format;
-    string layout;
-    string dtype;
+    string color_format;   // always "RGB"
+    string layout;         // always "HWC"
+    string dtype;          // always "uint8"
     bytes  pixels;
 }
 
 struct FramePacket {
     string frame_id;
     string camera_id;
-    int64  timestamp_ms;
+    uint64 timestamp_ms;
     int32  width;
     int32  height;
-    string pixel_format;
+    string pixel_format;   // always "RGB"
     Image  image;
 }
 ```
+
+`FramePacket` is opaque to the Image Processing Service. The service does not access, inspect, or modify pixel data. It routes `FramePacket` objects by `camera_id` into the corresponding `GatewayFramePacketSource` queue.
 
 ### 2.3 Input Contract
 
-`FramePacket` must satisfy the following before `process` is called:
+A `FramePacket` pushed into a `GatewayFramePacketSource` must satisfy:
 
 - `frame_id` must be present and non-empty
-- `camera_id` must be present and non-empty
+- `camera_id` must be present, non-empty, and correspond to a configured camera
 - `timestamp_ms` must be present
 - `image` must be present and non-null
-- `image.width` and `image.height` must be greater than zero
 - `image.pixels` must be non-empty
+- `pixel_format` must be `"RGB"` (canonical normalized form from the Gateway)
 
-The input `FramePacket` carries only ingress fields at the call boundary. IPS enriches the packet with detection and recognition results during pipeline execution.
+The Image Processing Service does not re-validate `FramePacket` fields. Field validation is the responsibility of the `FrameIngestionGateway`. The service enforces only that `camera_id` corresponds to a registered `GatewayFramePacketSource` before pushing.
 
-### 2.4 Input Semantics
+### 2.4 Validation Rules
 
-- `frame_id` — unique identifier for the source frame; preserved for traceability throughout the pipeline
-- `camera_id` — identifies the source camera; used by `MotionDetectionModule` to scope per-camera state
-- `timestamp_ms` — capture timestamp in milliseconds; preserved for traceability
-- `image` — the decoded frame image; used by `FrameCroppingModule` and `FrameTransformationLayer`
+`ServiceConfigValidator` validates the service configuration at startup:
+
+- `camera_ids` must be non-empty
+- All entries in `camera_ids` must be non-empty strings
+- All entries in `camera_ids` must be unique
+- `max_queue_depth_per_camera` must be a positive integer (`> 0`)
+- `overflow_policy` must be a valid `OverflowPolicy` enum value
+- `drain_queues_on_shutdown` must be present (bool)
+
+`GatewayFramePacketSource` validates push operations at runtime:
+
+- `frame_packet.camera_id` must match the source's configured `camera_id`
+- If `camera_id` does not match, the frame is discarded and `PushResult.REJECTED` is returned
+
+### 2.5 Input Semantics
+
+- `frame_id` — unique identifier for the frame; not interpreted by the service; passed through unchanged to `RecognitionPipelineManager`
+- `camera_id` — identifies the source camera; used to route the frame to the correct `GatewayFramePacketSource` queue
+- `timestamp_ms` — capture timestamp; not interpreted by the service; passed through unchanged to `RecognitionPipelineManager`
+- `image` — the normalized frame image; not accessed by the service; passed through unchanged to `RecognitionPipelineManager`
 
 ---
 
-## 3. Output Definition
+## 3. Output
 
 ### 3.1 Output Structure
 
+The service does not return output to callers on a per-frame basis. Per-frame recognition results are handled by the `ResultHandler`. The service exposes only health state and lifecycle control via its public API.
+
 ```text
-struct CanonicalBoundingBox {
-    int32 x;
-    int32 y;
-    int32 width;
-    int32 height;
+enum ServiceState {
+    CREATED,
+    RUNNING,
+    STOPPING,
+    STOPPED
 }
 
-struct RecognitionResult {
-    string               person_id;
-    CanonicalBoundingBox face_bbox;
+enum WorkerState {
+    IDLE,
+    RUNNING,
+    STOPPED,
+    FAILED
 }
 
-struct IPSOutput {
-    string                    frame_id;
-    vector<RecognitionResult> results;
+struct PerCameraHealth {
+    string      camera_id;
+    WorkerState worker_state;
+    int32       queue_depth;
+    uint64      last_frame_timestamp_ms;
+}
+
+struct ImageProcessingServiceHealth {
+    ServiceState            service_state;
+    bool                    gateway_healthy;
+    vector<PerCameraHealth> cameras;
 }
 ```
+
+Per-frame recognition output is defined by `RecognitionPipelineManager` and consumed exclusively by `ResultHandler`. It is not part of the Image Processing Service public API.
 
 ### 3.2 Output Semantics
 
-- `frame_id` — copied from `FramePacket.frame_id` for traceability
-- `results` — the set of recognized faces found in the frame; may be empty; each entry corresponds to one accepted face recognition result
-- `RecognitionResult.person_id` — the identity of the recognized person; present for every entry in `results`
-- `RecognitionResult.face_bbox` — the full-frame bounding box of the recognized face; coordinates are expressed relative to the full input frame with origin at the top-left corner
+- `service_state` — current lifecycle state of the service
+- `gateway_healthy` — `true` when the `FrameIngestionGateway` reports healthy status
+- `cameras` — one `PerCameraHealth` entry per configured `camera_id`
+- `PerCameraHealth.camera_id` — the camera identifier this entry covers
+- `PerCameraHealth.worker_state` — current state of the `RecognitionWorker` for this camera
+- `PerCameraHealth.queue_depth` — number of frames currently enqueued in the `GatewayFramePacketSource` for this camera
+- `PerCameraHealth.last_frame_timestamp_ms` — `timestamp_ms` of the most recently pushed `FramePacket` for this camera; `0` if no frame has been pushed yet
 
 ### 3.3 Output Constraints
 
-- `results` is always present; it is empty when no persons were detected, no faces were detected, or no faces were recognized
-- Each entry in `results` corresponds to exactly one accepted face recognition result from one face-region crop
-- The output must not expose detection confidence scores, embeddings, rejected candidates, intermediate bounding boxes, or per-stage routing decisions
-- `IPSOutput` is always structurally valid; IPS never returns a partial or inconsistent output
+The output must NOT expose:
+
+- Detection confidence scores, similarity scores, or face embeddings
+- Raw pixel data or any intermediate image representation
+- Internal queue implementation details
+- Pipeline routing decisions or skip flags
+- `RecognitionPipelineManager` internal state
 
 ---
 
-## 4. Module Responsibilities
-
-IPS is a pipeline orchestration module. Its exclusive responsibilities are:
-
-- **Execution order** — invoke internal modules in the defined deterministic sequence
-- **Stage routing** — inspect results at each routing point and apply stop or skip conditions
-- **Region cropping** — invoke `FrameCroppingModule` at each crop stage to produce region-of-interest images
-- **Coordinate projection** — invoke `CoordinateProjector` after object detection and face detection to map ROI-local detections to full-frame coordinates
-- **Representation requests** — invoke `FrameTransformationLayer` before each module to obtain module-ready input representations
-- **Accumulation** — collect projected person bounding boxes and projected face detections into `FramePacket` enrichment fields
-- **Result aggregation** — collect all `person_found = true` recognition results and assemble the final `IPSOutput`
-
-IPS must not implement any detection, embedding, matching, preprocessing, or media handling logic. All such logic belongs to dedicated internal modules.
-
----
-
-## 5. Internal Components
-
-### 5.1 PipelineOrchestrator
-
-`PipelineOrchestrator` is the internal execution controller. It owns no detection or processing logic.
-
-Its responsibilities are:
-
-- receive the incoming `FramePacket`
-- invoke internal modules in the defined order
-- invoke `FrameTransformationLayer` before each module requiring a prepared input
-- invoke `FrameCroppingModule` at each crop stage
-- invoke `CoordinateProjector` after object detection and face detection
-- apply routing decisions at each stage gate
-- accumulate projected person and face detections into `FramePacket` enrichment fields
-- collect accepted recognition results
-- construct and return `IPSOutput`
-
-`PipelineOrchestrator` must not embed detection algorithms, preprocessing logic, or coordinate arithmetic directly. It delegates all non-orchestration responsibilities to the appropriate internal module.
-
-### 5.2 FrameTransformationLayer
-
-`FrameTransformationLayer` is a request-driven internal representation service.
-
-Its responsibilities are:
-
-- accept a source image and a representation name
-- apply the transformation contract associated with that representation name
-- return a module-ready input representation
-
-Transformation contracts are configuration-defined and specify color format, layout, dtype, value range, and dimensions. `FrameTransformationLayer` applies all preprocessing: resizing, normalization, color format conversion, layout conversion, dtype conversion, and payload decoding. No module performs any of these operations independently.
-
-Representation names used by IPS:
-
-| Representation name        | Consumed by               |
-|----------------------------|---------------------------|
-| `motion_detection_input`   | MotionDetectionModule     |
-| `object_detection_input`   | ObjectDetectionModule     |
-| `face_detection_input`     | FaceDetectionModule       |
-| `face_recognition_input`   | FaceRecognitionModule     |
-
-### 5.3 FrameCroppingModule
-
-`FrameCroppingModule` is a stateless internal component that crops a rectangular region from the decoded frame image.
-
-Its responsibilities are:
-
-- accept a decoded frame image and a `CanonicalBoundingBox`
-- return the cropped region as an in-memory image
-
-`FrameCroppingModule` does not decode raw bytes and does not perform any pixel transformation. Cropped images exist only within the current frame-processing lifecycle.
-
-### 5.4 CoordinateProjector
-
-`CoordinateProjector` is a stateless internal component that translates ROI-local detections into full-frame coordinates.
-
-Its responsibilities are:
-
-- accept an array of ROI-local detections and the source ROI bounding box
-- add the ROI origin `(roi.x, roi.y)` to all coordinate fields of each detection
-- return the projected detections in full-frame coordinates
-
-`CoordinateProjector` does not apply any acceptance logic and does not modify detection content beyond coordinate offset.
-
-### 5.5 MotionDetectionModule
-
-`MotionDetectionModule` determines whether the frame contains motion relative to the previously processed frame for the same `camera_id`.
-
-Its responsibilities are:
-
-- receive a prepared `motion_detection_input` representation
-- compare against the previously stored frame for the given `camera_id`
-- produce a `MotionResult` containing a `detected` flag and, when `detected = true`, bounding boxes of motion regions in frame coordinates
-
-This module is stateful: it retains exactly one previous frame per `camera_id`. All other state is per-invocation.
-
-### 5.6 ObjectDetectionModule
-
-`ObjectDetectionModule` detects persons within a single motion-region crop.
-
-Its responsibilities are:
-
-- receive a prepared `object_detection_input` representation from a motion-region crop
-- detect persons within that region
-- return person bounding boxes in ROI-local coordinates
-
-It does not detect other object classes and does not perform coordinate projection.
-
-### 5.7 FaceDetectionModule
-
-`FaceDetectionModule` detects faces within a single person-region crop.
-
-Its responsibilities are:
-
-- receive a prepared `face_detection_input` representation from a person-region crop
-- detect faces within that region
-- return face bounding boxes and canonical 5-point landmarks in ROI-local coordinates
-
-One crop per invocation. The module is stateless per invocation.
-
-### 5.8 FaceRecognitionModule
-
-`FaceRecognitionModule` identifies a single detected face against the in-memory gallery.
-
-Its responsibilities are:
-
-- receive a prepared `face_recognition_input` representation from a face-region crop
-- extract a face embedding
-- compare the embedding against the loaded gallery
-- return `person_found` and, when a match is accepted, `person_id`
-
-The module does not access disk during recognition. It reads exclusively from the in-memory gallery loaded at initialization.
-
-### 5.9 FaceGalleryLoader
-
-`FaceGalleryLoader` is an initialization-only component.
-
-Its responsibilities are:
-
-- load precomputed face embeddings from the gallery directory at startup
-- validate embedding files (dimension, dtype, structure)
-- build the in-memory gallery cache used by `FaceRecognitionModule`
-
-`FaceGalleryLoader` does not participate in per-frame processing. After a successful load, the gallery is immutable for the IPS lifecycle.
-
----
-
-## 6. Internal Pipeline
-
-For each `FramePacket` received by `process`, `PipelineOrchestrator` executes the following sequence.
-
-### 6.1 Execution Steps
-
-```
-1.  Request `motion_detection_input` from FrameTransformationLayer
-2.  Invoke MotionDetectionModule
-3.  MotionDetectionModule writes FramePacket.motion { detected, bboxes? }
-4.  If motion.detected == false → stop; return IPSOutput with empty results
-
-5.  For each bbox in FramePacket.motion.bboxes:
-    a. Invoke FrameCroppingModule → produce motion-region crop
-
-6.  For each motion-region crop:
-    a. Request `object_detection_input` from FrameTransformationLayer (scoped to this crop)
-    b. Invoke ObjectDetectionModule
-    c. Collect person detections in ROI-local coordinates
-    d. Invoke CoordinateProjector with motion-region bbox → project to full-frame coordinates
-    e. Accumulate projected person bboxes
-
-7.  Write accumulated person bboxes to FramePacket.detected_persons
-8.  If FramePacket.detected_persons is empty → stop; return IPSOutput with empty results
-
-9.  For each bbox in FramePacket.detected_persons:
-    a. Invoke FrameCroppingModule → produce person-region crop
-    b. Request `face_detection_input` from FrameTransformationLayer (scoped to this crop)
-    c. Invoke FaceDetectionModule (one crop per invocation)
-    d. If no face detected → skip this person; continue to next
-    e. Invoke CoordinateProjector with person-region bbox → project face bbox and landmarks to full-frame
-    f. Write projected DetectedFace to FramePacket.detected_faces
-    g. Invoke FrameCroppingModule on face bbox → produce face-region crop
-    h. Request `face_recognition_input` from FrameTransformationLayer (scoped to face crop)
-    i. Invoke FaceRecognitionModule
-    j. If person_found == true → add RecognitionResult { person_id, face_bbox } to results
-
-10. Construct and return IPSOutput { frame_id, results }
-```
-
-### 6.2 Routing Invariants
-
-- Object Detection is invoked once per motion-region crop; never on the full frame
-- Face Detection is invoked once per person-region crop; never on the full frame or multiple crops in one call
-- Face Recognition is invoked once per face-region crop
-- All coordinate projection is performed exclusively by `CoordinateProjector`; modules produce only ROI-local detections
-- `FrameTransformationLayer` is called by `PipelineOrchestrator` between stages; it is never called by a module directly
-
----
-
-## 7. Data Structures
-
-### 7.1 FramePacket Enrichment Fields
-
-`FramePacket` carries enrichment fields written by IPS during pipeline execution. Each enrichment field is immutable once the stage responsible for it completes. Subsequent stages read these fields and do not rewrite them.
+## 4. Public API
 
 ```text
-struct FramePacket {
-    // Ingress fields — immutable throughout the pipeline
-    string frame_id;
-    string camera_id;
-    int64  timestamp_ms;
-    int32  width;
-    int32  height;
-    string pixel_format;
-    Image  image;
-
-    // Enrichment fields — written by the named stage; immutable after that stage completes
-    MotionResult             motion;            // written after Motion Detection
-    CanonicalBoundingBox[]   detected_persons;  // written after Object Detection + projection
-    DetectedFace[]           detected_faces;    // written after Face Detection + projection
-}
+void                         configure(config: ImageProcessingServiceConfig)
+void                         start()
+void                         stop(drain: bool)
+ImageProcessingServiceHealth health()
 ```
 
-### 7.2 MotionResult
+- `configure(config)` must be called before `start()`. Configuration is validated and stored. It must not be called after `start()`.
+- `start()` executes the full startup sequence and transitions service state to `RUNNING`. Calling `start()` more than once is an error.
+- `stop(drain)` initiates the shutdown sequence. `drain = true` is reserved for future use. In MVP, `drain_queues_on_shutdown` is always `false` — queues are discarded. Calling `stop()` before `start()` is a no-op.
+- `health()` returns the current `ImageProcessingServiceHealth` snapshot. It is safe to call at any service state.
 
-```text
-struct MotionResult {
-    bool                   detected;
-    CanonicalBoundingBox[] bboxes;   // present only when detected = true; at least one entry
-}
-```
-
-- `detected` — always present; `true` when motion was identified, `false` otherwise
-- `bboxes` — present only when `detected = true`; each entry is an axis-aligned bounding box of a contiguous motion region in full-frame coordinates
-
-### 7.3 DetectedFace
-
-```text
-struct DetectedFace {
-    CanonicalBoundingBox face_bbox;   // in full-frame coordinates
-    FaceLandmarks        landmarks;  // canonical 5-point landmarks in full-frame coordinates
-}
-
-struct FaceLandmarks {
-    Point left_eye;
-    Point right_eye;
-    Point nose;
-    Point mouth_left;
-    Point mouth_right;
-}
-
-struct Point {
-    int32 x;
-    int32 y;
-}
-```
-
-### 7.4 CanonicalBoundingBox
-
-```text
-struct CanonicalBoundingBox {
-    int32 x;       // left edge in pixel coordinates; origin at top-left of the full frame
-    int32 y;       // top edge in pixel coordinates
-    int32 width;   // region width in pixels; strictly positive
-    int32 height;  // region height in pixels; strictly positive
-}
-```
-
-All bounding boxes produced by pipeline modules and projected by `CoordinateProjector` are expressed as `CanonicalBoundingBox`. Module-internal coordinate formats are converted before being stored in `FramePacket` or passed to `FrameCroppingModule`.
+The API must remain stable regardless of which `RecognitionPipelineManager` implementation or `ResultHandler` implementation is configured.
 
 ---
 
-## 8. State Management
+## 5. Non-Functional Requirements
 
-- **IPS is stateless per frame.** Each invocation of `process` is independent. No data from one invocation carries to the next except as described below.
-- **MotionDetectionModule is stateful.** It retains exactly one previous frame per `camera_id` across invocations. This state is internal to `MotionDetectionModule` and is not exposed to `PipelineOrchestrator` or any other component.
-- **FaceRecognitionModule reads from an immutable in-memory gallery.** The gallery is loaded once at initialization by `FaceGalleryLoader`. It is read-only during frame processing. No disk access occurs during recognition.
-- **FramePacket enrichment fields are write-once.** Each field is written exactly once by the stage responsible for it and is immutable after that stage completes.
-- **Cropped images are transient.** Cropped images produced by `FrameCroppingModule` exist only within the current frame-processing lifecycle. They are not retained across invocations.
-
----
-
-## 9. Error Handling
-
-All error states produce a structurally valid `IPSOutput`. IPS never returns a partial output.
-
-| Failure scenario | Behavior |
-|---|---|
-| Invalid `FramePacket` (missing fields, zero dimensions) | Return `IPSOutput` with empty `results`; stop processing |
-| `MotionDetectionModule` runtime failure | Return `IPSOutput` with empty `results`; stop processing |
-| `motion.detected = false` | Return `IPSOutput` with empty `results`; normal stop condition |
-| `ObjectDetectionModule` runtime failure for a motion-region crop | Skip that crop; continue with remaining motion-region crops |
-| No person detections across all motion regions | Return `IPSOutput` with empty `results`; normal stop condition |
-| `FaceDetectionModule` returns no face for a person-region crop | Skip that person; continue with remaining persons |
-| `FaceDetectionModule` runtime failure for a person-region crop | Skip that person; continue with remaining persons |
-| `FaceRecognitionModule` runtime failure for a face-region crop | Skip that face; continue with remaining faces |
-| `FaceRecognitionModule` returns `person_found = false` | Skip that face; normal operation |
-
-**Skip vs stop rules:**
-- A failure at the Motion Detection or person accumulation stage stops the entire pipeline for the current frame.
-- A failure at the per-person or per-face level skips only that person or face. The pipeline continues processing remaining items.
-- IPS never returns a partial `FramePacket`. The returned value is always a complete `IPSOutput`.
+- **Owns worker threads** — the service creates, starts, and stops one `RecognitionWorker` thread per camera; thread ownership is not shared with any downstream component
+- **Per-camera concurrency** — different cameras run concurrently on independent worker threads
+- **Per-camera sequential ordering** — frames from the same `camera_id` are processed in FIFO order; exactly one `RecognitionWorker` per camera enforces this invariant
+- **No pipeline implementation** — the service does not implement recognition, detection, or preprocessing; all pipeline execution is delegated to `RecognitionPipelineManager`
+- **No direct pixel access** — the service never accesses `image.pixels` or any pixel representation
+- **Queue-bounded** — each per-camera queue is bounded by `max_queue_depth_per_camera`; overflow is handled by the configured `overflow_policy`
+- **DROP_OLDEST in MVP** — when the queue is full, the oldest frame is removed before inserting the newest; no frames are silently lost without updating metrics
+- **Real-time capable** — the service is designed for continuous, live per-frame processing; it must not accumulate unbounded memory
+- **Service state is authoritative** — all components check `service_state` before acting; no component runs outside the `RUNNING` state
+- **ResultHandler failure must not crash the service** — errors in `ResultHandler.handle()` are caught per worker; the worker loop continues
+- **Model-agnostic service boundary** — the service is independent of which pipeline stage implementations are loaded into `RecognitionPipelineManager`
 
 ---
 
-## 10. Class Diagram
+## 6. Processing Engine
+
+### 6.1 Engine Abstraction Interfaces
+
+`RecognitionPipelineManager` is the processing engine of the Image Processing Service. It is abstracted behind an interface:
+
+```text
+interface RecognitionPipelineManagerInterface {
+    process_frame(frame_packet: FramePacket) -> RecognitionPipelineOutput
+}
+```
+
+`GatewayFramePacketSource` is abstracted behind the `FramePacketSource` interface, which is defined and consumed by `RecognitionPipelineManager`:
+
+```text
+interface FramePacketSource {
+    push(frame_packet: FramePacket) -> PushResult
+    get_next_frame()               -> FramePacket | None
+}
+```
+
+`push` is called by the `FrameIngestionGateway` on its ingestion thread. `get_next_frame` is called by `RecognitionWorker` threads.
+
+`ResultHandler` is abstracted behind an interface:
+
+```text
+interface ResultHandlerInterface {
+    handle(output: RecognitionPipelineOutput) -> void
+}
+```
+
+### 6.2 Current Default Implementations
+
+```text
+class RecognitionPipelineManager implements RecognitionPipelineManagerInterface
+class GatewayFramePacketSource    implements FramePacketSource
+class LoggingResultHandler        implements ResultHandlerInterface
+```
+
+`RecognitionPipelineManager` is an orchestration engine. It executes the motion detection → object detection → face detection → face recognition pipeline for one `FramePacket` per call. It is not AI-based — it delegates AI execution to downstream pipeline stage implementations.
+
+`GatewayFramePacketSource` is an algorithmic component. It implements a bounded FIFO queue with the configured `overflow_policy`. It is thread-safe for concurrent `push` (ingestion thread) and `get_next_frame` (worker thread) access.
+
+`LoggingResultHandler` is the MVP implementation. It logs every `RecognitionPipelineOutput` and updates metrics. It does not publish to external systems.
+
+### 6.3 Replaceability
+
+The Image Processing Service depends on `RecognitionPipelineManagerInterface`, `FramePacketSource`, and `ResultHandlerInterface` — not on their concrete implementations. Any compliant implementation of any interface may be substituted without changing the public API or calling code. Replacing `RecognitionPipelineManager`, the queue implementation, or the result handler does NOT affect the service's public API.
+
+### 6.4 Architecture Decision
+
+The system uses RecognitionPipelineManager` is intentionally kept as a pure frame processor.
+
+- `RecognitionPipelineManager` public API is `process_frame(frame_packet: FramePacket) -> RecognitionPipelineOutput`. It always receives a valid `FramePacket` and always returns `RecognitionPipelineOutput`. It never returns `None`.
+- Queue polling, empty-queue handling, sleep/backoff, and all threading belong exclusively to `RecognitionWorker`.
+- `RecognitionPipelineManager` must not know about queues, `FramePacketSourceRegistry`, `GatewayFramePacketSource`, threading, or sleep/retry behavior.
+- This keeps queue and threading concerns inside the Image Processing Service and avoids coupling `RecognitionPipelineManager` to ingestion infrastructure.
+
+---
+
+## 7. Acceptance / Filtering Logic
+
+Queue admission and overflow are exclusively managed by `GatewayFramePacketSource`.
+
+- `FrameIngestionGateway` pushes each constructed `FramePacket` via `FramePacketSource.push(frame_packet)`. The `GatewayFramePacketSource` inspects the current queue depth before admission.
+- If `queue_depth < max_queue_depth_per_camera`, the frame is enqueued unconditionally and `PushResult.ACCEPTED` is returned.
+- If `queue_depth == max_queue_depth_per_camera`, the configured `overflow_policy` is applied.
+- In MVP, `overflow_policy = DROP_OLDEST`. The oldest frame is removed from the head of the queue, the new frame is appended to the tail, and `PushResult.OVERFLOW_DROP_OLDEST` is returned. The `frames_dropped_total` metric for that `camera_id` is incremented.
+- No overflow signal is propagated outside `GatewayFramePacketSource`. The `FrameIngestionGateway` receives only a `PushResult` enum value and does not know the queue state.
+- `GatewayFramePacketSource` is the ONLY component that applies overflow decisions. No other component evaluates queue depth for admission control.
+
+---
+
+## 8. Internal Pipeline
+
+### 8.1 ImageProcessingService
+
+`ImageProcessingService` is the service lifecycle manager only. It owns no recognition logic, image processing logic, or queue contents.
+
+Its responsibilities are:
+
+- Load and validate `ImageProcessingServiceConfig` via `ServiceConfigValidator` during `configure()`
+- Wire all owned components: configure `FrameIngestionGateway`, create one `GatewayFramePacketSource` per `camera_id`, populate `FramePacketSourceRegistry`, initialize `RecognitionPipelineManager`, create one `RecognitionWorker` per `camera_id` each wired to its per-camera `FramePacketSource`, create `ResultHandler`
+- Execute the startup sequence during `start()` in the defined order (see §13.2)
+- Execute the shutdown sequence during `stop()` in the defined order (see §13.4)
+- Transition service state: `CREATED → RUNNING → STOPPING → STOPPED`
+- Return `ImageProcessingServiceHealth` snapshots via `health()`
+- Update service-level metrics
+
+`ImageProcessingService` must not invoke pipeline stages directly, access pixel data, or manage the `FrameIngestionGateway` ingestion thread.
+
+### 8.2 ServiceConfigValidator
+
+`ServiceConfigValidator` is responsible only for validating the `ImageProcessingServiceConfig` at startup.
+
+Its responsibilities are:
+
+- Verify all required configuration fields are present and valid (see §2.4)
+- Raise `ServiceConfigurationError` if any required field is invalid or missing
+
+`ServiceConfigValidator` must not create components, start threads, or modify service state.
+
+### 8.3 GatewayFramePacketSource
+
+`GatewayFramePacketSource` is responsible for owning the per-camera bounded queue and enforcing the configured overflow policy.
+
+Its responsibilities are:
+
+- Maintain a bounded FIFO queue of `FramePacket` objects for exactly one `camera_id`
+- Accept `FramePacket` push calls from the `FrameIngestionGateway` ingestion thread
+- Enforce `max_queue_depth_per_camera` and `overflow_policy` on every push
+- When `overflow_policy = DROP_OLDEST` and the queue is full: remove the oldest frame from the head, insert the new frame at the tail, return `PushResult.OVERFLOW_DROP_OLDEST`, and increment `frames_dropped_total`
+- Expose `get_next_frame()` for the `RecognitionWorker` thread to pull the next available frame
+- Wake the registered worker condition variable when a frame is pushed into a previously empty queue
+- Be thread-safe for concurrent `push` and `get_next_frame` access
+
+`GatewayFramePacketSource` must not invoke pipeline stages, manage worker thread lifecycle, or access pixel data beyond routing the `FramePacket` struct.
+
+### 8.4 FramePacketSourceRegistry
+
+`FramePacketSourceRegistry` is responsible for maintaining the mapping from `camera_id` to `FramePacketSource`.
+
+Its responsibilities are:
+
+- Store one `FramePacketSource` per configured `camera_id`, populated at initialization
+- Expose `get(camera_id: string) -> FramePacketSource | None` for lookup
+- Be read-only after initialization; the registry is immutable once populated
+
+`FramePacketSourceRegistry` must not create, start, or manage sources, threads, or service state.
+
+### 8.5 RecognitionWorker
+
+`RecognitionWorker` is responsible for the per-camera worker loop only.
+
+Its responsibilities are:
+
+- Run the worker loop for exactly one `camera_id`
+- Repeatedly call `source.get_next_frame()` via the `FramePacketSource` interface to pull the next available `FramePacket` while the service is in `RUNNING` state
+- Sleep on its condition variable when `get_next_frame()` returns `None` (no frame available); wake when `GatewayFramePacketSource` signals a new frame arrival
+- Pass the pulled `FramePacket` to `recognition_manager.process_frame(frame_packet)` → `RecognitionPipelineOutput`
+- Pass the returned `RecognitionPipelineOutput` to `result_handler.handle(output)`
+- Catch and log exceptions from `source.get_next_frame`, from `recognition_manager.process_frame`, and from `result_handler.handle` without crashing the worker loop
+- Increment `worker_error_count` on each caught exception
+- Set its `WorkerState` to `FAILED` on unrecoverable errors and notify `ImageProcessingService`
+- Set its `WorkerState` to `STOPPED` when the service transitions to `STOPPING` and the loop exits normally
+
+`RecognitionWorker` must not know pipeline internals, access queue internals directly (bypassing the `FramePacketSource` interface), modify `FramePacket` contents, or manage the `FrameIngestionGateway`.
+
+### 8.6 ResultHandler
+
+`ResultHandler` is responsible for handling every `RecognitionPipelineOutput` produced by a `RecognitionWorker`.
+
+Its responsibilities are:
+
+- Receive one `RecognitionPipelineOutput` per call
+- In MVP: log the output (frame identity, camera, timestamp, persons detected, faces recognized)
+- Increment `frames_processed_total` for the `camera_id`
+- Update `pipeline_latency_ms` using the output's `timestamp_ms` and current wall-clock time
+
+`ResultHandler` must not invoke pipeline stages, manage worker lifecycle, or modify `RecognitionPipelineOutput`.
+
+### 8.7 End-to-End Processing Flow
+
+**frame push → queue admission → worker wake → pipeline execution → result handling**
+
+1. `FrameIngestionGateway` constructs a `FramePacket` and calls `FramePacketSourceRegistry.get(camera_id)` to retrieve the `GatewayFramePacketSource` for that camera.
+2. `FrameIngestionGateway` calls `GatewayFramePacketSource.push(frame_packet)` → `PushResult`. If `PushResult == OVERFLOW_DROP_OLDEST`, `frames_dropped_total` is incremented.
+3. `GatewayFramePacketSource` wakes the `RecognitionWorker` condition variable if the queue was empty before the push.
+4. `RecognitionWorker` wakes and calls `GatewayFramePacketSource.get_next_frame()` via the `FramePacketSource` interface → `FramePacket | None`. If `None`, the worker returns to sleep on its condition variable.
+5. `RecognitionWorker` calls `RecognitionPipelineManager.process_frame(frame_packet)`, which executes the recognition pipeline and returns `RecognitionPipelineOutput`.
+6. `RecognitionWorker` calls `ResultHandler.handle(output)`.
+7. `ResultHandler` logs the result and updates metrics.
+8. `RecognitionWorker` loops and calls `source.get_next_frame()` again.
+
+All intermediate pipeline data (embeddings, ROI images, detection scores, motion regions) remain strictly internal to `RecognitionPipelineManager`. The Image Processing Service never accesses them.
+
+---
+
+## 9. Configuration
+
+### 9.1 Configuration Parameters
+
+```text
+struct ImageProcessingServiceConfig {
+    vector<string>  camera_ids;                      // configured camera identifiers; must be non-empty and unique
+    int32           max_queue_depth_per_camera;       // maximum number of FramePackets buffered per camera queue
+    OverflowPolicy  overflow_policy;                  // action taken when a camera queue is full (MVP: DROP_OLDEST)
+    bool            drain_queues_on_shutdown;         // if true, workers process remaining frames before stopping (MVP: always false)
+}
+
+enum OverflowPolicy {
+    DROP_OLDEST,      // remove oldest frame from queue head, insert new frame at tail
+    DROP_NEWEST,      // discard the incoming frame; queue contents unchanged (reserved)
+    BLOCK_INGESTION   // block the push call until space is available (reserved)
+}
+```
+
+### 9.2 Loading Behavior
+
+Configuration is loaded exactly once during `configure()`. It is immutable after `configure()` returns and is reused unchanged across the entire service lifetime. No configuration parameter is part of the `start()`, `stop()`, or `health()` call signatures.
+
+Injection at construction time:
+
+- `camera_ids` → used by `ImageProcessingService` to create one `GatewayFramePacketSource` and one `RecognitionWorker` per identifier
+- `max_queue_depth_per_camera` → injected into each `GatewayFramePacketSource` as the queue capacity bound
+- `overflow_policy` → injected into each `GatewayFramePacketSource` as the admitted overflow strategy
+- `drain_queues_on_shutdown` → stored by `ImageProcessingService`; governs queue flushing behavior during `stop()`
+- `RecognitionPipelineManagerInterface` implementation → injected into `ImageProcessingService` at construction; passed to each `RecognitionWorker`
+- `ResultHandlerInterface` implementation → injected into `ImageProcessingService` at construction; passed to each `RecognitionWorker`
+- `FrameIngestionGateway` instance → injected into `ImageProcessingService` at construction; configured during `configure()`
+
+---
+
+## 10. Internal Data Structures
+
+- **`FramePacket`** — canonical frame container produced by the `FrameIngestionGateway`; queued in `GatewayFramePacketSource`; pulled by `RecognitionWorker`; the service does not access pixel data; lifecycle: per-frame, from push to `RecognitionPipelineManager` consumption
+- **`GatewayFramePacketSource`** — bounded FIFO queue with `push` / `get_next_frame` interface; one instance per `camera_id`; owns overflow enforcement; thread-safe; lifecycle: persistent across service lifetime
+- **`FramePacketSourceRegistry`** — immutable `map<string, FramePacketSource>`; populated during `configure()`; read-only at runtime; lifecycle: persistent
+- **`RecognitionPipelineOutput`** — structured recognition result for one frame; returned by `RecognitionPipelineManager.process_frame`; passed to `ResultHandler.handle`; not stored by the service; lifecycle: per-frame
+- **`PushResult`** — enum returned by `GatewayFramePacketSource.push`; values: `ACCEPTED`, `OVERFLOW_DROP_OLDEST`, `REJECTED`; used only to update metrics; lifecycle: per push call
+- **`ImageProcessingServiceConfig`** — validated service configuration struct; stored immutably after `configure()`; lifecycle: persistent
+- **`ImageProcessingServiceHealth`** — health snapshot assembled on demand by `health()`; contains `service_state`, `gateway_healthy`, and one `PerCameraHealth` per camera; lifecycle: per `health()` call
+- **`PerCameraHealth`** — per-camera health sub-struct; contains `camera_id`, `worker_state`, `queue_depth`, `last_frame_timestamp_ms`; lifecycle: per `health()` call
+- **`WorkerState`** — enum per `RecognitionWorker`; values: `IDLE`, `RUNNING`, `STOPPED`, `FAILED`; updated by each worker; read by `health()`; lifecycle: persistent per worker
+
+---
+
+## 11. Error Handling
+
+- **`ServiceConfigurationError` during `configure()`** → `ServiceConfigValidator` raises the error; `configure()` propagates it to the caller; service state remains `CREATED`; `start()` must not be called
+- **`FrameIngestionGateway` failure after `start()`** → `ImageProcessingService` records `gateway_healthy = false` in `ImageProcessingServiceHealth`; workers continue draining existing queue contents; service does not self-stop
+- **`GatewayFramePacketSource.push()` returns `OVERFLOW_DROP_OLDEST`** → oldest frame discarded; new frame enqueued; `frames_dropped_total[camera_id]` incremented; no error propagated to the Gateway
+- **`RecognitionPipelineManager.process_frame()` raises runtime exception** → `RecognitionWorker` catches the exception; logs the error; increments `worker_error_count[camera_id]`; worker loop continues on the next iteration; service state is not changed
+- **`ResultHandler.handle()` raises exception** → `RecognitionWorker` catches the exception; logs the error; increments `worker_error_count[camera_id]`; worker loop continues; service state is not changed
+- **Unknown `camera_id` at push time** → `GatewayFramePacketSource` returns `PushResult.REJECTED`; frame is discarded; `frames_dropped_total` is incremented; no exception is raised
+- **`RecognitionWorker` unrecoverable failure** → worker sets `WorkerState = FAILED`; notifies `ImageProcessingService`; `ImageProcessingService` records the failure in health state; remaining workers continue; service does not self-stop in MVP
+
+Workers must never crash the service process. All failure paths in `RecognitionWorker` are caught within the worker loop and resolve to a safe continue or a `FAILED` state notification.
+
+---
+
+## 12. Metrics / Observability
+
+All per-camera metrics are scoped by `camera_id`. Service-level metrics cover all cameras combined.
+
+- `frames_ingested_total` — total `FramePacket` objects pushed into `GatewayFramePacketSource.push()`, per `camera_id`; incremented on every push call regardless of `PushResult`
+- `frames_processed_total` — total `RecognitionPipelineOutput` objects delivered to `ResultHandler.handle()`, per `camera_id`; incremented by `ResultHandler` on each successful handle call
+- `frames_dropped_total` — total frames discarded due to queue overflow, per `camera_id`; incremented by `GatewayFramePacketSource` on `OVERFLOW_DROP_OLDEST`
+- `queue_depth_per_camera` — current number of frames in the `GatewayFramePacketSource` queue, per `camera_id`; sampled on `health()` and updated in real time within the source
+- `worker_idle_count` — number of times a `RecognitionWorker` entered the sleep/wait state due to an empty queue, per `camera_id`
+- `worker_error_count` — number of exceptions caught by a `RecognitionWorker` during `source.get_next_frame`, `recognition_manager.process_frame`, or `result_handler.handle`, per `camera_id`
+- `pipeline_latency_ms` — elapsed time from `FramePacket.timestamp_ms` to `ResultHandler.handle()` completion, per `camera_id`; updated by `ResultHandler` on each call
+
+Metrics are internal and operational. Not part of the public API.
+
+---
+
+## 13. Lifecycle
+
+### 13.1 Initialization (configure())
+
+- Receive `ImageProcessingServiceConfig`
+- `ServiceConfigValidator` validates all fields; raises `ServiceConfigurationError` on failure
+- `FrameIngestionGateway` is configured with the supplied camera list and transport settings
+- One `GatewayFramePacketSource` is created per `camera_id` with `max_queue_depth_per_camera` and `overflow_policy`
+- `FramePacketSourceRegistry` is populated with all per-camera sources
+- `RecognitionPipelineManager` is initialized with pipeline stage engines; it has no dependency on queues or the registry
+- `ResultHandler` is created
+- One `RecognitionWorker` is created per `camera_id`, each holding a reference to its per-camera `FramePacketSource`, `RecognitionPipelineManager`, and `ResultHandler`
+- No threads are started during `configure()`; service state remains `CREATED`
+
+### 13.2 Startup (start())
+
+1. Validate service state is `CREATED`
+2. Validate all `camera_ids` have corresponding entries in `FramePacketSourceRegistry`
+3. Apply final `FrameIngestionGateway` configuration
+4. Confirm all `GatewayFramePacketSource` instances are ready
+5. Confirm `FramePacketSourceRegistry` is complete
+6. Initialize `RecognitionPipelineManager` (load pipeline stage engines)
+7. Initialize `ResultHandler`
+8. Create and start one `RecognitionWorker` thread per `camera_id`, each wired to its per-camera `FramePacketSource`, `RecognitionPipelineManager`, and `ResultHandler`
+9. Start `FrameIngestionGateway` (begins ingestion thread)
+10. Set `service_state = RUNNING`
+
+### 13.3 Per-Frame Execution
+
+**frame push → queue admission → worker wake → pipeline execution → result handling**
+
+The `FrameIngestionGateway` pushes `FramePacket` objects into per-camera `GatewayFramePacketSource` queues. Each `RecognitionWorker` pulls frames directly via `FramePacketSource.get_next_frame()` and passes each `FramePacket` to `RecognitionPipelineManager.process_frame(frame_packet)`, receives a `RecognitionPipelineOutput`, and passes it to `ResultHandler.handle()`. Workers sleep when no frames are available and wake when `GatewayFramePacketSource` signals a new frame. Frames from the same `camera_id` are processed sequentially in FIFO order. Frames from different cameras are processed concurrently on independent worker threads.
+
+### 13.4 Shutdown (stop())
+
+1. Set `service_state = STOPPING`
+2. Stop `FrameIngestionGateway` ingestion thread (no new frames are pushed after this point)
+3. If `drain_queues_on_shutdown = false` (MVP): discard all pending frames in all per-camera queues
+4. Wake all sleeping `RecognitionWorker` threads via their condition variables
+5. Join all `RecognitionWorker` threads (workers exit their loops on `service_state != RUNNING` check)
+6. Shut down `RecognitionPipelineManager` and release pipeline stage engine resources
+7. Shut down `FrameIngestionGateway` and release transport resources
+8. Set `service_state = STOPPED`
+
+---
+
+## 14. Class Diagram
 
 ```mermaid
 classDiagram
-    class IPS {
-        +process(frame_packet: FramePacket) IPSOutput
+    class ImageProcessingService {
+        -service_state: ServiceState
+        -config: ImageProcessingServiceConfig
+        -gateway: FrameIngestionGateway
+        -registry: FramePacketSourceRegistry
+        -recognition_manager: RecognitionPipelineManagerInterface
+        -workers: map~string, RecognitionWorker~
+        -result_handler: ResultHandlerInterface
+        +configure(config: ImageProcessingServiceConfig) void
+        +start() void
+        +stop(drain: bool) void
+        +health() ImageProcessingServiceHealth
     }
 
-    class PipelineOrchestrator {
-        +run(frame_packet: FramePacket) IPSOutput
+    class ServiceConfigValidator {
+        +validate(config: ImageProcessingServiceConfig) void
     }
 
-    class FrameTransformationLayer {
-        +get_representation(image: Image, name: string) PreparedInput
+    class FrameIngestionGateway {
+        +configure(camera_ids: vector~string~) void
+        +start() void
+        +stop() void
+        +health() bool
     }
 
-    class FrameCroppingModule {
-        +crop(image: Image, region: CanonicalBoundingBox) CroppedImage
+    class FramePacketSourceRegistry {
+        -sources: map~string, FramePacketSource~
+        +register(camera_id: string, source: FramePacketSource) void
+        +get(camera_id: string) FramePacketSource | None
     }
 
-    class CoordinateProjector {
-        +project(detections: LocalDetection[], roi: CanonicalBoundingBox) FullFrameDetection[]
+    class FramePacketSource {
+        <<interface>>
+        +push(frame_packet: FramePacket) PushResult
+        +get_next_frame() FramePacket | None
     }
 
-    class MotionDetectionModule {
-        +process_frame(input: PreparedInput, camera_id: string) MotionResult
+    class GatewayFramePacketSource {
+        -camera_id: string
+        -queue: bounded_fifo~FramePacket~
+        -max_depth: int32
+        -overflow_policy: OverflowPolicy
+        +push(frame_packet: FramePacket) PushResult
+        +get_next_frame() FramePacket | None
     }
 
-    class ObjectDetectionModule {
-        +detect_persons(input: PreparedInput) PersonDetection[]
+    class RecognitionPipelineManagerInterface {
+        <<interface>>
+        +process_frame(frame_packet: FramePacket) RecognitionPipelineOutput
     }
 
-    class FaceDetectionModule {
-        +detect_faces(input: PreparedInput) FaceDetection[]
+    class RecognitionPipelineManager {
+        +process_frame(frame_packet: FramePacket) RecognitionPipelineOutput
     }
 
-    class FaceRecognitionModule {
-        +recognize_face(input: PreparedInput) FaceRecognitionOutput
+    class RecognitionWorker {
+        -camera_id: string
+        -worker_state: WorkerState
+        +run() void
     }
 
-    class FaceGalleryLoader {
-        +load_gallery(gallery_root_path: string) void
+    class ResultHandlerInterface {
+        <<interface>>
+        +handle(output: RecognitionPipelineOutput) void
     }
 
-    IPS --> PipelineOrchestrator : delegates to
-    PipelineOrchestrator --> FrameTransformationLayer : requests representations
-    PipelineOrchestrator --> FrameCroppingModule : crops regions
-    PipelineOrchestrator --> CoordinateProjector : projects detections
-    PipelineOrchestrator --> MotionDetectionModule : invokes
-    PipelineOrchestrator --> ObjectDetectionModule : invokes per motion-region
-    PipelineOrchestrator --> FaceDetectionModule : invokes per person-region
-    PipelineOrchestrator --> FaceRecognitionModule : invokes per face-region
-    FaceGalleryLoader ..> FaceRecognitionModule : loads gallery at startup
+    class LoggingResultHandler {
+        +handle(output: RecognitionPipelineOutput) void
+    }
+
+    class ImageProcessingServiceHealth {
+        +service_state: ServiceState
+        +gateway_healthy: bool
+        +cameras: vector~PerCameraHealth~
+    }
+
+    class PerCameraHealth {
+        +camera_id: string
+        +worker_state: WorkerState
+        +queue_depth: int32
+        +last_frame_timestamp_ms: uint64
+    }
+
+    class ImageProcessingServiceConfig {
+        +camera_ids: vector~string~
+        +max_queue_depth_per_camera: int32
+        +overflow_policy: OverflowPolicy
+        +drain_queues_on_shutdown: bool
+    }
+
+    ImageProcessingService --> ServiceConfigValidator : validates config via
+    ImageProcessingService --> FrameIngestionGateway : configures and owns
+    ImageProcessingService --> FramePacketSourceRegistry : owns
+    ImageProcessingService --> RecognitionPipelineManagerInterface : delegates pipeline via
+    ImageProcessingService "1" --> "many" RecognitionWorker : owns one per camera_id
+    ImageProcessingService --> ResultHandlerInterface : wires into workers
+    FramePacketSourceRegistry "1" --> "many" FramePacketSource : maps camera_id to
+    GatewayFramePacketSource ..|> FramePacketSource : implements
+    RecognitionPipelineManager ..|> RecognitionPipelineManagerInterface : implements
+    LoggingResultHandler ..|> ResultHandlerInterface : implements
+    RecognitionWorker --> FramePacketSource : pulls frames via
+    RecognitionWorker --> RecognitionPipelineManagerInterface : submits frames via
+    RecognitionWorker --> ResultHandlerInterface : delivers output via
+    ImageProcessingService --> ImageProcessingServiceHealth : returns from health()
+    ImageProcessingServiceHealth --> PerCameraHealth : contains
 ```
 
 ---
 
-## 11. Sequence Diagram
+## 15. Sequence Diagram
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Caller
-    participant IPS
-    participant FTL as FrameTransformationLayer
-    participant FC as FrameCroppingModule
-    participant CP as CoordinateProjector
-    participant MD as MotionDetectionModule
-    participant OD as ObjectDetectionModule
-    participant FD as FaceDetectionModule
-    participant FR as FaceRecognitionModule
+    participant GW as FrameIngestionGateway
+    participant SRC as GatewayFramePacketSource(camera_id)
+    participant WORKER as RecognitionWorker(camera_id)
+    participant RPM as RecognitionPipelineManager
+    participant RH as ResultHandler
 
-    Caller->>IPS: process(frame_packet)
+    GW->>SRC: push(frame_packet)
+    SRC-->>GW: PushResult.ACCEPTED
 
-    IPS->>FTL: get_representation(image, "motion_detection_input")
-    FTL-->>IPS: prepared_input
-    IPS->>MD: process_frame(prepared_input, camera_id)
-    MD-->>IPS: MotionResult { detected, bboxes? }
-    alt detected == false
-        IPS-->>Caller: IPSOutput { results: [] }
-    end
+    Note over SRC,WORKER: Queue was empty — signal worker
+    SRC->>WORKER: signal condition variable
 
-    loop for each motion bbox
-        IPS->>FC: crop(image, motion_bbox) → motion_crop
-        IPS->>FTL: get_representation(motion_crop, "object_detection_input")
-        FTL-->>IPS: prepared_input
-        IPS->>OD: detect_persons(prepared_input)
-        OD-->>IPS: person_detections (ROI-local)
-        IPS->>CP: project(person_detections, motion_bbox)
-        CP-->>IPS: full-frame person bboxes
-    end
+    WORKER->>SRC: get_next_frame()
+    SRC-->>WORKER: FramePacket
+    WORKER->>RPM: process_frame(frame_packet)
+    RPM->>RPM: execute recognition pipeline
+    RPM-->>WORKER: RecognitionPipelineOutput
 
-    alt detected_persons is empty
-        IPS-->>Caller: IPSOutput { results: [] }
-    end
+    WORKER->>RH: handle(output)
+    RH->>RH: log output, update metrics
+    RH-->>WORKER: void
 
-    loop for each person bbox
-        IPS->>FC: crop(image, person_bbox) → person_crop
-        IPS->>FTL: get_representation(person_crop, "face_detection_input")
-        FTL-->>IPS: prepared_input
-        IPS->>FD: detect_faces(prepared_input)
-        FD-->>IPS: face_detections (ROI-local) or empty
-        alt no face detected
-            Note over IPS: skip this person
-        else face detected
-            IPS->>CP: project(face_detection, person_bbox)
-            CP-->>IPS: full-frame face bbox + landmarks
-            IPS->>FC: crop(image, face_bbox) → face_crop
-            IPS->>FTL: get_representation(face_crop, "face_recognition_input")
-            FTL-->>IPS: prepared_input
-            IPS->>FR: recognize_face(prepared_input)
-            FR-->>IPS: FaceRecognitionOutput { person_found, person_id? }
-            alt person_found == true
-                Note over IPS: add RecognitionResult to results
-            end
-        end
-    end
-
-    IPS-->>Caller: IPSOutput { frame_id, results }
+    Note over WORKER: Queue empty — sleep
+    WORKER->>SRC: get_next_frame()
+    SRC-->>WORKER: None
+    WORKER->>WORKER: wait on condition variable
 ```
 
 ---
 
-## 12. Design Principles
+## 16. Data Flow Diagram
 
-- **Deterministic pipeline.** The execution sequence is fixed. Given the same input, the same stored motion state, and the same gallery, IPS produces identical results.
+```mermaid
+flowchart TD
+    A["Camera Source\n(external)"]
+    B["FrameIngestionGateway\nProduces: FramePacket\n(frame_id, camera_id, timestamp_ms, image)"]
+    C["GatewayFramePacketSource\nQueues: FramePacket per camera_id\nEnforces: max_queue_depth, overflow_policy"]
+    D["RecognitionWorker\nPulls: FramePacket via get_next_frame()\nSleeps when queue empty; wakes on signal"]
+    E["RecognitionPipelineManager\nReceives: FramePacket via process_frame()\nProduces: RecognitionPipelineOutput\n(frame_id, camera_id, persons, faces)"]
+    F["ResultHandler\nConsumes: RecognitionPipelineOutput\nLogs result, updates metrics"]
+    G["ImageProcessingServiceHealth\n(service_state, gateway_healthy,\nqueue_depth_per_camera, worker_state_per_camera)"]
 
-- **Strict separation of concerns.** Each internal component owns exactly one responsibility. `PipelineOrchestrator` orchestrates and routes. `FrameCroppingModule` crops. `CoordinateProjector` projects. Detection and recognition modules compute. No component duplicates another's responsibility.
+    A --> B
+    B -->|"push(FramePacket)"| C
+    C -->|"get_next_frame() → FramePacket | None"| D
+    D -->|"process_frame(frame_packet)"| E
+    E -->|"RecognitionPipelineOutput"| F
+    F -->|"frames_processed_total, pipeline_latency_ms"| G
+    C -->|"queue_depth_per_camera, frames_dropped_total"| G
+```
 
-- **No preprocessing inside modules.** All image preprocessing — resizing, normalization, color format conversion, layout conversion, dtype conversion — is the exclusive responsibility of `FrameTransformationLayer`. Modules receive fully prepared representations and send them directly to their processing engines without modification.
+---
 
-- **Geometric consistency.** All detections produced by modules are in ROI-local coordinates. `CoordinateProjector` is the single point of responsibility for translating ROI-local coordinates to full-frame coordinates. No coordinate arithmetic is performed outside `CoordinateProjector`.
+## 17. Extensibility
 
-- **Write-once enrichment.** Each `FramePacket` enrichment field is written exactly once by the stage responsible for it and is treated as immutable by all subsequent stages.
+**What can change without breaking the public API:**
 
-- **No external side effects.** IPS produces only a structured `IPSOutput`. It does not access the filesystem during frame processing, does not write to shared stores, and does not communicate with external systems.
+- `RecognitionPipelineManager` may be replaced with any implementation satisfying `RecognitionPipelineManagerInterface`; no change to `ImageProcessingService` public API or worker logic is required
+- `ResultHandler` may be replaced with any implementation satisfying `ResultHandlerInterface` (e.g., event bus publisher, gRPC emitter, metrics sink); no change to worker logic is required
+- `GatewayFramePacketSource` may be replaced with any `FramePacketSource` implementation (e.g., ring buffer, lock-free queue); no change to `RecognitionWorker` or `RecognitionPipelineManager` is required
+- `overflow_policy` may be changed from `DROP_OLDEST` to `DROP_NEWEST` or `BLOCK_INGESTION` without changing the public API; only `GatewayFramePacketSource` behavior changes
+- The number of cameras may be changed via configuration; the worker count and source count scale accordingly without changing any component interface
+- `drain_queues_on_shutdown` may be enabled in a future version without changing the public API; only shutdown sequencing changes
 
-- **Fail safe.** Any stage failure produces a structurally valid `IPSOutput`. Failures at the per-person or per-face level skip only that item. No partial or inconsistent output is ever returned.
+**What must remain stable:**
 
-- **Algorithm-agnostic API.** The `process(frame_packet) -> IPSOutput` contract is stable regardless of which detection or recognition engines are configured internally. Replacing an internal engine does not change the public API.
+- Public API function signatures: `configure(config)`, `start()`, `stop(drain)`, `health() -> ImageProcessingServiceHealth`
+- `ImageProcessingServiceHealth` output schema: `service_state`, `gateway_healthy`, `cameras` with typed `PerCameraHealth` fields
+- `FramePacketSource` interface: `push(frame_packet) -> PushResult`, `get_next_frame() -> FramePacket | None`
+- `RecognitionPipelineManagerInterface`: `process_frame(frame_packet: FramePacket) -> RecognitionPipelineOutput`
+- `ResultHandlerInterface`: `handle(output: RecognitionPipelineOutput) -> void`
+- Per-camera FIFO ordering guarantee: exactly one `RecognitionWorker` per camera
+- Ownership boundaries: `ImageProcessingService` owns threads, workers, queues, and lifecycle; `FrameIngestionGateway` owns its ingestion thread
+
+---
+
+## 18. Module Compliance Checklist
+
+- [ ] One `RecognitionWorker` per `camera_id` — enforces sequential, FIFO per-camera processing
+- [ ] Queue overflow threshold (`max_queue_depth_per_camera`) is applied internally only — not exposed in any public API call signature
+- [ ] No internal pipeline data (embeddings, scores, raw detections, ROI images) is accessible through the public API
+- [ ] `RecognitionPipelineManagerInterface` is respected — the service depends on the interface, not the concrete `RecognitionPipelineManager` class
+- [ ] `FrameIngestionGateway` ingestion thread is owned exclusively by the Gateway — the service does not manage it
+- [ ] `FramePacket` pixel data is never accessed by `ImageProcessingService`, `GatewayFramePacketSource`, `FramePacketSourceRegistry`, or `RecognitionWorker`
+- [ ] `PushResult` enum is used for overflow signaling — no exception is raised on queue overflow
+- [ ] Service state transitions are strictly ordered: `CREATED → RUNNING → STOPPING → STOPPED`
+- [ ] Worker exceptions are caught within each `RecognitionWorker` loop — they must not terminate the service process
+- [ ] `drain_queues_on_shutdown = false` in MVP — queues are discarded at shutdown without waiting
+- [ ] `ImageProcessingServiceHealth` is always constructable — `health()` must not throw at any service state
+- [ ] Configuration is loaded exactly once during `configure()` and is immutable thereafter

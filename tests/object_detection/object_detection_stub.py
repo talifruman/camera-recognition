@@ -12,13 +12,13 @@ class BoundingBox(TypedDict):
 
 class FrameMetadata(TypedDict):
     camera_id: str
-    frame_id: int
+    frame_id: str
     width: int
     height: int
 
 
 class PersonDetectionResult(TypedDict):
-    frame_id: int
+    frame_id: str
     person_detected: bool
     persons: list[BoundingBox]
 

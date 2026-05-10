@@ -1,5 +1,14 @@
 ﻿# Motion Detection Module Specification
 
+## Shared Contract Types
+
+The following types used by this module are defined in [shared_contracts.md](shared_contracts.md) and must not be duplicated here:
+
+- `BoundingBox` — the single shared bounding-box type (§1); coordinate space must be stated at the usage site
+- `Image` — the canonical shared public image struct; carries `data`, `width`, `height`, `color_format`, `layout`, `dtype`, and `value_range`; pixel format is described by `OutputImageType` (§4)
+
+---
+
 ## 1. Scope
 
 ### Purpose
@@ -36,38 +45,41 @@ The module processes exactly one `MotionDetectionInput` per invocation.
 
 ### 2.2 Input Structure
 
+`Image` is defined in [shared_contracts.md §6](shared_contracts.md) — the canonical shared public image struct carrying explicit metadata fields.
+
 ```text
-struct FramePacket {
-    uint64 frame_id;
+struct MotionInputFrame {
+    string frame_id;
     string camera_id;
     uint64 timestamp_ms;
-    Image  image;
+    Image  image;   // See shared_contracts.md §6 — shared Image struct; metadata fields must be compatible with GRAYSCALE_UINT8_HWC
 }
 
 struct MotionDetectionInput {
-    FramePacket current_frame;
-    FramePacket previous_frame;
+    MotionInputFrame current_frame;
+    MotionInputFrame previous_frame;
 }
 ```
+
+> **Note on naming.** This module uses `MotionInputFrame` instead of `FramePacket` to avoid ambiguity with the `FramePacket` type defined by the Frame Transformation Layer (which carries raw `image_bytes` as bytes, not a shared `Image` struct). `MotionInputFrame` is a motion-detection-specific input container carrying a fully prepared shared `Image`.
 
 - `frame_id` identifies the source frame for traceability.
 - `camera_id` identifies the source camera; preserved unchanged for traceability.
 - `timestamp_ms` is the capture timestamp in milliseconds.
-- `image` is the prepared grayscale image for the frame.
-- `current_frame` is the `FramePacket` representing the latest frame to be tested for motion.
-- `previous_frame` is the `FramePacket` representing the reference frame; provided as part of the input.
+- `image` is the prepared grayscale image for the frame (`Image` — see [shared_contracts.md §6](shared_contracts.md)).
+- `current_frame` is the `MotionInputFrame` representing the latest frame to be tested for motion.
+- `previous_frame` is the `MotionInputFrame` representing the reference frame; provided as part of the input.
 
 ### 2.3 Input Contract
 
 `current_frame.image` and `previous_frame.image` must already satisfy the following contract when the module receives the input:
 
-- `color_format`: `GRAY`
-- `layout`: `HWC`
-- `dtype`: `uint8`
-- `value_range`: `[0, 255]`
-- `current_frame.image` and `previous_frame.image` must have identical `width` and `height`
-- `current_frame.camera_id` and `previous_frame.camera_id` must be identical
-- `previous_frame` must precede or be simultaneous with `current_frame`: `previous_frame.timestamp_ms ≤ current_frame.timestamp_ms`
+- `current_frame.image.color_format` must be `GRAY`, `current_frame.image.layout` must be `HWC`, `current_frame.image.dtype` must be `uint8`, and `current_frame.image.value_range` must be `[0,255]` — consistent with `GRAYSCALE_UINT8_HWC` (see [shared_contracts.md §4](shared_contracts.md)).
+- `previous_frame.image` must satisfy the same `GRAYSCALE_UINT8_HWC` metadata contract.
+- `current_frame.image.width` must equal `previous_frame.image.width` and `current_frame.image.height` must equal `previous_frame.image.height` (identical spatial dimensions).
+- `current_frame.image.data.shape` must be consistent with `current_frame.image.width`, `current_frame.image.height`, `current_frame.image.layout`, and `current_frame.image.color_format`.
+- `current_frame.camera_id` and `previous_frame.camera_id` must be identical.
+- `previous_frame` must precede or be simultaneous with `current_frame`: `previous_frame.timestamp_ms ≤ current_frame.timestamp_ms`.
 
 The module does not perform any image preprocessing. `InputValidator` enforces this contract and rejects any input that does not satisfy it.
 
@@ -81,18 +93,18 @@ The module does not perform any image preprocessing. `InputValidator` enforces t
 - `current_frame.camera_id` must exist and be non-empty
 - `current_frame.timestamp_ms` must exist
 - `current_frame.image` must exist and be non-null
-- `current_frame.image.color_format` must be `GRAY`
-- `current_frame.image.layout` must be `HWC`
-- `current_frame.image.dtype` must be `uint8`
-- `current_frame.image.width` and `current_frame.image.height` must be greater than zero
+- `current_frame.image.data` must be non-null and contain valid pixel data
+- `current_frame.image.color_format` must be `GRAY`, `current_frame.image.layout` must be `HWC`, `current_frame.image.dtype` must be `uint8`, and `current_frame.image.value_range` must be `[0,255]`
+- `current_frame.image.width` must be > 0 and `current_frame.image.height` must be > 0
+- `current_frame.image.data.shape` must be consistent with `current_frame.image.width`, `current_frame.image.height`, `current_frame.image.layout`, and `current_frame.image.color_format`
 - `previous_frame.frame_id` must exist
 - `previous_frame.camera_id` must exist and be non-empty
 - `previous_frame.timestamp_ms` must exist
 - `previous_frame.image` must exist and be non-null
-- `previous_frame.image.color_format` must be `GRAY`
-- `previous_frame.image.layout` must be `HWC`
-- `previous_frame.image.dtype` must be `uint8`
-- `previous_frame.image.width` and `previous_frame.image.height` must match `current_frame.image.width` and `current_frame.image.height`
+- `previous_frame.image.data` must be non-null and contain valid pixel data
+- `previous_frame.image.color_format` must be `GRAY`, `previous_frame.image.layout` must be `HWC`, `previous_frame.image.dtype` must be `uint8`, and `previous_frame.image.value_range` must be `[0,255]`
+- `previous_frame.image.width` must equal `current_frame.image.width` and `previous_frame.image.height` must equal `current_frame.image.height`
+- `previous_frame.image.data.shape` must be consistent with `previous_frame.image.width`, `previous_frame.image.height`, `previous_frame.image.layout`, and `previous_frame.image.color_format`
 - `current_frame.camera_id` must equal `previous_frame.camera_id`
 - `previous_frame.timestamp_ms` must be less than or equal to `current_frame.timestamp_ms` (temporal ordering consistency)
 
@@ -102,17 +114,12 @@ The module does not perform any image preprocessing. `InputValidator` enforces t
 
 ### 3.1 Output Structure
 
-```text
-struct BoundingBox {
-    int32 x;       // x coordinate of the top-left corner, relative to current_frame.image
-    int32 y;       // y coordinate of the top-left corner, relative to current_frame.image
-    int32 width;   // width of the bounding box in pixels
-    int32 height;  // height of the bounding box in pixels
-}
+`BoundingBox` is defined in [shared_contracts.md §1](shared_contracts.md). All `BoundingBox` coordinates in this output are ROI-local relative to `current_frame.image`.
 
+```text
 struct MotionResult {
     bool                detected;
-    vector<BoundingBox> bboxes;
+    vector<BoundingBox> bboxes;   // ROI-local, relative to current_frame.image
 }
 ```
 
@@ -238,11 +245,11 @@ Its responsibilities are:
 - verify that `current_frame` and `previous_frame` are present and non-null
 - verify that `current_frame.frame_id`, `current_frame.camera_id`, and `current_frame.timestamp_ms` are present
 - verify that `current_frame.camera_id` is non-empty
-- verify that `current_frame.image` conforms to the input contract (`color_format = GRAY`, `layout = HWC`, `dtype = uint8`, positive dimensions)
+- verify that `current_frame.image` is a non-null `Image` whose metadata fields (`color_format`, `layout`, `dtype`, `value_range`) are compatible with `GRAYSCALE_UINT8_HWC`, with positive `width` and `height`, and consistent `data.shape`
 - verify that `previous_frame.frame_id`, `previous_frame.camera_id`, and `previous_frame.timestamp_ms` are present
 - verify that `previous_frame.camera_id` is non-empty
-- verify that `previous_frame.image` conforms to the input contract (`color_format = GRAY`, `layout = HWC`, `dtype = uint8`, positive dimensions)
-- verify that `previous_frame.image` dimensions match `current_frame.image` dimensions
+- verify that `previous_frame.image` is a non-null `Image` whose metadata fields (`color_format`, `layout`, `dtype`, `value_range`) are compatible with `GRAYSCALE_UINT8_HWC`, with positive `width` and `height`, and consistent `data.shape`
+- verify that `previous_frame.image.width` equals `current_frame.image.width` and `previous_frame.image.height` equals `current_frame.image.height`
 - verify that `current_frame.camera_id` equals `previous_frame.camera_id`
 - verify that `previous_frame.timestamp_ms` is less than or equal to `current_frame.timestamp_ms`
 
@@ -322,7 +329,7 @@ struct MotionDetectionConfig {
 
 ### 9.2 Loading Behavior
 
-Configuration is loaded exactly once during module initialization. It is immutable after initialization and reused unchanged across all invocations. No configuration parameter is part of `FramePacket` or any per-call runtime input.
+Configuration is loaded exactly once during module initialization. It is immutable after initialization and reused unchanged across all invocations. No configuration parameter is part of `MotionInputFrame` or any per-call runtime input.
 
 Injection at construction time:
 
@@ -336,7 +343,7 @@ Injection at construction time:
 
 - **`MotionMeasurementResult`** — raw motion measurements; contains `motion_fraction: float` and candidate `bboxes: vector<BoundingBox>` filtered by `min_bbox_area`; produced by `MotionDetectionAlgorithm`, consumed by `MotionDecisionPolicy`; strictly internal to the module; must never cross the module boundary; must never be exposed in `MotionResult`; lifecycle: per-call
 - **`MotionDetectionResultInternal`** — binary detection decision; contains `detected: bool` and accepted `bboxes: vector<BoundingBox>`; produced by `MotionDecisionPolicy`, consumed by `MotionOutputBuilder`; lifecycle: per-call
-- **`BoundingBox`** — axis-aligned rectangle; fields: `x: int32`, `y: int32`, `width: int32`, `height: int32`; `(x, y)` is the top-left corner of the region; all coordinates are expressed in the coordinate system of `current_frame.image` (the image actually used for motion measurement); the module does not map coordinates to any original source frame; `width` and `height` are measured in pixels; used in `MotionMeasurementResult` and `MotionDetectionResultInternal`; lifecycle: per-call
+- **`BoundingBox`** — defined in [shared_contracts.md §1](shared_contracts.md); all coordinates in this module are expressed in the coordinate system of `current_frame.image` (the image actually used for motion measurement); the module does not map coordinates to any original source frame; used in `MotionMeasurementResult` and `MotionDetectionResultInternal`; lifecycle: per-call
 
 ---
 
@@ -414,16 +421,16 @@ classDiagram
         +build(result: MotionDetectionResultInternal) MotionResult
     }
 
-    class FramePacket {
-        +frame_id: uint64
+    class MotionInputFrame {
+        +frame_id: string
         +camera_id: string
         +timestamp_ms: uint64
         +image: Image
     }
 
     class MotionDetectionInput {
-        +current_frame: FramePacket
-        +previous_frame: FramePacket
+        +current_frame: MotionInputFrame
+        +previous_frame: MotionInputFrame
     }
 
     class MotionResult {
@@ -454,7 +461,7 @@ classDiagram
     MotionDetectionManager --> MotionOutputBuilder : orchestrates
     FrameDifferencingMotionDetector ..|> MotionDetectionAlgorithm : implements
     MotionDetectionManager --> MotionDetectionInput : consumes
-    MotionDetectionInput --> FramePacket : contains
+    MotionDetectionInput --> MotionInputFrame : contains
     MotionResult --> BoundingBox : contains
     MotionMeasurementResult --> BoundingBox : contains
     MotionDetectionResultInternal --> BoundingBox : contains
@@ -502,7 +509,7 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    A["MotionDetectionInput\ncurrent_frame (FramePacket) · previous_frame (FramePacket)"]
+    A["MotionDetectionInput\ncurrent_frame (MotionInputFrame) · previous_frame (MotionInputFrame)"]
     B["InputValidator\nvalidated MotionDetectionInput"]
     D["MotionDetectionAlgorithm\nmeasure(previous_frame.image, current_frame.image)\nMotionMeasurementResult\n(motion_fraction · bboxes)"]
     E["MotionDecisionPolicy\nMotionDetectionResultInternal\n(detected · bboxes)"]
@@ -544,7 +551,7 @@ flowchart TD
 - [ ] `detected = false` when no bboxes remain — `MotionDecisionPolicy` must set `detected = false` when all bboxes are filtered by `min_bbox_area`, regardless of threshold conditions
 - [ ] Preprocessing boundary enforced — module performs no image format conversion, color conversion, layout conversion, dtype conversion, or normalization
 - [ ] Stateless — the module must not retain any frame data between invocations; no internal frame storage
-- [ ] No `FramePacket` mutation — the module must not write to any field of the input structures
+- [ ] No `MotionInputFrame` mutation — the module must not write to any field of the input structures
 - [ ] `detected = false` returned for all non-detection scenarios — including invalid input, missing or invalid `previous_frame`, threshold miss, empty bbox list, and runtime failure
 - [ ] Module does not expose control-flow enums via public API
 - [ ] All outcomes are expressed via `MotionResult` return value only

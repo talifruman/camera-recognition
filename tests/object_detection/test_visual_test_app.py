@@ -34,7 +34,7 @@ class ObjectDetectionStubTests(unittest.TestCase):
         image = np.zeros((120, 200, 3), dtype=np.uint8)
         metadata = {
             "camera_id": "camera-a",
-            "frame_id": 7,
+            "frame_id": "frame_0007",
             "width": 200,
             "height": 120,
         }
@@ -42,7 +42,7 @@ class ObjectDetectionStubTests(unittest.TestCase):
         result = object_detection_stub.process(image, metadata)
 
         self.assertEqual(set(result), {"frame_id", "person_detected", "persons"})
-        self.assertEqual(result["frame_id"], 7)
+        self.assertEqual(result["frame_id"], "frame_0007")
         self.assertTrue(result["person_detected"])
         self.assertEqual(len(result["persons"]), 2)
 

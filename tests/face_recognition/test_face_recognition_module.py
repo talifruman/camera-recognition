@@ -85,7 +85,7 @@ def _make_landmarks(
 
 
 def _make_input(
-    frame_id: int = 1,
+    frame_id: str = "frame_0001",
     camera_id: str = "cam-01",
     timestamp_ms: int = 5000,
     face_roi: np.ndarray | None = None,
@@ -173,10 +173,10 @@ class OutputContractTests(unittest.TestCase):
         result = module.recognize_face(_make_input())
         self.assertIsInstance(result["person_found"], bool)
 
-    def test_output_frame_id_is_int(self) -> None:
+    def test_output_frame_id_is_str(self) -> None:
         module = _make_module()
-        result = module.recognize_face(_make_input(frame_id=42))
-        self.assertIsInstance(result["frame_id"], int)
+        result = module.recognize_face(_make_input(frame_id="frame_0042"))
+        self.assertIsInstance(result["frame_id"], str)
 
     def test_output_camera_id_is_str(self) -> None:
         module = _make_module()
@@ -309,7 +309,7 @@ class AcceptedMatchTests(unittest.TestCase):
     def test_correct_identity_selected_among_multiple_entries(self) -> None:
         # Build the face_input with a distinct ROI to get a specific embedding
         face_input = FaceRecognitionInput(
-            frame_id=1,
+            frame_id="frame_0001",
             camera_id="cam",
             timestamp_ms=0,
             face_roi_image=_make_face_roi(fill=200),
@@ -367,7 +367,7 @@ class BelowThresholdTests(unittest.TestCase):
 class MetadataPreservationTests(unittest.TestCase):
 
     def _result_for(
-        self, frame_id: int, camera_id: str, timestamp_ms: int
+        self, frame_id: str, camera_id: str, timestamp_ms: int
     ) -> FaceRecognitionOutput:
         module = _make_module()
         return module.recognize_face(
@@ -379,20 +379,20 @@ class MetadataPreservationTests(unittest.TestCase):
         )
 
     def test_frame_id_preserved(self) -> None:
-        result = self._result_for(frame_id=99, camera_id="cam", timestamp_ms=0)
-        self.assertEqual(result["frame_id"], 99)
+        result = self._result_for(frame_id="frame_0099", camera_id="cam", timestamp_ms=0)
+        self.assertEqual(result["frame_id"], "frame_0099")
 
     def test_camera_id_preserved(self) -> None:
-        result = self._result_for(frame_id=1, camera_id="camera-XYZ", timestamp_ms=0)
+        result = self._result_for(frame_id="frame_0001", camera_id="camera-XYZ", timestamp_ms=0)
         self.assertEqual(result["camera_id"], "camera-XYZ")
 
     def test_timestamp_ms_preserved(self) -> None:
-        result = self._result_for(frame_id=1, camera_id="cam", timestamp_ms=123456)
+        result = self._result_for(frame_id="frame_0001", camera_id="cam", timestamp_ms=123456)
         self.assertEqual(result["timestamp_ms"], 123456)
 
     def test_metadata_preserved_on_validation_failure(self) -> None:
         """Metadata must still be copied even when validation fails."""
-        inp = _make_input(frame_id=77, camera_id="cam-err", timestamp_ms=555)
+        inp = _make_input(frame_id="frame_0077", camera_id="cam-err", timestamp_ms=555)
         inp["face_roi_image"] = None  # trigger validation failure
         module = _make_module()
         result = module.recognize_face(inp)  # type: ignore[arg-type]
@@ -465,7 +465,7 @@ class StubEmbeddingDeterminismTests(unittest.TestCase):
 class ModuleDeterminismTests(unittest.TestCase):
 
     def test_same_input_produces_same_output(self) -> None:
-        face_input = _make_input(frame_id=10, camera_id="cam-d", timestamp_ms=100)
+        face_input = _make_input(frame_id="cam1_1712345678", camera_id="cam-d", timestamp_ms=100)
         entry = _make_matching_gallery_entry(face_input, person_id=_PERSON_A)
         config = _make_config(threshold=0.5)
 
@@ -589,11 +589,11 @@ class FaceRecognitionOutputBuilderTests(unittest.TestCase):
         builder = FaceRecognitionOutputBuilder()
         decision = RecognitionDecision(person_found=True, person_id="pid-123")
         output = builder.build(
-            frame_id=7, camera_id="cam-q", timestamp_ms=3000, decision=decision
+            frame_id="frame_0007", camera_id="cam-q", timestamp_ms=3000, decision=decision
         )
         self.assertTrue(output["person_found"])
         self.assertEqual(output["person_id"], "pid-123")
-        self.assertEqual(output["frame_id"], 7)
+        self.assertEqual(output["frame_id"], "frame_0007")
         self.assertEqual(output["camera_id"], "cam-q")
         self.assertEqual(output["timestamp_ms"], 3000)
 
@@ -601,7 +601,7 @@ class FaceRecognitionOutputBuilderTests(unittest.TestCase):
         builder = FaceRecognitionOutputBuilder()
         decision = RecognitionDecision(person_found=False)
         output = builder.build(
-            frame_id=1, camera_id="cam", timestamp_ms=0, decision=decision
+            frame_id="frame_0001", camera_id="cam", timestamp_ms=0, decision=decision
         )
         self.assertFalse(output["person_found"])
         self.assertEqual(output["person_id"], "")
@@ -777,9 +777,9 @@ class RealPipelineTests(unittest.TestCase):
     def test_real_metadata_preserved(self) -> None:
         module = _make_real_module(self._engine)
         result = module.recognize_face(
-            _make_input(frame_id=99, camera_id="cam-real", timestamp_ms=7777)
+            _make_input(frame_id="frame_0099", camera_id="cam-real", timestamp_ms=7777)
         )
-        self.assertEqual(result["frame_id"], 99)
+        self.assertEqual(result["frame_id"], "frame_0099")
         self.assertEqual(result["camera_id"], "cam-real")
         self.assertEqual(result["timestamp_ms"], 7777)
 

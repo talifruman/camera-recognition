@@ -1,5 +1,18 @@
 # Object Detection Module Specification (Person Detection Only)
 
+## Shared Contract Types
+
+The following types used by this module are defined in [shared_contracts.md](shared_contracts.md) and must not be duplicated here:
+
+- `BoundingBox` — the single shared bounding-box type (§1)
+- `OutputImageType` — the pixel representation enum (§4)
+- `GeometrySpec` — the geometry transformation struct (§3)
+- `ResizePolicy` — the resize behavior enum (§2)
+- `PipelineStageInputContract` — the stage initialization contract (§5)
+- `Image` — the canonical shared public image struct (§6); carries `data`, `width`, `height`, `color_format`, `layout`, `dtype`, and `value_range`; pixel format is described by `OutputImageType`
+
+---
+
 ## 1. Scope
 
 This document defines only the Object Detection Module responsible for person detection in video frames.
@@ -44,9 +57,39 @@ All frame preparation belongs to upstream components (IPS / Frame Transformation
 
 ## 4. Public API Contract
 
+The primary public integration method is:
+
+```text
+detect(input: ObjectDetectionInput) -> PersonDetectionResult
+```
+
+All external callers (including `PipelineOrchestrator` inside `RecognitionPipelineManager`) must use `detect()`. This is the only supported integration entry point.
+
+The initialization contract method is:
+
+```text
+get_input_contract() -> PipelineStageInputContract
+```
+
+`RecognitionPipelineManager` calls this once during initialization to determine the `OutputImageType` and `GeometrySpec` to pass to the Frame Transformation Layer when preparing images for this stage. The returned contract is stable across invocations.
+
+For YOLO11m (the default model), the contract values are:
+- `output_image_type`: `RGB_UINT8_HWC`
+- `geometry_spec`: `{ width: 640, height: 640, resize_policy: LETTERBOX }`
+
 The external API must expose only:
-- person_detected (boolean)
-- persons (list of BoundingBox)
+- `person_detected` (boolean)
+- `persons` (list of `BoundingBox` — ROI-local coordinates)
+
+The external API must NOT expose:
+- labels
+- confidence scores
+- raw detections
+- model outputs
+- `DetectionStatus`
+- runtime-specific metadata
+
+The internal method `process(model_ready_input, metadata)` is an internal pipeline convenience method retained for backward compatibility. It must not be used as the primary integration entry point. External callers must use `detect()`.
 
 The external API must not expose:
 - labels
@@ -77,12 +120,12 @@ The module requires exactly:
 
 **Metadata:**
 - `camera_id` — non-empty identifier of frame source.
-- `frame_id` — monotonically increasing per camera stream.
-- `width` — frame width in pixels.
-- `height` — frame height in pixels.
+- `frame_id` — unique identifier for the frame; preserved unchanged for traceability.
+- `timestamp_ms` — capture timestamp in milliseconds; preserved for tracing and debugging consistency across the pipeline.
+- `roi_bbox_frame` — position of the ROI in the original (full) frame coordinate space, as a `BoundingBox`. Provided by the caller (`PipelineOrchestrator`) for validation purposes. `roi_bbox_frame` is **not** returned in `PersonDetectionResult` — coordinate projection is performed by the caller using spatial metadata from the Frame Transformation Layer.
 
 **Processing input:**
-- A model-ready frame representation, already prepared for the configured YOLO model.
+- `roi_image` (`Image` — see [shared_contracts.md §6](shared_contracts.md)) — the model-ready image representation of the motion-region crop, already prepared for the configured YOLO model by the Frame Transformation Layer. `roi_image.width` and `roi_image.height` are explicit pixel-dimension fields on the `Image` struct. The standalone `width` and `height` fields remain as separate fields in `ObjectDetectionInput`; they are set from `ProcessedFrame.image.width` and `ProcessedFrame.image.height` by the caller (`PipelineOrchestrator`) and are used by the validator for shape consistency checking against `roi_image.data.shape`.
 
 There is NO dependency on:
 - `raw_buffer`
@@ -93,10 +136,15 @@ There is NO dependency on:
 ### 5.3 Validation Rules
 
 - `camera_id` must exist and be non-empty.
-- `frame_id` must exist.
-- `width` > 0 and `height` > 0.
-- Model-ready representation must exist.
-- Representation must match the expected model input contract.
+- `frame_id` must exist and be non-empty.
+- `timestamp_ms` must exist.
+- `roi_bbox_frame` must exist and have valid dimensions (width > 0, height > 0).
+- `roi_image` must exist.
+- `roi_image.width` must be > 0 and `roi_image.height` must be > 0.
+- `roi_image.data` must be non-null and contain valid pixel data.
+- `roi_image.color_format`, `roi_image.layout`, `roi_image.dtype`, and `roi_image.value_range` must match the expected `OutputImageType` for the configured model.
+- `roi_image.data.shape` must be consistent with `roi_image.width`, `roi_image.height`, `roi_image.layout`, and `roi_image.color_format`.
+- `roi_image` must match the expected model input contract.
 
 ### 5.4 Assumptions
 - Input integrity is expected from the upstream producer, but this module performs strict validation before processing.
@@ -106,20 +154,16 @@ There is NO dependency on:
 
 ### 6.1 BoundingBox
 
-```text
-struct BoundingBox {
-    int32 x;        // top-left x in pixels
-    int32 y;        // top-left y in pixels
-    int32 width;    // box width in pixels
-    int32 height;   // box height in pixels
-}
-```
+`BoundingBox` is defined in [shared_contracts.md §1](shared_contracts.md). Its coordinate space is always stated by context:
+
+- `PersonDetectionResult.persons` contains **ROI-local** `BoundingBox` entries — coordinates relative to the input `roi_image`.
+- Object Detection never projects boxes to full-frame coordinates. Full-frame projection is performed by the caller (`SpatialCoordinator` inside `PipelineOrchestrator`) using spatial metadata from the Frame Transformation Layer.
 
 ### 6.2 PersonDetectionResult
 
 ```text
 struct PersonDetectionResult {
-    uint64 frame_id;
+    string frame_id;
     bool person_detected;
     vector<BoundingBox> persons;
 }
@@ -164,8 +208,8 @@ struct RawDetection {
 #### Input Validator
 
 The Input Validator MUST ONLY:
-- Validate presence of required metadata fields (`camera_id`, `frame_id`, `width`, `height`).
-- Validate that the model-ready input exists.
+- Validate presence of required metadata fields (`camera_id`, `frame_id`, `timestamp_ms`, `width`, `height`, `roi_bbox_frame`).
+- Validate that `roi_image` (model-ready input) exists.
 - Validate compatibility with the expected model input contract.
 
 The Input Validator MUST NOT:
@@ -183,9 +227,9 @@ The Input Validator MUST NOT:
 - Non-Max Suppression (NMS) is applied using an IoU threshold to remove overlapping detections.
 - IoU (Intersection over Union) is a metric that measures the overlap between two bounding boxes. It is calculated as the ratio between the area of intersection and the area of union of the boxes.
 - During Non-Max Suppression (NMS), IoU is used to identify overlapping detections. If the IoU between two boxes exceeds a configured threshold, the lower-confidence detection is removed.
-- Maps decoded detection boxes back to the original frame resolution.
+- Maps decoded detection boxes back to `roi_image` coordinate space (ROI-local coordinates, relative to the input ROI image). Full-frame coordinate projection is not the responsibility of this module.
 
-All bounding boxes must be transformed back to the original frame coordinate system before being included in the final output.
+All bounding boxes in the output are expressed in ROI-local coordinates relative to `roi_image`.
 
 #### IoU and Non-Max Suppression Illustration
 
@@ -215,15 +259,16 @@ flowchart LR
 classDiagram
     class PipelineOrchestrator {
         <<external caller>>
-        +run_stage(model_ready_input, metadata) PersonDetectionResult
+        +detect(input: ObjectDetectionInput) PersonDetectionResult
     }
 
     class ObjectDetectionModule {
-        +process(model_ready_input, metadata) PersonDetectionResult
+        +detect(input: ObjectDetectionInput) PersonDetectionResult
+        +get_input_contract() PipelineStageInputContract
     }
 
     class InputValidator {
-        +validate_input(input_representation, metadata, config) void
+        +validate_input(model_ready_input, metadata, config) void
     }
 
     class IInferenceEngine {
@@ -252,15 +297,14 @@ classDiagram
         +build(frame_id, detections) PersonDetectionResult
     }
 
-    class DetectionInput {
-        +frame_id: uint64
+    class ObjectDetectionInput {
+        +frame_id: string
         +camera_id: string
-        +width: uint32
-        +height: uint32
-        +model_ready_representation: ModelReadyFrame
+        +timestamp_ms: uint64
+        +roi_bbox_frame: BoundingBox
+        +roi_image: Image
     }
 
-    class ModelReadyFrame
     class InferenceOutput
 
     class RawDetection {
@@ -277,12 +321,12 @@ classDiagram
     }
 
     class PersonDetectionResult {
-        +frame_id: uint64
+        +frame_id: string
         +person_detected: bool
         +persons: BoundingBox[]
     }
 
-    PipelineOrchestrator --> ObjectDetectionModule : process(model_ready_input, metadata)
+    PipelineOrchestrator --> ObjectDetectionModule : detect(ObjectDetectionInput)
     ObjectDetectionModule --> InputValidator : validate_input()
     ObjectDetectionModule --> IInferenceEngine : infer(model_ready_input)
     ConcreteInferenceEngine ..|> IInferenceEngine
@@ -290,8 +334,8 @@ classDiagram
     ObjectDetectionModule --> PersonFilteringLayer : filter_persons()/validate_boxes()
     ObjectDetectionModule --> ResultBuilder : build()
 
-    InputValidator --> DetectionInput : validates
-    IInferenceEngine --> ModelReadyFrame : consumes
+    InputValidator --> ObjectDetectionInput : validates
+    IInferenceEngine --> Image : consumes
     IInferenceEngine --> InferenceOutput : produces
     Postprocessor --> InferenceOutput : consumes
     Postprocessor --> RawDetection : produces
@@ -314,8 +358,8 @@ sequenceDiagram
     participant Filter as PersonFilteringLayer
     participant Build as ResultBuilder
 
-    Orch->>ODM: process(model_ready_input, metadata)
-    ODM->>Val: validate_input(input_representation, metadata, config)
+    Orch->>ODM: detect(ObjectDetectionInput)
+    ODM->>Val: validate_input(model_ready_input, metadata, config)
     Val-->>ODM: valid
 
     ODM->>Eng: infer(model_ready_input)
@@ -512,7 +556,7 @@ struct PersonDetectionConfig {
 
 Configuration changes affect internal detection behavior but must not alter external response schema.
 The combination of model_path and inference_backend enables dynamic model and runtime evolution while preserving the same public API.
-The default person confidence threshold is typically set to 0.5 (configurable).
+The implemented default person confidence threshold is `0.35` (configurable).
 
 ## 18. Compliance Checklist
 

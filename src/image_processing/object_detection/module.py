@@ -7,6 +7,14 @@ from typing import Any, TypedDict
 
 import numpy as np
 
+from image_processing.shared.contracts import (
+    GeometrySpec,
+    Image,
+    OutputImageType,
+    PipelineStageInputContract,
+    ResizePolicy,
+)
+
 
 class BoundingBox(TypedDict):
     x: int
@@ -15,15 +23,27 @@ class BoundingBox(TypedDict):
     height: int
 
 
-class FrameMetadata(TypedDict):
+class ObjectDetectionInput(TypedDict):
+    frame_id: str
     camera_id: str
-    frame_id: int
+    timestamp_ms: int
+    roi_image: Image
+    roi_bbox_frame: BoundingBox
     width: int
     height: int
 
 
+class FrameMetadata(TypedDict):
+    camera_id: str
+    frame_id: str
+    timestamp_ms: int
+    width: int
+    height: int
+    roi_bbox_frame: BoundingBox
+
+
 class PersonDetectionResult(TypedDict):
-    frame_id: int
+    frame_id: str
     person_detected: bool
     persons: list[BoundingBox]
 
@@ -46,27 +66,77 @@ class RawDetection:
     bbox: BoundingBox
 
 
+# Expected Image metadata for ObjectDetection (RGB_UINT8_HWC contract)
+_EXPECTED_COLOR_FORMAT = "RGB"
+_EXPECTED_LAYOUT = "HWC"
+_EXPECTED_DTYPE = "uint8"
+_EXPECTED_VALUE_RANGE = "[0,255]"
+
+
 class InputValidator:
     def validate_input(
         self,
-        model_ready_input: Any,
+        roi_image: Image,
         metadata: FrameMetadata,
         config: PersonDetectionConfig,
     ) -> None:
+        """Validate an Image struct from ObjectDetectionInput against the RGB_UINT8_HWC contract."""
         del config
 
+        # Validate metadata fields
         if not metadata.get("camera_id"):
             raise ValueError("camera_id is required")
         if "frame_id" not in metadata:
             raise ValueError("frame_id is required")
+        if "timestamp_ms" not in metadata:
+            raise ValueError("timestamp_ms is required")
+        if not isinstance(metadata["timestamp_ms"], int):
+            raise TypeError("timestamp_ms must be an int")
         if metadata["width"] <= 0 or metadata["height"] <= 0:
             raise ValueError("width and height must be positive")
-        if not isinstance(model_ready_input, np.ndarray):
-            raise TypeError("model_ready_input must be a numpy.ndarray")
-        if model_ready_input.ndim not in (2, 3):
-            raise ValueError("model_ready_input must be a 2D or 3D numpy array")
-        if model_ready_input.shape[0] != metadata["height"] or model_ready_input.shape[1] != metadata["width"]:
-            raise ValueError("metadata width and height must match model_ready_input shape")
+        roi_bbox = metadata.get("roi_bbox_frame")
+        if roi_bbox is None:
+            raise ValueError("roi_bbox_frame is required")
+        if roi_bbox["width"] <= 0 or roi_bbox["height"] <= 0:
+            raise ValueError("roi_bbox_frame must have positive width and height")
+
+        # Validate Image struct
+        if not isinstance(roi_image, dict):
+            raise TypeError("roi_image must be an Image struct (dict)")
+        data = roi_image.get("data")
+        if data is None:
+            raise ValueError("roi_image.data is required")
+        if not isinstance(data, np.ndarray):
+            raise TypeError("roi_image.data must be a numpy.ndarray")
+        if data.ndim not in (2, 3):
+            raise ValueError("roi_image.data must be a 2D or 3D numpy array")
+        if roi_image.get("width", 0) <= 0:
+            raise ValueError("roi_image.width must be positive")
+        if roi_image.get("height", 0) <= 0:
+            raise ValueError("roi_image.height must be positive")
+        if roi_image.get("color_format") != _EXPECTED_COLOR_FORMAT:
+            raise ValueError(
+                f"roi_image.color_format must be '{_EXPECTED_COLOR_FORMAT}', "
+                f"got {roi_image.get('color_format')!r}"
+            )
+        if roi_image.get("layout") != _EXPECTED_LAYOUT:
+            raise ValueError(
+                f"roi_image.layout must be '{_EXPECTED_LAYOUT}', "
+                f"got {roi_image.get('layout')!r}"
+            )
+        if roi_image.get("dtype") != _EXPECTED_DTYPE:
+            raise ValueError(
+                f"roi_image.dtype must be '{_EXPECTED_DTYPE}', "
+                f"got {roi_image.get('dtype')!r}"
+            )
+        if roi_image.get("value_range") != _EXPECTED_VALUE_RANGE:
+            raise ValueError(
+                f"roi_image.value_range must be '{_EXPECTED_VALUE_RANGE}', "
+                f"got {roi_image.get('value_range')!r}"
+            )
+        # Shape consistency: data must match the standalone width/height
+        if data.shape[0] != metadata["height"] or data.shape[1] != metadata["width"]:
+            raise ValueError("metadata width and height must match roi_image.data shape")
 
 
 class UltralyticsInferenceEngine:
@@ -206,7 +276,7 @@ class PersonFilteringLayer:
 
 
 class ResultBuilder:
-    def build(self, frame_id: int, detections: list[RawDetection]) -> PersonDetectionResult:
+    def build(self, frame_id: str, detections: list[RawDetection]) -> PersonDetectionResult:
         persons = [detection.bbox for detection in detections]
         return {
             "frame_id": frame_id,
@@ -228,8 +298,63 @@ class ObjectDetectionModule:
         self._person_filtering = PersonFilteringLayer()
         self._result_builder = ResultBuilder()
 
+    def detect(self, input: ObjectDetectionInput) -> PersonDetectionResult:
+        """Primary public integration method. Called by PipelineOrchestrator via ObjectDetectionInterface."""
+        metadata: FrameMetadata = {
+            "camera_id": input["camera_id"],
+            "frame_id": input["frame_id"],
+            "timestamp_ms": input["timestamp_ms"],
+            "width": input["width"],
+            "height": input["height"],
+            "roi_bbox_frame": input["roi_bbox_frame"],
+        }
+        self._input_validator.validate_input(input["roi_image"], metadata, self._config)
+        return self.process(input["roi_image"]["data"], metadata)
+
+    def get_input_contract(self) -> PipelineStageInputContract:
+        """Return the image format and geometry required by this stage.
+
+        YOLO11m requires RGB, uint8, HWC, 640x640 with letterbox padding.
+        RPM queries this at initialization to configure FTL get_frame() calls.
+        """
+        return {
+            "output_image_type": OutputImageType.RGB_UINT8_HWC,
+            "geometry_spec": {
+                "width": 640,
+                "height": 640,
+                "resize_policy": ResizePolicy.LETTERBOX,
+            },
+        }
+
     def process(self, model_ready_input: Any, metadata: FrameMetadata) -> PersonDetectionResult:
-        self._input_validator.validate_input(model_ready_input, metadata, self._config)
+        """Internal pipeline method. Use detect() as the public integration entry point.
+
+        Accepts a raw np.ndarray directly. Validation of Image struct fields
+        is performed by detect() before calling this method. Callers using
+        process() directly (e.g. tests) are responsible for providing a valid ndarray.
+        """
+        # Inline validation for direct callers of process()
+        if not metadata.get("camera_id"):
+            raise ValueError("camera_id is required")
+        if "frame_id" not in metadata:
+            raise ValueError("frame_id is required")
+        if "timestamp_ms" not in metadata:
+            raise ValueError("timestamp_ms is required")
+        if not isinstance(metadata["timestamp_ms"], int):
+            raise TypeError("timestamp_ms must be an int")
+        if metadata["width"] <= 0 or metadata["height"] <= 0:
+            raise ValueError("width and height must be positive")
+        roi_bbox = metadata.get("roi_bbox_frame")
+        if roi_bbox is None:
+            raise ValueError("roi_bbox_frame is required")
+        if roi_bbox["width"] <= 0 or roi_bbox["height"] <= 0:
+            raise ValueError("roi_bbox_frame must have positive width and height")
+        if not isinstance(model_ready_input, np.ndarray):
+            raise TypeError("model_ready_input must be a numpy.ndarray")
+        if model_ready_input.ndim not in (2, 3):
+            raise ValueError("model_ready_input must be a 2D or 3D numpy array")
+        if model_ready_input.shape[0] != metadata["height"] or model_ready_input.shape[1] != metadata["width"]:
+            raise ValueError("metadata width and height must match model_ready_input shape")
         inference_output = self._inference_engine.infer(model_ready_input, self._config)
         raw_detections = self._postprocessor.decode_and_nms(inference_output, self._config)
         person_detections = self._person_filtering.filter_persons(raw_detections, self._config)

@@ -39,7 +39,7 @@ def _make_gray_image(height: int = 64, width: int = 64) -> np.ndarray:
 
 def _make_frame(
     *,
-    frame_id: int = 1,
+    frame_id: str = "frame_0001",
     camera_id: str = "cam-a",
     timestamp_ms: int = 1000,
     height: int = 64,
@@ -64,14 +64,14 @@ def _make_input(
 ) -> MotionDetectionInput:
     return MotionDetectionInput(
         current_frame=_make_frame(
-            frame_id=2,
+            frame_id="frame_0002",
             camera_id=camera_id,
             timestamp_ms=current_ts,
             height=height,
             width=width,
         ),
         previous_frame=_make_frame(
-            frame_id=1,
+            frame_id="frame_0001",
             camera_id=camera_id,
             timestamp_ms=previous_ts,
             height=height,
@@ -581,13 +581,13 @@ class AssetIntegrationTests(unittest.TestCase):
 
             inp: MotionDetectionInput = {
                 "current_frame": {
-                    "frame_id": 2,
+                    "frame_id": "frame_0002",
                     "camera_id": case_name,
                     "timestamp_ms": 2000,
                     "image": curr_img,
                 },
                 "previous_frame": {
-                    "frame_id": 1,
+                    "frame_id": "frame_0001",
                     "camera_id": case_name,
                     "timestamp_ms": 1000,
                     "image": prev_img,
