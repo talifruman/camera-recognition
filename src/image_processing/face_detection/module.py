@@ -6,37 +6,21 @@ from typing import Protocol, TypedDict, runtime_checkable
 import numpy as np
 
 from image_processing.shared.contracts import (
+    BoundingBox,
+    FaceLandmarks,
     GeometrySpec,
     Image,
     OutputImageType,
     PipelineStageInputContract,
+    Point,
     ResizePolicy,
 )
 
 
 # ---------------------------------------------------------------------------
 # Public data structures — match Face Detection markdown spec §2.2, §7.1
+# (BoundingBox, Point, FaceLandmarks are imported from image_processing.shared.contracts)
 # ---------------------------------------------------------------------------
-
-
-class BoundingBox(TypedDict):
-    x: int
-    y: int
-    width: int
-    height: int
-
-
-class Point(TypedDict):
-    x: int
-    y: int
-
-
-class FaceLandmarks(TypedDict):
-    left_eye: Point
-    right_eye: Point
-    nose: Point
-    mouth_left: Point
-    mouth_right: Point
 
 
 class DetectedFace(TypedDict):

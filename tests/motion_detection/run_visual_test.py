@@ -12,10 +12,11 @@ SRC_DIR = Path(__file__).resolve().parents[2] / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from image_processing.shared.contracts import Image  # type: ignore[import-not-found]
 from image_processing.motion_detection import (  # type: ignore[import-not-found]
-    FramePacket,
     MotionDetectionInput,
     MotionDetectionManager,
+    MotionInputFrame,
     MotionResult,
 )
 
@@ -77,6 +78,23 @@ def load_frame_pair(
 # ---------------------------------------------------------------------------
 
 
+def _ndarray_to_image(arr: np.ndarray) -> Image:
+    """Wrap a 2-D or (H,W,1) uint8 grayscale ndarray in a shared Image struct."""
+    if arr.ndim == 3:
+        h, w = arr.shape[0], arr.shape[1]
+    else:
+        h, w = arr.shape[0], arr.shape[1]
+    return Image(
+        data=arr,
+        width=w,
+        height=h,
+        color_format="GRAY",
+        layout="HWC",
+        dtype="uint8",
+        value_range="[0,255]",
+    )
+
+
 def build_motion_input(
     prev_img: np.ndarray,
     curr_img: np.ndarray,
@@ -85,17 +103,17 @@ def build_motion_input(
     """Construct a MotionDetectionInput from a grayscale frame pair."""
     camera_id = case_name
 
-    previous_frame: FramePacket = {
+    previous_frame: MotionInputFrame = {
         "frame_id": "frame_0001",
         "camera_id": camera_id,
         "timestamp_ms": 1000,
-        "image": prev_img,
+        "image": _ndarray_to_image(prev_img),
     }
-    current_frame: FramePacket = {
+    current_frame: MotionInputFrame = {
         "frame_id": "frame_0002",
         "camera_id": camera_id,
         "timestamp_ms": 2000,
-        "image": curr_img,
+        "image": _ndarray_to_image(curr_img),
     }
     motion_input: MotionDetectionInput = {
         "previous_frame": previous_frame,

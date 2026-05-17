@@ -125,7 +125,7 @@ The module requires exactly:
 - `roi_bbox_frame` — position of the ROI in the original (full) frame coordinate space, as a `BoundingBox`. Provided by the caller (`PipelineOrchestrator`) for validation purposes. `roi_bbox_frame` is **not** returned in `PersonDetectionResult` — coordinate projection is performed by the caller using spatial metadata from the Frame Transformation Layer.
 
 **Processing input:**
-- `roi_image` (`Image` — see [shared_contracts.md §6](shared_contracts.md)) — the model-ready image representation of the motion-region crop, already prepared for the configured YOLO model by the Frame Transformation Layer. `roi_image.width` and `roi_image.height` are explicit pixel-dimension fields on the `Image` struct. The standalone `width` and `height` fields remain as separate fields in `ObjectDetectionInput`; they are set from `ProcessedFrame.image.width` and `ProcessedFrame.image.height` by the caller (`PipelineOrchestrator`) and are used by the validator for shape consistency checking against `roi_image.data.shape`.
+- `roi_image` (`Image` — see [shared_contracts.md §6](shared_contracts.md)) — the model-ready image representation of the motion-region crop, already prepared for the configured YOLO model by the Frame Transformation Layer. Image pixel dimensions are owned exclusively by `roi_image.width` and `roi_image.height` inside the `Image` struct. No standalone `width` or `height` fields exist on `ObjectDetectionInput`. The `InputValidator` reads dimensions directly from `roi_image.width` and `roi_image.height` for shape consistency validation against `roi_image.data.shape`.
 
 There is NO dependency on:
 - `raw_buffer`
@@ -208,7 +208,7 @@ struct RawDetection {
 #### Input Validator
 
 The Input Validator MUST ONLY:
-- Validate presence of required metadata fields (`camera_id`, `frame_id`, `timestamp_ms`, `width`, `height`, `roi_bbox_frame`).
+- Validate presence of required metadata fields (`camera_id`, `frame_id`, `timestamp_ms`, `roi_bbox_frame`).
 - Validate that `roi_image` (model-ready input) exists.
 - Validate compatibility with the expected model input contract.
 
@@ -268,7 +268,7 @@ classDiagram
     }
 
     class InputValidator {
-        +validate_input(model_ready_input, metadata, config) void
+        +validate_input(roi_image, metadata, config) void
     }
 
     class IInferenceEngine {
@@ -359,7 +359,7 @@ sequenceDiagram
     participant Build as ResultBuilder
 
     Orch->>ODM: detect(ObjectDetectionInput)
-    ODM->>Val: validate_input(model_ready_input, metadata, config)
+    ODM->>Val: validate_input(roi_image, metadata, config)
     Val-->>ODM: valid
 
     ODM->>Eng: infer(model_ready_input)

@@ -48,10 +48,12 @@ RecognitionPipelineManager is NOT responsible for:
 - Orchestrating all interaction with the Frame Transformation Layer — controlling when frames are ingested and when processed frame data is retrieved — without accessing or managing its internal implementation
 - Executing the pipeline stages in the defined deterministic order: motion detection → object detection → face detection → face recognition
 - Applying routing gate decisions at each pipeline stage boundary
+- Applying per-frame ROI guardrails before downstream fan-out (`max_motion_rois_per_frame`, `max_person_rois_per_frame`, `max_face_rois_per_frame`)
 - Requesting processed full-frame and ROI data from the Frame Transformation Layer at each pipeline stage using `FrameTemporalSelector` to select CURRENT or PREVIOUS
 - Using the returned processed frames to construct the exact stage input contracts: `MotionDetectionInput`, `ObjectDetectionInput`, `FaceDetectionInput`, `FaceRecognitionInput`
 - Projecting person detection bounding boxes from ROI-local coordinates to full-frame coordinates via `SpatialCoordinator`
 - Assembling a structured `RecognitionPipelineOutput` from all projected person and face results
+- Capturing per-frame orchestration metrics for observability (`total_ftl_calls_per_frame`, stage call counts, and ROI request counters)
 - Ensuring that execution of one camera's pipeline does not block execution of another camera's pipeline
 
 ### Out of Scope
@@ -182,10 +184,12 @@ All pipeline-internal data, intermediate coordinates, and detection artifacts re
 
 ```text
 RecognitionPipelineOutput process_frame(frame_packet: FramePacket)
+dict get_last_frame_metrics()
 ```
 
 - The caller supplies a complete `FramePacket`.
 - `RecognitionPipelineManager` processes exactly one `FramePacket` per invocation.
+- `get_last_frame_metrics()` returns instrumentation counters for the most recent invocation on this manager instance.
 - `RecognitionPipelineManager` does not know who the caller is. The caller may be any external runtime component, test harness, or scheduler, but this module must not name or depend on it.
 - No batching is allowed. One `FramePacket` per invocation.
 - The API must remain stable regardless of which pipeline stage implementations are configured. No threshold, image type, geometry spec, or configuration parameter is a parameter of this method — all such values are immutable internal configuration state loaded at initialization.
@@ -198,6 +202,7 @@ RecognitionPipelineOutput process_frame(frame_packet: FramePacket)
 - **No ingestion responsibility** — `RecognitionPipelineManager` does not own frame transport, camera connections, or ingestion logic
 - **RecognitionPipelineManager does not pull frames** — `RecognitionPipelineManager` never accesses frame sources of any kind; all frames are supplied by the external caller
 - **No image storage** — `RecognitionPipelineManager` does not store image bytes, full-frame `Image` structs, or `ProcessedFrame`; frame storage is managed exclusively by the Frame Transformation Layer
+- **Image data ownership contract** — `RecognitionPipelineManager` and downstream stages treat `ProcessedFrame.image.data` buffers as read-only; mutation is forbidden by contract, and callers must not rely on whether FTL returned copies or references
 - **No frame reference storage** — `RecognitionPipelineManager` does not store or track `FrameReference` values across invocations; per-camera temporal frame state (CURRENT and PREVIOUS slots) is owned exclusively by the Frame Transformation Layer
 - **Frame Transformation Layer manages per-camera temporal state** — the Frame Transformation Layer maintains CURRENT and PREVIOUS frame slots independently per `camera_id`; after each successful `ingest_frame`, the FTL advances its internal temporal state; `RecognitionPipelineManager` only selects CURRENT or PREVIOUS via `FrameTemporalSelector` when requesting processed frames
 - **Frame Transformation Layer manages frame storage** — the Frame Transformation Layer manages frame storage internally; `RecognitionPipelineManager` delegates all frame ingestion and retrieval to it via the public interface
@@ -207,6 +212,7 @@ RecognitionPipelineOutput process_frame(frame_packet: FramePacket)
 - **`FrameTransformationLayerInterface` concurrency** — its implementation must be safe for concurrent `ingest_frame` and `get_frame` calls if multiple cameras are processed in parallel; `RecognitionPipelineManager` only invokes its public interface and does not own its storage
 - **Real-time capable** — suitable for per-frame online processing
 - **Deterministic** — same `FramePacket` + same configuration + same Frame Transformation Layer state produce the same `RecognitionPipelineOutput`
+- **Bounded fan-out** — ROI guardrails cap downstream OD/FD/FR fan-out per frame
 - **Model-agnostic API** — the public output schema is independent of the underlying pipeline stage implementations
 - **Strict isolation** — no internal AI data (detection scores, embeddings, raw tensors, landmarks) escapes the public API
 - **All outputs are full-frame coordinates** — no ROI-local coordinates appear in `RecognitionPipelineOutput`
@@ -361,6 +367,35 @@ Its responsibilities are:
 
 `PipelineOrchestrator` must not perform coordinate arithmetic directly, perform image preprocessing, or modify pixel data.
 
+### 8.3.1 Spatial Projection Contract (Mandatory)
+
+`PipelineOrchestrator` and `SpatialCoordinator` must treat `ProcessedFrame.spatial_transform` as mandatory spatial metadata on every `get_frame` response.
+
+Rules:
+
+- For `ResizePolicy.NONE`, projection to full-frame is identity-plus-offset:
+    - `scale_x = 1`, `scale_y = 1`, `pad_left = 0`, `pad_top = 0`
+    - Add `source_bbox_full_frame.x`/`source_bbox_full_frame.y` after local-to-crop conversion.
+- For `ResizePolicy.LETTERBOX`, inverse projection must remove padding first, then divide by scale.
+
+Mandatory inverse projection steps for an output-local point `(ox, oy)`:
+
+```text
+1. Remove padding:   cx = ox - pad_left
+                                         cy = oy - pad_top
+2. Undo scale:       rx = cx / scale_x
+                                         ry = cy / scale_y
+3. Add crop origin:  fx = rx + source_bbox_full_frame.x
+                                         fy = ry + source_bbox_full_frame.y
+```
+
+`fx, fy` are full-frame coordinates.
+
+Integration safety rules:
+
+- RPM must never project boxes or landmarks from transformed output coordinates back to full-frame coordinates without `spatial_transform` when geometry is non-identity.
+- If `spatial_transform` is missing or invalid for non-identity geometry, RPM must treat this as an integration error and fail fast for that frame.
+
 `PipelineOrchestrator` must not:
 
 - store image bytes, full-frame `Image` structs, or `ProcessedFrame`
@@ -442,6 +477,8 @@ MotionDetectionInput {
 
 > **Note.** `MotionInputFrame` is the input container type used by the Motion Detection module. It is distinct from the FTL-level `FramePacket` (which carries raw `image_bytes` as bytes and is the entry point into the FTL). `MotionInputFrame` carries a fully prepared shared `Image` struct.
 
+> **Frame traceability.** `previous_processed.frame_id` is supplied by the FTL through `ProcessedFrame.frame_id`, which the FTL copies unchanged from the source `FramePacket.frame_id` during ingest and preserves through all crop, resize, letterbox, and pixel-format conversion operations. RPM does not synthesize or modify `frame_id` for either frame. The previous frame's original source identity is fully preserved through the FTL `FrameStore`.
+
 and invokes `MotionDetectionInterface.detect(MotionDetectionInput)`.
 
 `MotionResult.bboxes` are relative to `MotionDetectionInput.current_frame.image`. Because `RecognitionPipelineManager` supplies the full current frame to Motion Detection, the returned motion bboxes are used as crop regions over the full current frame. The returned bboxes are relative to the image supplied to Motion Detection — not implicitly in any other coordinate space.
@@ -462,15 +499,13 @@ ObjectDetectionInput {
     camera_id      = frame_packet.camera_id,
     timestamp_ms   = frame_packet.timestamp_ms,
     roi_image      = ProcessedFrame.image,
-    roi_bbox_frame = motion_region_bbox,
-    width          = ProcessedFrame.image.width,
-    height         = ProcessedFrame.image.height
+    roi_bbox_frame = motion_region_bbox
 }
 ```
 
-`roi_bbox_frame` carries the ROI position in full-frame coordinates — it is the motion-region bbox that was passed to the FTL to produce this `ProcessedFrame`. `width` and `height` are the pixel dimensions of `roi_image`, derived from the ProcessedFrame. The motion-region crop defines a new ROI-local coordinate space: the ROI image is the primary input Object Detection needs. The ROI image is already prepared by the Frame Transformation Layer using the stage-defined input contract (`object_detection_contract.output_image_type` and `object_detection_contract.geometry_spec`). The Object Detection stage does not call the Frame Transformation Layer. `PipelineOrchestrator` invokes `ObjectDetectionInterface.detect(ObjectDetectionInput)` → `PersonDetectionResult`.
+`roi_bbox_frame` carries the ROI position in full-frame coordinates — it is the motion-region bbox that was passed to the FTL to produce this `ProcessedFrame`. Image pixel dimensions are owned exclusively by `roi_image.width` and `roi_image.height` inside the `Image` struct; no standalone `width` or `height` fields exist on `ObjectDetectionInput`. The motion-region crop defines a new ROI-local coordinate space: the ROI image is the primary input Object Detection needs. The ROI image is already prepared by the Frame Transformation Layer using the stage-defined input contract (`object_detection_contract.output_image_type` and `object_detection_contract.geometry_spec`). The Object Detection stage does not call the Frame Transformation Layer. `PipelineOrchestrator` invokes `ObjectDetectionInterface.detect(ObjectDetectionInput)` → `PersonDetectionResult`.
 
-`PersonDetectionResult.persons` are ROI-local coordinates relative to `ObjectDetectionInput.roi_image`. They must never be used as full-frame coordinates or exposed publicly. `PipelineOrchestrator` passes each ROI-local person bbox to `SpatialCoordinator.project_bbox_to_full_frame` together with the motion ROI spatial metadata (`ProcessedFrame.source_bbox_full_frame`) to obtain the projected full-frame person bbox.
+`PersonDetectionResult.persons` are ROI-local coordinates relative to `ObjectDetectionInput.roi_image`. They must never be used as full-frame coordinates or exposed publicly. `PipelineOrchestrator` passes each ROI-local person bbox to `SpatialCoordinator.project_bbox_to_full_frame` together with the motion ROI spatial metadata (`ProcessedFrame.source_bbox_full_frame`, `ProcessedFrame.spatial_transform`) to obtain the projected full-frame person bbox.
 
 #### 8.5.3 Face Detection Stage Input Construction
 
@@ -493,11 +528,11 @@ FaceDetectionInput {
 
 `FaceDetectionInput` does not carry `roi_bbox_frame`, spatial metadata, or ROI coordinates — those remain internal pipeline state managed by the FTL and `PipelineOrchestrator`. The person-region crop defines another ROI-local coordinate space: the ROI image is the only input Face Detection needs. `PipelineOrchestrator` invokes `FaceDetectionInterface.detect_faces(FaceDetectionInput)`.
 
-`FaceDetectionOutput.detections` carries zero or more `DetectedFace` entries; each `DetectedFace.face_bbox` is in ROI-local coordinates relative to the person ROI image. These coordinates must never be used as full-frame coordinates or exposed publicly. `PipelineOrchestrator` passes each ROI-local face bbox to `SpatialCoordinator.project_bbox_to_full_frame` together with the person ROI spatial metadata (`ProcessedFrame.source_bbox_full_frame`) to obtain the projected full-frame face bbox. The FTL then creates the face ROI image from the projected full-frame face bbox.
+`FaceDetectionOutput.detections` carries zero or more `DetectedFace` entries; each `DetectedFace.face_bbox` is in ROI-local coordinates relative to the person ROI image. These coordinates must never be used as full-frame coordinates or exposed publicly. `PipelineOrchestrator` passes each ROI-local face bbox to `SpatialCoordinator.project_bbox_to_full_frame` together with the person ROI spatial metadata (`ProcessedFrame.source_bbox_full_frame`, `ProcessedFrame.spatial_transform`) to obtain the projected full-frame face bbox. The FTL then creates the face ROI image from the projected full-frame face bbox.
 
 #### 8.5.4 Face Recognition Stage Input Construction
 
-For each accepted face in `FaceDetectionOutput.detections`, `PipelineOrchestrator` first obtains the projected full-frame face bbox by calling `SpatialCoordinator.project_bbox_to_full_frame(roi_local_face_bbox, person_roi_spatial_metadata)`. Before constructing `FaceRecognitionInput`, `PipelineOrchestrator` re-expresses `DetectedFace.landmarks` in face-crop-local coordinates by subtracting the face bbox origin from each landmark: for each landmark `lm`, `face_local_lm.x = lm.x - DetectedFace.face_bbox.x` and `face_local_lm.y = lm.y - DetectedFace.face_bbox.y`. `PipelineOrchestrator` then calls:
+For each accepted face in `FaceDetectionOutput.detections`, `PipelineOrchestrator` first obtains the projected full-frame face bbox by calling `SpatialCoordinator.project_bbox_to_full_frame(roi_local_face_bbox, source_bbox_full_frame, spatial_transform)`. Before constructing `FaceRecognitionInput`, `PipelineOrchestrator` re-expresses `DetectedFace.landmarks` in face-crop-local coordinates by subtracting the face bbox origin from each landmark: for each landmark `lm`, `face_local_lm.x = lm.x - DetectedFace.face_bbox.x` and `face_local_lm.y = lm.y - DetectedFace.face_bbox.y`. `PipelineOrchestrator` then calls:
 
 ```text
 FrameTransformationLayerInterface.get_frame(camera_id, CURRENT, projected_face_bbox, face_recognition_contract.output_image_type, face_recognition_contract.geometry_spec) -> ProcessedFrame
@@ -515,7 +550,7 @@ FaceRecognitionInput {
 }
 ```
 
-and invokes `FaceRecognitionInterface.recognize(FaceRecognitionInput)`. Face Recognition receives only the face ROI image — it does not receive full-frame data, ROI bbox metadata, or spatial metadata. `landmarks` are the canonical 5-point `FaceLandmarks` re-expressed in face-crop-local coordinates (relative to `face_roi_image`, not the person ROI image). `FaceRecognitionOutput` returns only `person_found` and `person_id` — it does not carry human-readable display names; Face Recognition remains engine-agnostic and identity-only. If recognition succeeds (`person_found = true`), `PipelineOrchestrator` performs an identity enrichment lookup using `person_id` to retrieve `person_name`, then appends `RecognizedFaceResult{face_bbox, person_id, person_name}` to the parent `PersonResult.recognized_faces`. If recognition fails, the face is omitted entirely.
+and invokes `FaceRecognitionInterface.recognize(FaceRecognitionInput)`. Face Recognition receives only the face ROI image — it does not receive full-frame data, ROI bbox metadata, or spatial metadata. `landmarks` are the canonical 5-point `FaceLandmarks` re-expressed in face-crop-local coordinates (relative to `face_roi_image`, not the person ROI image). `FaceRecognitionOutput` returns only `person_found` and `person_id` — it does not carry human-readable display names; Face Recognition remains engine-agnostic and identity-only. If recognition succeeds (`person_found = true`), `PipelineOrchestrator` calls `PersonDirectory.get_person(person_id)` → `PersonDirectoryOutput` and uses `PersonDirectoryOutput.person_name` to enrich the result; if `PersonDirectoryOutput.found = false`, `person_name` is set to `"UNKNOWN"`. If `PersonDirectory.get_person()` raises an exception, `PipelineOrchestrator` catches it and uses deterministic UNKNOWN fallback (`person_id = "UNKNOWN"`, `person_name = "UNKNOWN"`, `found = false`); the face is still appended to `recognized_faces` — no exception propagates to the pipeline level. `PipelineOrchestrator` then appends `RecognizedFaceResult{face_bbox, person_id, person_name}` to the parent `PersonResult.recognized_faces`. If recognition fails (`person_found = false`), the face is omitted entirely.
 
 ### 8.6 SpatialCoordinator
 
@@ -523,11 +558,19 @@ and invokes `FaceRecognitionInterface.recognize(FaceRecognitionInput)`. Face Rec
 
 Its responsibilities are:
 
-- project ROI-local Object Detection person bboxes to full-frame coordinates using the motion ROI spatial metadata (`source_bbox_full_frame`) returned by the Frame Transformation Layer
-- project ROI-local Face Detection face bboxes to full-frame coordinates using the person ROI spatial metadata (`source_bbox_full_frame`) returned by the Frame Transformation Layer
+- project ROI-local Object Detection person bboxes to full-frame coordinates using motion ROI spatial metadata (`source_bbox_full_frame` and `spatial_transform`) returned by the Frame Transformation Layer
+- project ROI-local Face Detection face bboxes to full-frame coordinates using person ROI spatial metadata (`source_bbox_full_frame` and `spatial_transform`) returned by the Frame Transformation Layer
 - return the projected `BoundingBox` in full-frame coordinates
 
 `SpatialCoordinator` is invoked after Object Detection (to project person bboxes using motion ROI spatial metadata) and after Face Detection (to project face bboxes using person ROI spatial metadata). `SpatialCoordinator` does NOT create ROI images — it only projects coordinates. `SpatialCoordinator` must not apply detection logic, make routing decisions, or modify any image data.
+
+`SpatialCoordinator.project_bbox_to_full_frame(local_bbox, source_bbox_full_frame, spatial_transform)` must apply inverse geometry before adding source-crop offsets:
+
+1. Remove geometry padding: `x_unpadded = local_x - spatial_transform.pad_left`, `y_unpadded = local_y - spatial_transform.pad_top`
+2. Undo geometry scale: `x_crop = x_unpadded / spatial_transform.scale_x`, `y_crop = y_unpadded / spatial_transform.scale_y`, and the same for width/height
+3. Translate into full-frame coordinates: `x_full = x_crop + source_bbox_full_frame.x`, `y_full = y_crop + source_bbox_full_frame.y`
+
+For `ResizePolicy.NONE`, the inverse reduces to identity because `scale_x=scale_y=1.0` and `pad_left=pad_top=0`. For `ResizePolicy.LETTERBOX`, all three steps are mandatory.
 
 ### 8.7 RecognitionPipelineOutputBuilder
 
@@ -542,7 +585,21 @@ Its responsibilities are:
 
 `RecognitionPipelineOutputBuilder` must not invoke pipeline stages, apply projection logic, or make routing decisions.
 
-### 8.8 End-to-End Processing Flow
+### 8.8 PersonDirectory
+
+`PersonDirectory` is responsible for resolving a recognized `person_id` into a `PersonRecord` containing the corresponding `person_name` for identity enrichment.
+
+Its responsibilities are:
+
+- load person metadata from a configured JSON file exactly once at initialization
+- validate all loaded records: reject records with empty `person_id`, empty `person_name`, or the reserved key `"UNKNOWN"`
+- build and maintain an in-memory map: `person_id → PersonRecord`
+- respond to `get_person(person_id)` queries from `PipelineOrchestrator` at runtime
+- return a canonical UNKNOWN output (`person_id = "UNKNOWN"`, `person_name = "UNKNOWN"`, `found = false`) when the `person_id` is unknown, empty, or equals `"UNKNOWN"`
+
+`PersonDirectory` must not perform face recognition, load face embeddings, access the gallery, or be depended on by any pipeline stage implementation. `PersonDirectory` must not fail the pipeline due to a missing `person_id` — all unresolvable lookups return the canonical UNKNOWN output.
+
+### 8.9 End-to-End Processing Flow
 
 For one invocation of `process_frame`, the internal pipeline follows this order:
 
@@ -555,11 +612,11 @@ For one invocation of `process_frame`, the internal pipeline follows this order:
 5. `PipelineOrchestrator` calls `FrameTransformationLayerInterface.get_frame(camera_id, CURRENT, full_frame_bbox, motion_contract.output_image_type, motion_contract.geometry_spec)` → `current_processed`.
 6. `PipelineOrchestrator` calls `FrameTransformationLayerInterface.get_frame(camera_id, PREVIOUS, full_frame_bbox, motion_contract.output_image_type, motion_contract.geometry_spec)` → `previous_processed`. If the FTL raises `PreviousFrameNotAvailableError` (cold start — no PREVIOUS for this `camera_id` yet) → return empty `PipelineResult` immediately. Cold start does not proceed to Motion Detection.
 7. `PipelineOrchestrator` constructs `MotionDetectionInput{current_frame, previous_frame}` and calls `MotionDetectionInterface.detect(MotionDetectionInput)` → `MotionResult`. If `detected == false` → return empty `PipelineResult`.
-8. For each `motion_region_bbox` in `MotionResult.bboxes`: `PipelineOrchestrator` calls `FrameTransformationLayerInterface.get_frame(camera_id, CURRENT, motion_region_bbox, object_detection_contract.output_image_type, object_detection_contract.geometry_spec)` → `ProcessedFrame` (motion ROI image + spatial metadata). The motion-region crop defines a new ROI-local coordinate space. `PipelineOrchestrator` constructs `ObjectDetectionInput{frame_id, camera_id, timestamp_ms, roi_image=ProcessedFrame.image, roi_bbox_frame=motion_region_bbox, width=ProcessedFrame.image.width, height=ProcessedFrame.image.height}` — Object Detection receives the ROI image with its dimensions and the ROI position in full-frame coordinates. `PipelineOrchestrator` calls `ObjectDetectionInterface.detect(ObjectDetectionInput)` → `PersonDetectionResult`. `PersonDetectionResult.persons` are ROI-local coordinates relative to `ObjectDetectionInput.roi_image`.
-9. For each ROI-local `person_bbox` in `PersonDetectionResult.persons`: `PipelineOrchestrator` calls `SpatialCoordinator.project_bbox_to_full_frame(person_bbox, ProcessedFrame.source_bbox_full_frame)` using the motion ROI spatial metadata → projected `BoundingBox` (full-frame person bbox); creates `PersonResult{person_bbox, recognized_faces=[]}` and accumulates it into `PipelineResult.persons`.
+8. For each `motion_region_bbox` in `MotionResult.bboxes`: `PipelineOrchestrator` calls `FrameTransformationLayerInterface.get_frame(camera_id, CURRENT, motion_region_bbox, object_detection_contract.output_image_type, object_detection_contract.geometry_spec)` → `ProcessedFrame` (motion ROI image + spatial metadata). The motion-region crop defines a new ROI-local coordinate space. `PipelineOrchestrator` constructs `ObjectDetectionInput{frame_id, camera_id, timestamp_ms, roi_image=ProcessedFrame.image, roi_bbox_frame=motion_region_bbox}` — Object Detection receives the ROI image (which carries its own width and height inside the `Image` struct) and the ROI position in full-frame coordinates. `PipelineOrchestrator` calls `ObjectDetectionInterface.detect(ObjectDetectionInput)` → `PersonDetectionResult`. `PersonDetectionResult.persons` are ROI-local coordinates relative to `ObjectDetectionInput.roi_image`.
+9. For each ROI-local `person_bbox` in `PersonDetectionResult.persons`: `PipelineOrchestrator` calls `SpatialCoordinator.project_bbox_to_full_frame(person_bbox, ProcessedFrame.source_bbox_full_frame, ProcessedFrame.spatial_transform)` using the motion ROI spatial metadata → projected `BoundingBox` (full-frame person bbox); creates `PersonResult{person_bbox, recognized_faces=[]}` and accumulates it into `PipelineResult.persons`.
 10. If `PipelineResult.persons` is empty → return `PipelineResult` (empty persons, empty faces).
 11. For each `PersonResult` in `PipelineResult.persons`: `PipelineOrchestrator` calls `FrameTransformationLayerInterface.get_frame(camera_id, CURRENT, PersonResult.person_bbox, face_detection_contract.output_image_type, face_detection_contract.geometry_spec)` → `ProcessedFrame` (person ROI image + spatial metadata). The person-region crop defines another ROI-local coordinate space. `PipelineOrchestrator` constructs `FaceDetectionInput{frame_id, camera_id, timestamp_ms, roi_image=ProcessedFrame.image}` — Face Detection receives only the ROI image, never the full frame, `roi_bbox_frame`, or spatial metadata. `PipelineOrchestrator` calls `FaceDetectionInterface.detect_faces(FaceDetectionInput)` → `FaceDetectionOutput`. If `FaceDetectionOutput.detections` is empty → skip this person; continue to next. `FaceDetectionOutput.detections` carries zero or more `DetectedFace` entries; each `DetectedFace.face_bbox` is in ROI-local coordinates relative to the person ROI image.
-12. For each ROI-local `DetectedFace` in `FaceDetectionOutput.detections`: `PipelineOrchestrator` calls `SpatialCoordinator.project_bbox_to_full_frame(DetectedFace.face_bbox, ProcessedFrame.source_bbox_full_frame)` using the person ROI spatial metadata → projected full-frame face bbox. Before constructing `FaceRecognitionInput`, `PipelineOrchestrator` re-expresses `DetectedFace.landmarks` in face-crop-local coordinates by subtracting the face bbox origin: for each landmark `lm`, `face_local_lm.x = lm.x - DetectedFace.face_bbox.x` and `face_local_lm.y = lm.y - DetectedFace.face_bbox.y`. `PipelineOrchestrator` then calls `FrameTransformationLayerInterface.get_frame(camera_id, CURRENT, projected_face_bbox, face_recognition_contract.output_image_type, face_recognition_contract.geometry_spec)` → face ROI `ProcessedFrame`. `PipelineOrchestrator` constructs `FaceRecognitionInput{frame_id, camera_id, timestamp_ms, face_roi_image=ProcessedFrame.image, landmarks=face_crop_local_landmarks}`; calls `FaceRecognitionInterface.recognize(FaceRecognitionInput)` → `FaceRecognitionOutput`. Face Recognition receives only the face ROI image — no full-frame data, ROI bbox metadata, or spatial metadata. If recognition succeeds (`person_found = true`), `PipelineOrchestrator` performs an identity enrichment lookup using `FaceRecognitionOutput.person_id` to retrieve `person_name`, then appends `RecognizedFaceResult{face_bbox=projected_face_bbox, person_id, person_name}` into the current `PersonResult.recognized_faces`. If recognition fails (`person_found = false`), the face is omitted entirely — no entry is added.
+12. For each ROI-local `DetectedFace` in `FaceDetectionOutput.detections`: `PipelineOrchestrator` calls `SpatialCoordinator.project_bbox_to_full_frame(DetectedFace.face_bbox, ProcessedFrame.source_bbox_full_frame, ProcessedFrame.spatial_transform)` using the person ROI spatial metadata → projected full-frame face bbox. Before constructing `FaceRecognitionInput`, `PipelineOrchestrator` re-expresses `DetectedFace.landmarks` in face-crop-local coordinates by subtracting the face bbox origin: for each landmark `lm`, `face_local_lm.x = lm.x - DetectedFace.face_bbox.x` and `face_local_lm.y = lm.y - DetectedFace.face_bbox.y`. `PipelineOrchestrator` then calls `FrameTransformationLayerInterface.get_frame(camera_id, CURRENT, projected_face_bbox, face_recognition_contract.output_image_type, face_recognition_contract.geometry_spec)` → face ROI `ProcessedFrame`. `PipelineOrchestrator` constructs `FaceRecognitionInput{frame_id, camera_id, timestamp_ms, face_roi_image=ProcessedFrame.image, landmarks=face_crop_local_landmarks}`; calls `FaceRecognitionInterface.recognize(FaceRecognitionInput)` → `FaceRecognitionOutput`. Face Recognition receives only the face ROI image — no full-frame data, ROI bbox metadata, or spatial metadata. If recognition succeeds (`person_found = true`), `PipelineOrchestrator` calls `PersonDirectory.get_person(FaceRecognitionOutput.person_id)` → `PersonDirectoryOutput`; uses `PersonDirectoryOutput.person_name` for the enriched result (if `PersonDirectoryOutput.found = false`, `person_name = "UNKNOWN"`); if `PersonDirectory.get_person()` raises an exception, `PipelineOrchestrator` catches it and uses deterministic UNKNOWN fallback (`person_id = "UNKNOWN"`, `person_name = "UNKNOWN"`, `found = false`) — the face is still appended and no exception propagates; then appends `RecognizedFaceResult{face_bbox=projected_face_bbox, person_id, person_name}` into the current `PersonResult.recognized_faces`. If recognition fails (`person_found = false`), the face is omitted entirely — no entry is added.
 13. `SpatialCoordinator` is invoked after Object Detection (using motion ROI spatial metadata to project person bboxes) and after Face Detection (using person ROI spatial metadata to project face bboxes). No ROI-local coordinates appear in `PipelineResult` or `RecognitionPipelineOutput`.
 14. `PipelineOrchestrator` returns `PipelineResult` to `RecognitionPipelineManager`.
 15. `RecognitionPipelineManager` calls `RecognitionPipelineOutputBuilder.build(frame_id, camera_id, timestamp_ms, PipelineResult)` → `RecognitionPipelineOutput`.
@@ -567,7 +624,7 @@ For one invocation of `process_frame`, the internal pipeline follows this order:
 
 All intermediate data (Frame Transformation Layer outputs, ROI-local bounding boxes, face embeddings, motion region data, pipeline routing flags, `ProcessedFrame`) remain strictly internal to the module.
 
-### 8.9 Concurrency Model
+### 8.10 Concurrency Model
 
 - `RecognitionPipelineManager` is safe for parallel calls targeting different `camera_id` values when the `FrameTransformationLayerInterface` implementation is concurrency-safe.
 - `RecognitionPipelineManager` owns one `PipelineOrchestrator` instance and holds no per-camera mutable state.
@@ -609,6 +666,7 @@ Injection at construction time:
 - `FaceDetectionInterface` implementation → injected into `PipelineOrchestrator` as the face detection engine; its `PipelineStageInputContract` is queried at initialization and used for all Face Detection frame data requests
 - `FaceRecognitionInterface` implementation → injected into `PipelineOrchestrator` as the face recognition engine; its `PipelineStageInputContract` is queried at initialization and used for all Face Recognition frame data requests
 - `SpatialCoordinator` → injected into `PipelineOrchestrator` for person detection coordinate projection
+- `PersonDirectory` → injected into `PipelineOrchestrator` for `person_id` → `person_name` resolution; startup `PersonDirectory.load()` is recommended before runtime traffic, while lookup remains fail-safe (`found = false` / UNKNOWN) if startup load is delayed or unavailable
 
 ---
 
@@ -621,7 +679,9 @@ Injection at construction time:
 - **`MotionResult`** — result of the motion detection stage; contains a `detected` flag and, when `detected = true`, motion region bounding boxes relative to `MotionDetectionInput.current_frame.image`; because the full current frame is supplied to Motion Detection, these bboxes serve as crop regions over the full current frame; produced by `MotionDetectionInterface`, consumed by `PipelineOrchestrator`; lifecycle: per-call
 - **`PersonDetectionResult`** — result of object detection for one motion-region crop; contains zero or more person bounding boxes in ROI-local coordinates; produced by `ObjectDetectionInterface`, consumed by `PipelineOrchestrator`; lifecycle: per-call
 - **`FaceDetectionOutput`** — result of face detection for one person-region crop; contains zero or more `DetectedFace` entries each carrying a face bbox in ROI-local coordinates relative to the person ROI image, and canonical `FaceLandmarks`; these ROI-local coordinates must never be exposed publicly; `SpatialCoordinator` projects each face bbox to full-frame coordinates using the person ROI spatial metadata before any further use; produced by `FaceDetectionInterface`, consumed by `PipelineOrchestrator`; lifecycle: per-call
-- **`FaceRecognitionOutput`** — result of face recognition for one face-region crop; contains `person_found` flag and, when `person_found = true`, `person_id` only; `person_name` is not part of `FaceRecognitionOutput` — it is resolved via identity enrichment by `PipelineOrchestrator` after recognition; produced by `FaceRecognitionInterface`, consumed by `PipelineOrchestrator`; lifecycle: per-call
+- **`FaceRecognitionOutput`** — result of face recognition for one face-region crop; contains `person_found` flag and, when `person_found = true`, `person_id` only; `person_name` is not part of `FaceRecognitionOutput` — it is resolved by `PersonDirectory` after recognition; produced by `FaceRecognitionInterface`, consumed by `PipelineOrchestrator`; lifecycle: per-call
+- **`PersonRecord`** — resolved person identity record containing `person_id` and `person_name`; stored in `PersonDirectoryStore`; consumed by `PersonDirectory.get_person()` to construct `PersonDirectoryOutput`; lifecycle: persistent
+- **`PersonDirectoryOutput`** — result of a `PersonDirectory.get_person()` call; contains `person_id`, `person_name`, and `found` flag; produced by `PersonDirectory`, consumed by `PipelineOrchestrator` for identity enrichment; `person_name = "UNKNOWN"` and `found = false` when the `person_id` is unresolvable; lifecycle: per-call
 - **`PipelineResult`** — accumulated pipeline output for one frame; formally defined as:
 
   ```text
@@ -646,6 +706,8 @@ Injection at construction time:
 - **Invalid projection bbox** (source or local bounding box has zero or negative dimensions) → `SpatialCoordinator` discards the affected result; the corresponding `PersonResult` is omitted from `PipelineResult`; remaining projected results are returned normally
 - **Pipeline stage runtime failure** (any pipeline stage interface raises a runtime exception during Motion Detection or Motion Detection input preparation) → catch internally within `PipelineOrchestrator`; return `RecognitionPipelineOutput` with `persons = []`; for Object Detection, Face Detection, and Face Recognition stage failures on individual regions, skip only the affected region and continue with remaining results
 - **Recognition failure for a detected face** (Face Recognition returns `person_found = false`) → omit the face entirely from `recognized_faces`; do NOT add any placeholder or partial entry
+- **`PersonDirectory` lookup failure** (`person_id` is unknown, empty, or equals `"UNKNOWN"`) → `PersonDirectory.get_person()` returns canonical UNKNOWN output (`person_name = "UNKNOWN"`, `found = false`); `PipelineOrchestrator` still appends `RecognizedFaceResult` with `person_name = "UNKNOWN"`; the pipeline is not interrupted
+- **`PersonDirectory.get_person()` raises an exception** (unexpected runtime error during enrichment) → `PipelineOrchestrator` catches the exception; uses deterministic UNKNOWN fallback (`person_id = "UNKNOWN"`, `person_name = "UNKNOWN"`, `found = false`); the face is still appended to `recognized_faces`; no exception propagates to the pipeline level
 
 Partial results are returned whenever possible. Raw Frame Transformation Layer errors are never exposed in `RecognitionPipelineOutput`. The module always returns a structurally valid output.
 
@@ -667,6 +729,8 @@ All metrics are scoped by `camera_id` extracted from the `FramePacket`. Metrics 
 - `recognized_faces_count` — total `RecognizedFaceResult` entries successfully appended into `recognized_faces` per invocation, scoped by `camera_id`
 - `projection_error_count` — person bboxes discarded due to invalid projection parameters, scoped by `camera_id`
 - `validation_failure_count` — inputs rejected by `RecognitionPipelineInputValidator`
+- `person_directory_lookup_count` — `PersonDirectory.get_person()` calls per invocation, scoped by `camera_id`
+- `person_directory_unknown_lookup_count` — `PersonDirectory.get_person()` calls that returned `found = false` per invocation, scoped by `camera_id`
 
 Metrics are internal and operational. Not part of the public API.
 
@@ -683,6 +747,7 @@ Injection at initialization time:
 - `RecognitionPipelineManagerConfig` — loaded from the configuration source; immutable after initialization
 - `FrameTransformationLayerInterface` implementation — **required**; must be fully initialized before any pipeline execution begins
 - One `PipelineOrchestrator` instance — all four pipeline stage interfaces, their stage-defined `PipelineStageInputContract` values (queried from each interface via `get_input_contract()`), the Frame Transformation Layer interface, and `SpatialCoordinator` are injected into the `PipelineOrchestrator`; no per-camera mutable state is held in `RecognitionPipelineManager` or `PipelineOrchestrator`
+- `PersonDirectory` startup load is recommended at initialization: `PersonDirectory.load(PersonDirectoryConfig)` is called so person metadata is in memory before normal runtime traffic; if startup load is delayed or fails, runtime lookup remains fail-safe (UNKNOWN) and no JSON file I/O occurs during `process_frame`
 - All internal components are wired before the first invocation
 
 ### 13.2 Per Invocation
@@ -718,11 +783,22 @@ classDiagram
     }
 
     class SpatialCoordinator {
-        +project_bbox_to_full_frame(local_bbox: BoundingBox, source_bbox_full_frame: BoundingBox) BoundingBox
+        +project_bbox_to_full_frame(local_bbox: BoundingBox, source_bbox_full_frame: BoundingBox, spatial_transform: SpatialTransform) BoundingBox
     }
 
     class RecognitionPipelineOutputBuilder {
         +build(frame_id: string, camera_id: string, timestamp_ms: uint64, result: PipelineResult) RecognitionPipelineOutput
+    }
+
+    class PersonDirectory {
+        +load(config: PersonDirectoryConfig) void
+        +get_person(person_id: string) PersonDirectoryOutput
+    }
+
+    class PersonDirectoryOutput {
+        +person_id: string
+        +person_name: string
+        +found: bool
     }
 
     class FrameTemporalSelector {
@@ -793,6 +869,7 @@ classDiagram
     PipelineOrchestrator --> FaceDetectionInterface : orchestrates
     PipelineOrchestrator --> FaceRecognitionInterface : orchestrates
     PipelineOrchestrator --> SpatialCoordinator : projects person bboxes via
+    PipelineOrchestrator --> PersonDirectory : resolves person_id via
     RecognitionPipelineManager --> RecognitionPipelineOutput : returns
     RecognitionPipelineOutput --> PersonResult : contains
     PersonResult --> RecognizedFaceResult : contains
@@ -815,6 +892,7 @@ sequenceDiagram
     participant SC as SpatialCoordinator
     participant FaceDet as FaceDetection
     participant FaceRec as FaceRecognition
+    participant PD as PersonDirectory
     participant Builder as OutputBuilder
 
     ExternalCaller->>RPM: process_frame(frame_packet)
@@ -862,7 +940,8 @@ sequenceDiagram
                     Orch->>FaceRec: recognize(FaceRecognitionInput — face_roi_image only)
                     alt recognition succeeded
                         FaceRec-->>Orch: FaceRecognitionOutput (person_found=true)
-                        Note over Orch: identity enrichment — lookup person_name using person_id
+                        Orch->>PD: get_person(person_id)
+                        PD-->>Orch: PersonDirectoryOutput{person_id, person_name, found}
                         Note over Orch: append RecognizedFaceResult{face_bbox, person_id, person_name} to PersonResult.recognized_faces
                     else recognition failed
                         FaceRec-->>Orch: FaceRecognitionOutput (person_found=false)
@@ -899,7 +978,7 @@ flowchart TD
     K["FaceDetectionInput construction (roi_image only)<br/>+ FaceDetectionInterface<br/>FaceDetectionOutput<br/>(face bboxes — ROI-local, relative to person ROI image · landmarks)"]
     K2["SpatialCoordinator<br/>project ROI-local face bbox to full-frame<br/>(using person ROI spatial metadata)<br/>→ projected full-frame face bbox"]
     L["FrameTransformationLayerInterface.get_frame<br/>(camera_id, CURRENT, projected_face_bbox_full_frame)<br/>OutputImageType + GeometrySpec → recognition stage<br/>ProcessedFrame (face ROI image)"]
-    M["FaceRecognitionInput construction (face_roi_image only)<br/>(face_roi_image + landmarks from FaceDetectionOutput)<br/>+ FaceRecognitionInterface<br/>FaceRecognitionOutput<br/>(person_found · person_id)<br/>→ if person_found: identity enrichment lookup (person_id → person_name)<br/>→ append RecognizedFaceResult{face_bbox, person_id, person_name} to PersonResult.recognized_faces<br/>→ if not: omit face entirely"]
+    M["FaceRecognitionInput construction (face_roi_image only)<br/>(face_roi_image + landmarks from FaceDetectionOutput)<br/>+ FaceRecognitionInterface<br/>FaceRecognitionOutput<br/>(person_found · person_id)<br/>→ if person_found: PersonDirectory.get_person(person_id) → PersonDirectoryOutput.person_name<br/>→ append RecognizedFaceResult{face_bbox, person_id, person_name} to PersonResult.recognized_faces<br/>→ if not: omit face entirely"]
     N["RecognitionPipelineOutputBuilder<br/>RecognitionPipelineOutput"]
     O["Caller<br/>RecognitionPipelineOutput"]
     CS["Cold start: FTL raises PreviousFrameNotAvailableError for PREVIOUS<br/>→ return empty output immediately"]
@@ -939,7 +1018,7 @@ flowchart TD
 - Per-stage `OutputImageType` and `GeometrySpec` values (stage-defined input contract change — updated in the stage implementation)
 - The projection algorithm inside `SpatialCoordinator` — provided the full-frame coordinate guarantee for person bboxes is preserved
 - The internal mechanism by which the Frame Transformation Layer manages per-camera CURRENT/PREVIOUS temporal state — provided the `get_frame` and `ingest_frame` interface contracts are preserved
-- The identity enrichment mechanism (person_name lookup by person_id) — provided the enrichment produces a valid `person_name` for every recognized identity
+- The `PersonDirectory` implementation and JSON file path — the in-memory store contents and source file may change without affecting the `RecognitionPipelineOutput` schema, provided `get_person()` always returns a valid `PersonDirectoryOutput`
 
 **What must remain stable:**
 
@@ -998,6 +1077,11 @@ flowchart TD
 - [ ] Only recognized faces appear in the public output — unrecognized faces are never exposed
 - [ ] One `FramePacket` per invocation — the module must not accept or process batched input
 - [ ] All bounding boxes in `RecognitionPipelineOutput` are in full-frame coordinates — no ROI-local coordinates may appear in the output
+- [ ] `PersonDirectory` is loaded at initialization; no JSON file I/O occurs during `process_frame`
+- [ ] `PipelineOrchestrator` calls `PersonDirectory.get_person(person_id)` after face recognition returns `person_found = true`
+- [ ] `PersonDirectory.get_person()` raising an exception during enrichment does not crash the pipeline — `PipelineOrchestrator` catches it and falls back to UNKNOWN metadata; the face is still appended to `recognized_faces`
+- [ ] Unknown or unresolvable `person_id` from face recognition results in `person_name = "UNKNOWN"` in `RecognizedFaceResult`; the face is not omitted from `recognized_faces`
+- [ ] `PersonDirectory` is not depended on by face recognition, gallery loader, or any pipeline stage implementation
 - [ ] Coordinate projection by `SpatialCoordinator` — for person bboxes after Object Detection (using motion ROI spatial metadata) and for face bboxes after Face Detection (using person ROI spatial metadata)
 - [ ] No detection score or similarity score exposure — no score or confidence value from any pipeline stage may appear in `RecognitionPipelineOutput`
 - [ ] No embedding exposure — no face embedding or feature vector from any pipeline stage may appear in `RecognitionPipelineOutput`

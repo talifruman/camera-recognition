@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-from image_processing.shared.contracts import Image
+from image_processing.shared.contracts import (
+    BoundingBox,
+    FaceLandmarks,
+    Image,
+    Point,
+)
 
 from .module import (
     AcceptedDetection,
-    BoundingBox,
     DetectedFace,
     DetectorInputContract,
     FaceDetectionConfig,
@@ -15,8 +19,6 @@ from .module import (
     FaceDetectionOutputBuilder,
     FaceDetectionPostprocessor,
     FaceDetectorEngine,
-    FaceLandmarks,
-    Point,
     RawFaceDetection,
 )
 from .scrfd_detector import SCRFDFaceDetector

@@ -1,0 +1,7 @@
+implementation_type: "stub"
+
+model_path: "TODO"
+
+recognition_threshold: 0.4
+
+embedding_dimension: 512

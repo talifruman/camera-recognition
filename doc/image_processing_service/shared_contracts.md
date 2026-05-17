@@ -48,9 +48,7 @@ Every field, function parameter, and return value that uses `BoundingBox` must e
 ```text
 enum ResizePolicy {
     NONE,
-    STRETCH,
-    LETTERBOX,
-    PRESERVE_ASPECT_RATIO
+    LETTERBOX
 }
 ```
 
@@ -58,10 +56,8 @@ enum ResizePolicy {
 
 | Value | Behavior |
 |-------|----------|
-| `NONE` | No resize is applied. The image is returned at its natural cropped size. `width` and `height` in `GeometrySpec` are ignored. |
-| `STRETCH` | The image is resized to exactly `(width, height)`. Aspect ratio is not preserved. |
+| `NONE` | No resize is applied. The image is returned at its natural cropped size. `width` and `height` in `GeometrySpec` are ignored. Placeholder values `0`/`0` are valid for stage contracts. |
 | `LETTERBOX` | The image is resized to fit within `(width, height)` while preserving aspect ratio. Padding is added on the shorter axis to fill the target canvas. Padding color is implementation-defined (typically black). |
-| `PRESERVE_ASPECT_RATIO` | The image is resized to fit within `(width, height)` while preserving aspect ratio. No padding is added; the output may be smaller than `(width, height)` on one axis. |
 
 ---
 
@@ -79,8 +75,8 @@ struct GeometrySpec {
 
 ### Rules
 
-- If `resize_policy` is `NONE`, `width` and `height` are ignored. Implementations may omit or zero them.
-- If `resize_policy` is `STRETCH` or `LETTERBOX` or `PRESERVE_ASPECT_RATIO`, `width` and `height` must be positive (`> 0`).
+- If `resize_policy` is `NONE`, `width` and `height` are ignored. `width = 0` and `height = 0` are valid placeholders. Implementations may also omit these values.
+- If `resize_policy` is `LETTERBOX`, `width` and `height` must be positive (`> 0`).
 - `GeometrySpec` is consumed by the Frame Transformation Layer to prepare the output image geometry for a given `get_frame` call.
 - Each pipeline stage declares its required `GeometrySpec` through `get_input_contract()`.
 
@@ -97,26 +93,24 @@ The Frame Transformation Layer may extend the `LETTERBOX` behavior with an optio
 ```text
 enum OutputImageType {
     GRAYSCALE_UINT8_HWC,
-    RGB_UINT8_HWC,
-    RGB_FLOAT32_HWC_NORMALIZED_0_TO_1,
-    RGB_FLOAT32_HWC_NORMALIZED_MINUS1_TO_1
+    RGB_UINT8_HWC
 }
 ```
 
 ### Contract per Value
 
 | Value | Color Format | Layout | dtype | Value Range | Channel Order | Shape Convention |
-|-------|-------------|--------|-------|-------------|---------------|-----------------|
+|-------|-------------|--------|-------|-------------|---------------|------------------|
 | `GRAYSCALE_UINT8_HWC` | Grayscale | HWC | uint8 | [0, 255] | Single channel (no channel dim, or last dim = 1) | (H, W) or (H, W, 1) |
 | `RGB_UINT8_HWC` | RGB | HWC | uint8 | [0, 255] | R, G, B | (H, W, 3) |
-| `RGB_FLOAT32_HWC_NORMALIZED_0_TO_1` | RGB | HWC | float32 | [0.0, 1.0] | R, G, B | (H, W, 3) |
-| `RGB_FLOAT32_HWC_NORMALIZED_MINUS1_TO_1` | RGB | HWC | float32 | [-1.0, 1.0] | R, G, B | (H, W, 3) |
 
 ### Rules
 
 - The Frame Transformation Layer maps each `OutputImageType` to exactly one hardcoded pixel-format conversion contract. No caller-supplied conversion parameters are accepted.
 - `OutputImageType` defines pixel representation only. Geometry (resize, letterbox) is defined by `GeometrySpec`.
 - Each pipeline stage must declare the `OutputImageType` it requires through `get_input_contract()`.
+- **Shared `OutputImageType` values describe pipeline-level image formats only.** Model-specific normalization must be performed inside the model-owning module.
+- Face Recognition does not request normalized images from FTL. ArcFace normalization to `[-1,1]` is internal to `ArcFaceEmbeddingEngine`.
 
 ---
 
@@ -175,7 +169,7 @@ struct Image {
 | `color_format` | `RGB`, `BGR`, `GRAY` | Pixel color representation. |
 | `layout` | `HWC`, `CHW` | Memory layout of the pixel buffer. |
 | `dtype` | `uint8`, `float32` | Element data type of the pixel buffer. |
-| `value_range` | `[0,255]`, `[0,1]`, `[-1,1]` | Nominal value range of pixel elements. |
+| `value_range` | `[0,255]` | Nominal value range of pixel elements. |
 
 ### OutputImageType to Image Field Mapping
 
@@ -185,8 +179,6 @@ Each `OutputImageType` value (§4) maps to exactly one valid combination of `Ima
 |----------------|--------------|--------|-------|-------------|
 | `GRAYSCALE_UINT8_HWC` | `GRAY` | `HWC` | `uint8` | `[0,255]` |
 | `RGB_UINT8_HWC` | `RGB` | `HWC` | `uint8` | `[0,255]` |
-| `RGB_FLOAT32_HWC_NORMALIZED_0_TO_1` | `RGB` | `HWC` | `float32` | `[0,1]` |
-| `RGB_FLOAT32_HWC_NORMALIZED_MINUS1_TO_1` | `RGB` | `HWC` | `float32` | `[-1,1]` |
 
 ### Rules
 
@@ -196,8 +188,17 @@ Each `OutputImageType` value (§4) maps to exactly one valid combination of `Ima
 - Public APIs must NOT expose raw `np.ndarray` directly. All image payloads crossing a public module boundary must be carried in an `Image` struct.
 - Validators MAY compare `image.width` and `image.height` against `image.data.shape` for consistency verification.
 - `Image.data.shape`, `Image.color_format`, `Image.layout`, `Image.dtype`, and `Image.value_range` must all be mutually consistent and must match the declared `OutputImageType` for the pipeline stage. An `Image` whose metadata fields are inconsistent or do not match the declared `OutputImageType` is invalid input.
+- `Image.data` must be treated as read-only by downstream consumers unless a module contract explicitly states otherwise.
+- Consumers must not mutate `Image.data` in-place across module boundaries.
+- Whether an implementation returns a defensive copy or a shared reference is an implementation detail. Callers must not rely on mutability behavior or ownership details.
 - `BaseImage` is not a public or shared contract type. It is an FTL-internal concept only.
 - `FrameBuffer` is not a public or shared contract type. It is an FTL-internal processing type only.
+
+### Image.data Ownership and Mutability Rationale
+
+- The read-only consumer rule avoids forcing defensive copies at every module boundary.
+- Keeping copy/reference behavior as an implementation detail preserves performance flexibility.
+- Treating shared image buffers as immutable by contract keeps pipeline behavior safe and predictable.
 
 ---
 

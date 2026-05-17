@@ -6,13 +6,10 @@ from .module import (
     FaceGalleryCache,
     FaceGalleryLoaderConfig,
     FaceGalleryLoaderModule,
-    GalleryEntry,
+    LoadedGalleryEmbedding,
     GalleryLoadError,
     GalleryPathValidationError,
-    GalleryPathValidator,
-    GalleryDirectoryScanner,
     NpyEmbeddingFileReader,
-    PersonScanRecord,
     StubEmbeddingFileReader,
 )
 
@@ -22,12 +19,9 @@ __all__ = [
     "FaceGalleryCache",
     "FaceGalleryLoaderConfig",
     "FaceGalleryLoaderModule",
-    "GalleryDirectoryScanner",
-    "GalleryEntry",
+    "LoadedGalleryEmbedding",
     "GalleryLoadError",
     "GalleryPathValidationError",
-    "GalleryPathValidator",
     "NpyEmbeddingFileReader",
-    "PersonScanRecord",
     "StubEmbeddingFileReader",
 ]

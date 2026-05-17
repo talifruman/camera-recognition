@@ -11,16 +11,23 @@ SRC_DIR = Path(__file__).resolve().parents[2] / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from image_processing.motion_detection import (  # type: ignore[import-not-found]
+from image_processing.shared.contracts import (  # type: ignore[import-not-found]
     BoundingBox,
-    FramePacket,
+    GeometrySpec,
+    Image,
+    OutputImageType,
+    ResizePolicy,
+)
+from image_processing.motion_detection import (  # type: ignore[import-not-found]
     FrameDifferencingMotionDetector,
     InputValidator,
     MotionDetectionAlgorithm,
     MotionDetectionConfig,
     MotionDetectionInput,
+    MotionDetectionInterface,
     MotionDetectionManager,
     MotionDetectionResultInternal,
+    MotionInputFrame,
     MotionMeasurementResult,
     MotionResult,
     StubMotionDetectionAlgorithm,
@@ -32,9 +39,93 @@ from image_processing.motion_detection import (  # type: ignore[import-not-found
 # ---------------------------------------------------------------------------
 
 
-def _make_gray_image(height: int = 64, width: int = 64) -> np.ndarray:
-    """Return a valid GRAY HWC uint8 image with the given dimensions."""
-    return np.zeros((height, width), dtype=np.uint8)
+def _make_image(height: int = 64, width: int = 64) -> Image:
+    """Return a valid GRAYSCALE_UINT8_HWC Image struct."""
+    return Image(
+        data=np.zeros((height, width), dtype=np.uint8),
+        width=width,
+        height=height,
+        color_format="GRAY",
+        layout="HWC",
+        dtype="uint8",
+        value_range="[0,255]",
+    )
+
+
+def _make_image_3d(height: int = 64, width: int = 64) -> Image:
+    """Return a valid GRAYSCALE_UINT8_HWC Image struct with (H,W,1) data."""
+    return Image(
+        data=np.zeros((height, width, 1), dtype=np.uint8),
+        width=width,
+        height=height,
+        color_format="GRAY",
+        layout="HWC",
+        dtype="uint8",
+        value_range="[0,255]",
+    )
+
+
+def _make_image_from_array(arr: np.ndarray) -> Image:
+    height, width = arr.shape[:2]
+    return Image(
+        data=arr,
+        width=width,
+        height=height,
+        color_format="GRAY",
+        layout="HWC",
+        dtype="uint8",
+        value_range="[0,255]",
+    )
+
+
+def _make_textured_scene(height: int = 192, width: int = 256, seed: int = 7) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    scene = rng.integers(30, 120, size=(height, width), dtype=np.uint8)
+
+    for y in range(0, height, 24):
+        cv2.line(scene, (0, y), (width - 1, y), 140 + (y % 50), 1)
+    for x in range(0, width, 24):
+        cv2.line(scene, (x, 0), (x, height - 1), 80 + (x % 60), 1)
+
+    cv2.rectangle(scene, (20, 20), (70, 70), 220, -1)
+    cv2.rectangle(scene, (width - 90, 25), (width - 35, 85), 15, -1)
+    cv2.circle(scene, (width // 2, height // 2), 26, 200, 3)
+    cv2.circle(scene, (width // 3, height // 3), 14, 250, -1)
+    cv2.putText(scene, "RPM", (width // 2 - 40, height - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.8, 210, 2, cv2.LINE_AA)
+    return scene
+
+
+def _shift_image(image: np.ndarray, dx: float, dy: float) -> np.ndarray:
+    height, width = image.shape[:2]
+    transform = np.array([[1.0, 0.0, dx], [0.0, 1.0, dy]], dtype=np.float32)
+    return cv2.warpAffine(
+        image,
+        transform,
+        (width, height),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT_101,
+    )
+
+
+def _make_motion_input_from_arrays(
+    previous_image: np.ndarray,
+    current_image: np.ndarray,
+    camera_id: str = "cam-a",
+) -> MotionDetectionInput:
+    return MotionDetectionInput(
+        previous_frame=MotionInputFrame(
+            frame_id="frame_0001",
+            camera_id=camera_id,
+            timestamp_ms=1000,
+            image=_make_image_from_array(previous_image),
+        ),
+        current_frame=MotionInputFrame(
+            frame_id="frame_0002",
+            camera_id=camera_id,
+            timestamp_ms=2000,
+            image=_make_image_from_array(current_image),
+        ),
+    )
 
 
 def _make_frame(
@@ -44,13 +135,13 @@ def _make_frame(
     timestamp_ms: int = 1000,
     height: int = 64,
     width: int = 64,
-    image: np.ndarray | None = None,
-) -> FramePacket:
-    return FramePacket(
+    image: Image | None = None,
+) -> MotionInputFrame:
+    return MotionInputFrame(
         frame_id=frame_id,
         camera_id=camera_id,
         timestamp_ms=timestamp_ms,
-        image=image if image is not None else _make_gray_image(height, width),
+        image=image if image is not None else _make_image(height, width),
     )
 
 
@@ -125,46 +216,56 @@ class ValidationTests(unittest.TestCase):
         bad: MotionDetectionInput = {  # type: ignore[typeddict-item]
             "previous_frame": _make_frame(),
         }
-        self._assert_no_motion(manager.process(bad))
+        self._assert_no_motion(manager.detect(bad))
 
     def test_missing_previous_frame_returns_no_motion(self) -> None:
         manager = _make_manager()
         bad: MotionDetectionInput = {  # type: ignore[typeddict-item]
             "current_frame": _make_frame(),
         }
-        self._assert_no_motion(manager.process(bad))
+        self._assert_no_motion(manager.detect(bad))
 
     def test_empty_current_camera_id_returns_no_motion(self) -> None:
         manager = _make_manager()
         inp = _make_input()
         inp["current_frame"]["camera_id"] = ""
-        self._assert_no_motion(manager.process(inp))
+        self._assert_no_motion(manager.detect(inp))
 
     def test_empty_previous_camera_id_returns_no_motion(self) -> None:
         manager = _make_manager()
         inp = _make_input()
         inp["previous_frame"]["camera_id"] = ""
-        self._assert_no_motion(manager.process(inp))
+        self._assert_no_motion(manager.detect(inp))
 
     def test_camera_id_mismatch_returns_no_motion(self) -> None:
         manager = _make_manager()
         inp = _make_input()
         inp["previous_frame"]["camera_id"] = "cam-b"
-        self._assert_no_motion(manager.process(inp))
+        self._assert_no_motion(manager.detect(inp))
 
     def test_timestamp_ordering_violation_returns_no_motion(self) -> None:
         manager = _make_manager()
         # previous_ts > current_ts — violates spec §2.3
         inp = _make_input(current_ts=1000, previous_ts=2000)
-        self._assert_no_motion(manager.process(inp))
+        self._assert_no_motion(manager.detect(inp))
 
     def test_equal_timestamps_are_accepted(self) -> None:
         """previous_ts == current_ts is valid per spec (≤ relationship)."""
         manager = _make_manager()
         inp = _make_input(current_ts=1000, previous_ts=1000)
-        result = manager.process(inp)
+        result = manager.detect(inp)
         self.assertIn("detected", result)
         # Not checking detected value — just that it doesn't fail validation
+
+    def test_negative_current_timestamp_returns_no_motion(self) -> None:
+        manager = _make_manager()
+        inp = _make_input(current_ts=-1, previous_ts=-2)
+        self._assert_no_motion(manager.detect(inp))
+
+    def test_negative_previous_timestamp_returns_no_motion(self) -> None:
+        manager = _make_manager()
+        inp = _make_input(current_ts=1000, previous_ts=-1)
+        self._assert_no_motion(manager.detect(inp))
 
     def test_image_dimension_mismatch_returns_no_motion(self) -> None:
         manager = _make_manager()
@@ -172,32 +273,141 @@ class ValidationTests(unittest.TestCase):
             current_frame=_make_frame(height=64, width=64),
             previous_frame=_make_frame(height=32, width=32),
         )
-        self._assert_no_motion(manager.process(inp))
+        self._assert_no_motion(manager.detect(inp))
 
     def test_wrong_dtype_current_image_returns_no_motion(self) -> None:
         manager = _make_manager()
         inp = _make_input()
-        inp["current_frame"]["image"] = np.zeros((64, 64), dtype=np.float32)
-        self._assert_no_motion(manager.process(inp))
+        bad_image = Image(
+            data=np.zeros((64, 64), dtype=np.float32),
+            width=64, height=64,
+            color_format="GRAY", layout="HWC",
+            dtype="float32",
+            value_range="[0,255]",
+        )
+        inp["current_frame"]["image"] = bad_image
+        self._assert_no_motion(manager.detect(inp))
 
     def test_wrong_dtype_previous_image_returns_no_motion(self) -> None:
         manager = _make_manager()
         inp = _make_input()
-        inp["previous_frame"]["image"] = np.zeros((64, 64), dtype=np.float32)
-        self._assert_no_motion(manager.process(inp))
+        bad_image = Image(
+            data=np.zeros((64, 64), dtype=np.float32),
+            width=64, height=64,
+            color_format="GRAY", layout="HWC",
+            dtype="float32",
+            value_range="[0,255]",
+        )
+        inp["previous_frame"]["image"] = bad_image
+        self._assert_no_motion(manager.detect(inp))
 
-    def test_multichannel_non_gray_image_returns_no_motion(self) -> None:
+    def test_wrong_color_format_returns_no_motion(self) -> None:
         manager = _make_manager()
         inp = _make_input()
-        # 3-channel (RGB-like) image — violates GRAY contract
-        inp["current_frame"]["image"] = np.zeros((64, 64, 3), dtype=np.uint8)
-        self._assert_no_motion(manager.process(inp))
+        bad_image = Image(
+            data=np.zeros((64, 64, 3), dtype=np.uint8),
+            width=64, height=64,
+            color_format="RGB",
+            layout="HWC",
+            dtype="uint8",
+            value_range="[0,255]",
+        )
+        inp["current_frame"]["image"] = bad_image
+        self._assert_no_motion(manager.detect(inp))
+
+    def test_wrong_layout_returns_no_motion(self) -> None:
+        manager = _make_manager()
+        inp = _make_input()
+        bad_image = Image(
+            data=np.zeros((1, 64, 64), dtype=np.uint8),
+            width=64, height=64,
+            color_format="GRAY",
+            layout="CHW",
+            dtype="uint8",
+            value_range="[0,255]",
+        )
+        inp["current_frame"]["image"] = bad_image
+        self._assert_no_motion(manager.detect(inp))
+
+    def test_wrong_value_range_returns_no_motion(self) -> None:
+        manager = _make_manager()
+        inp = _make_input()
+        bad_image = Image(
+            data=np.zeros((64, 64), dtype=np.uint8),
+            width=64, height=64,
+            color_format="GRAY", layout="HWC", dtype="uint8",
+            value_range="[0,1]",
+        )
+        inp["current_frame"]["image"] = bad_image
+        self._assert_no_motion(manager.detect(inp))
+
+    def test_invalid_width_returns_no_motion(self) -> None:
+        manager = _make_manager()
+        inp = _make_input()
+        bad_image = Image(
+            data=np.zeros((64, 64), dtype=np.uint8),
+            width=0,
+            height=64,
+            color_format="GRAY", layout="HWC", dtype="uint8",
+            value_range="[0,255]",
+        )
+        inp["current_frame"]["image"] = bad_image
+        self._assert_no_motion(manager.detect(inp))
+
+    def test_invalid_height_returns_no_motion(self) -> None:
+        manager = _make_manager()
+        inp = _make_input()
+        bad_image = Image(
+            data=np.zeros((64, 64), dtype=np.uint8),
+            width=64,
+            height=0,
+            color_format="GRAY", layout="HWC", dtype="uint8",
+            value_range="[0,255]",
+        )
+        inp["current_frame"]["image"] = bad_image
+        self._assert_no_motion(manager.detect(inp))
+
+    def test_data_shape_mismatch_returns_no_motion(self) -> None:
+        """Declared width/height don't match data.shape."""
+        manager = _make_manager()
+        inp = _make_input()
+        bad_image = Image(
+            data=np.zeros((32, 32), dtype=np.uint8),
+            width=64,
+            height=64,
+            color_format="GRAY", layout="HWC", dtype="uint8",
+            value_range="[0,255]",
+        )
+        inp["current_frame"]["image"] = bad_image
+        self._assert_no_motion(manager.detect(inp))
+
+    def test_raw_ndarray_as_image_returns_no_motion(self) -> None:
+        """Passing a raw np.ndarray instead of an Image struct must fail."""
+        manager = _make_manager()
+        inp = _make_input()
+        inp["current_frame"]["image"] = np.zeros((64, 64), dtype=np.uint8)  # type: ignore[typeddict-item]
+        self._assert_no_motion(manager.detect(inp))
 
     def test_none_current_image_returns_no_motion(self) -> None:
         manager = _make_manager()
         inp = _make_input()
         inp["current_frame"]["image"] = None  # type: ignore[typeddict-item]
-        self._assert_no_motion(manager.process(inp))
+        self._assert_no_motion(manager.detect(inp))
+
+    def test_multichannel_non_gray_image_returns_no_motion(self) -> None:
+        """Image with color_format=RGB (not GRAY) must fail validation."""
+        manager = _make_manager()
+        inp = _make_input()
+        bad_image = Image(
+            data=np.zeros((64, 64, 3), dtype=np.uint8),
+            width=64, height=64,
+            color_format="RGB",
+            layout="HWC",
+            dtype="uint8",
+            value_range="[0,255]",
+        )
+        inp["current_frame"]["image"] = bad_image
+        self._assert_no_motion(manager.detect(inp))
 
 
 # ---------------------------------------------------------------------------
@@ -211,17 +421,17 @@ class StubPipelineTests(unittest.TestCase):
     def test_valid_input_returns_detected_true_at_default_threshold(self) -> None:
         # Default threshold 0.05; stub fraction 0.2 => detected=True
         manager = _make_stub_manager(motion_fraction_threshold=0.05)
-        result = manager.process(_make_input())
+        result = manager.detect(_make_input())
         self.assertTrue(result["detected"])
 
     def test_valid_input_returns_non_empty_bboxes_when_detected(self) -> None:
         manager = _make_stub_manager(motion_fraction_threshold=0.05)
-        result = manager.process(_make_input())
+        result = manager.detect(_make_input())
         self.assertGreater(len(result["bboxes"]), 0)
 
     def test_bbox_has_strictly_positive_dimensions(self) -> None:
         manager = _make_stub_manager()
-        result = manager.process(_make_input())
+        result = manager.detect(_make_input())
         for bbox in result["bboxes"]:
             self.assertGreater(bbox["width"], 0)
             self.assertGreater(bbox["height"], 0)
@@ -229,7 +439,7 @@ class StubPipelineTests(unittest.TestCase):
     def test_bbox_is_inside_current_image_bounds(self) -> None:
         h, w = 64, 80
         manager = _make_stub_manager()
-        result = manager.process(_make_input(height=h, width=w))
+        result = manager.detect(_make_input(height=h, width=w))
         for bbox in result["bboxes"]:
             self.assertGreaterEqual(bbox["x"], 0)
             self.assertGreaterEqual(bbox["y"], 0)
@@ -239,7 +449,7 @@ class StubPipelineTests(unittest.TestCase):
     def test_bbox_inside_bounds_for_minimal_image(self) -> None:
         """Even a 1×1 image must produce a valid in-bounds bbox."""
         manager = _make_stub_manager()
-        result = manager.process(_make_input(height=1, width=1))
+        result = manager.detect(_make_input(height=1, width=1))
         for bbox in result["bboxes"]:
             self.assertGreaterEqual(bbox["x"], 0)
             self.assertGreaterEqual(bbox["y"], 0)
@@ -251,39 +461,35 @@ class StubPipelineTests(unittest.TestCase):
     def test_detected_false_when_threshold_exceeds_stub_fraction(self) -> None:
         # Stub fraction is 0.2; threshold 0.5 => not detected
         manager = _make_stub_manager(motion_fraction_threshold=0.5)
-        result = manager.process(_make_input())
+        result = manager.detect(_make_input())
         self.assertFalse(result["detected"])
 
     def test_bboxes_empty_when_not_detected(self) -> None:
         manager = _make_stub_manager(motion_fraction_threshold=0.5)
-        result = manager.process(_make_input())
+        result = manager.detect(_make_input())
         self.assertEqual(result["bboxes"], [])
 
     def test_detected_true_at_exact_threshold(self) -> None:
         # Stub fraction = 0.2; threshold = 0.2 => motion_fraction >= threshold
         manager = _make_stub_manager(motion_fraction_threshold=0.2)
-        result = manager.process(_make_input())
+        result = manager.detect(_make_input())
         self.assertTrue(result["detected"])
 
     def test_result_is_deterministic(self) -> None:
         manager = _make_stub_manager()
         inp = _make_input()
-        result1 = manager.process(inp)
-        result2 = manager.process(inp)
+        result1 = manager.detect(inp)
+        result2 = manager.detect(inp)
         self.assertEqual(result1, result2)
 
     def test_result_with_single_channel_3d_image(self) -> None:
         """(H, W, 1) grayscale images must be accepted and processed."""
         manager = _make_stub_manager()
         inp = MotionDetectionInput(
-            current_frame=_make_frame(
-                image=np.zeros((64, 64, 1), dtype=np.uint8)
-            ),
-            previous_frame=_make_frame(
-                image=np.zeros((64, 64, 1), dtype=np.uint8)
-            ),
+            current_frame=_make_frame(image=_make_image_3d(64, 64)),
+            previous_frame=_make_frame(image=_make_image_3d(64, 64)),
         )
-        result = manager.process(inp)
+        result = manager.detect(inp)
         self.assertIn("detected", result)
         self.assertIn("bboxes", result)
 
@@ -298,7 +504,7 @@ class ManagerBehaviorTests(unittest.TestCase):
 
     def test_output_has_exactly_detected_and_bboxes_keys(self) -> None:
         manager = _make_manager()
-        result = manager.process(_make_input())
+        result = manager.detect(_make_input())
         self.assertEqual(set(result), {"detected", "bboxes"})
 
     def test_manager_does_not_mutate_input_dict(self) -> None:
@@ -311,7 +517,7 @@ class ManagerBehaviorTests(unittest.TestCase):
         current_img_id = id(inp["current_frame"]["image"])
         previous_img_id = id(inp["previous_frame"]["image"])
 
-        manager.process(inp)
+        manager.detect(inp)
 
         self.assertEqual(id(inp["current_frame"]), current_id)
         self.assertEqual(id(inp["previous_frame"]), previous_id)
@@ -324,27 +530,33 @@ class ManagerBehaviorTests(unittest.TestCase):
                 raise RuntimeError("simulated algorithm failure")
 
         manager = _make_manager(algorithm=ExplodingAlgorithm())  # type: ignore[arg-type]
-        result = manager.process(_make_input())
+        result = manager.detect(_make_input())
         self.assertFalse(result["detected"])
         self.assertEqual(result["bboxes"], [])
 
     def test_detected_is_bool(self) -> None:
         manager = _make_manager()
-        result = manager.process(_make_input())
+        result = manager.detect(_make_input())
         self.assertIsInstance(result["detected"], bool)
 
     def test_bboxes_is_list(self) -> None:
         manager = _make_manager()
-        result = manager.process(_make_input())
+        result = manager.detect(_make_input())
         self.assertIsInstance(result["bboxes"], list)
 
     def test_bbox_fields_are_correct_types(self) -> None:
         manager = _make_stub_manager()
-        result = manager.process(_make_input())
+        result = manager.detect(_make_input())
         self.assertTrue(result["detected"])
         bbox = result["bboxes"][0]
         for field_name in ("x", "y", "width", "height"):
             self.assertIsInstance(bbox[field_name], int, msg=f"{field_name} must be int")
+
+    def test_process_wrapper_calls_detect(self) -> None:
+        """process() deprecated wrapper must return same result as detect()."""
+        manager = _make_stub_manager()
+        inp = _make_input()
+        self.assertEqual(manager.process(inp), manager.detect(inp))
 
 
 # ---------------------------------------------------------------------------
@@ -364,12 +576,12 @@ class DeterminismTests(unittest.TestCase):
         manager1 = MotionDetectionManager(config=config)
         manager2 = MotionDetectionManager(config=config)
         inp = _make_input()
-        self.assertEqual(manager1.process(inp), manager2.process(inp))
+        self.assertEqual(manager1.detect(inp), manager2.detect(inp))
 
     def test_multiple_invocations_produce_identical_output(self) -> None:
         manager = _make_manager()
         inp = _make_input()
-        results = [manager.process(inp) for _ in range(5)]
+        results = [manager.detect(inp) for _ in range(5)]
         self.assertTrue(all(r == results[0] for r in results))
 
     def test_different_image_sizes_produce_in_bounds_bbox(self) -> None:
@@ -377,7 +589,7 @@ class DeterminismTests(unittest.TestCase):
         manager = _make_manager()
         for h, w in [(1, 1), (4, 4), (10, 20), (100, 200), (480, 640)]:
             with self.subTest(h=h, w=w):
-                result = manager.process(_make_input(height=h, width=w))
+                result = manager.detect(_make_input(height=h, width=w))
                 if result["detected"]:
                     bbox = result["bboxes"][0]
                     self.assertGreaterEqual(bbox["x"], 0)
@@ -386,6 +598,59 @@ class DeterminismTests(unittest.TestCase):
                     self.assertLessEqual(bbox["y"] + bbox["height"], h)
                     self.assertGreater(bbox["width"], 0)
                     self.assertGreater(bbox["height"], 0)
+
+
+# ---------------------------------------------------------------------------
+# GetInputContractTests — spec §4 / §9
+# ---------------------------------------------------------------------------
+
+
+class GetInputContractTests(unittest.TestCase):
+    """Verify get_input_contract() returns the correct values."""
+
+    def test_returns_grayscale_uint8_hwc(self) -> None:
+        manager = MotionDetectionManager()
+        contract = manager.get_input_contract()
+        self.assertEqual(contract["output_image_type"], OutputImageType.GRAYSCALE_UINT8_HWC)
+
+    def test_returns_resize_policy_none(self) -> None:
+        manager = MotionDetectionManager()
+        contract = manager.get_input_contract()
+        self.assertEqual(contract["geometry_spec"]["resize_policy"], ResizePolicy.NONE)
+
+    def test_geometry_spec_width_height_zero(self) -> None:
+        manager = MotionDetectionManager()
+        contract = manager.get_input_contract()
+        geo = contract["geometry_spec"]
+        self.assertEqual(geo["width"], 0)
+        self.assertEqual(geo["height"], 0)
+
+    def test_contract_has_required_keys(self) -> None:
+        manager = MotionDetectionManager()
+        contract = manager.get_input_contract()
+        self.assertIn("output_image_type", contract)
+        self.assertIn("geometry_spec", contract)
+
+
+# ---------------------------------------------------------------------------
+# ProtocolComplianceTests — spec §8.1
+# ---------------------------------------------------------------------------
+
+
+class ProtocolComplianceTests(unittest.TestCase):
+    """Verify MotionDetectionManager satisfies MotionDetectionInterface."""
+
+    def test_manager_satisfies_interface(self) -> None:
+        manager = MotionDetectionManager()
+        self.assertIsInstance(manager, MotionDetectionInterface)
+
+    def test_manager_has_detect_method(self) -> None:
+        manager = MotionDetectionManager()
+        self.assertTrue(callable(getattr(manager, "detect", None)))
+
+    def test_manager_has_get_input_contract_method(self) -> None:
+        manager = MotionDetectionManager()
+        self.assertTrue(callable(getattr(manager, "get_input_contract", None)))
 
 
 # ---------------------------------------------------------------------------
@@ -418,12 +683,24 @@ class RealAlgorithmTests(unittest.TestCase):
         prev_img: np.ndarray,
         curr_img: np.ndarray,
     ) -> MotionDetectionInput:
+        h, w = curr_img.shape[0], curr_img.shape[1]
+        ph, pw = prev_img.shape[0], prev_img.shape[1]
+        curr_image = Image(
+            data=curr_img, width=w, height=h,
+            color_format="GRAY", layout="HWC", dtype="uint8", value_range="[0,255]",
+        )
+        prev_image = Image(
+            data=prev_img, width=pw, height=ph,
+            color_format="GRAY", layout="HWC", dtype="uint8", value_range="[0,255]",
+        )
         return MotionDetectionInput(
-            current_frame=FramePacket(
-                frame_id=2, camera_id="cam-a", timestamp_ms=2000, image=curr_img
+            current_frame=MotionInputFrame(
+                frame_id="frame_0002", camera_id="cam-a",
+                timestamp_ms=2000, image=curr_image,
             ),
-            previous_frame=FramePacket(
-                frame_id=1, camera_id="cam-a", timestamp_ms=1000, image=prev_img
+            previous_frame=MotionInputFrame(
+                frame_id="frame_0001", camera_id="cam-a",
+                timestamp_ms=1000, image=prev_image,
             ),
         )
 
@@ -438,7 +715,7 @@ class RealAlgorithmTests(unittest.TestCase):
     def test_identical_frames_not_detected(self) -> None:
         manager = self._real_manager()
         img = np.zeros((64, 64), dtype=np.uint8)
-        result = manager.process(self._motion_input(img, img))
+        result = manager.detect(self._motion_input(img, img))
         self.assertFalse(result["detected"])
         self.assertEqual(result["bboxes"], [])
 
@@ -491,7 +768,7 @@ class RealAlgorithmTests(unittest.TestCase):
         curr_img[30:33, 30:33] = 255
 
         manager = self._real_manager(min_bbox_area=100)
-        result = manager.process(self._motion_input(prev_img, curr_img))
+        result = manager.detect(self._motion_input(prev_img, curr_img))
         self.assertFalse(result["detected"])
 
     # --- motion_fraction_threshold -----------------------------------------
@@ -504,7 +781,7 @@ class RealAlgorithmTests(unittest.TestCase):
         curr_img[90:105, 90:105] = 255  # area 225 >= min_bbox_area=100
 
         manager = self._real_manager(motion_fraction_threshold=0.05, min_bbox_area=100)
-        result = manager.process(self._motion_input(prev_img, curr_img))
+        result = manager.detect(self._motion_input(prev_img, curr_img))
         self.assertFalse(result["detected"])
 
     def test_high_motion_fraction_above_threshold_detected(self) -> None:
@@ -515,7 +792,7 @@ class RealAlgorithmTests(unittest.TestCase):
         curr_img[25:75, 25:75] = 255  # area 2500, fraction 0.25
 
         manager = self._real_manager(motion_fraction_threshold=0.05, min_bbox_area=100)
-        result = manager.process(self._motion_input(prev_img, curr_img))
+        result = manager.detect(self._motion_input(prev_img, curr_img))
         self.assertTrue(result["detected"])
         self.assertGreater(len(result["bboxes"]), 0)
 
@@ -545,6 +822,358 @@ class RealAlgorithmTests(unittest.TestCase):
         result = algo.measure(prev_img, curr_img)
         self.assertGreater(len(result.bboxes), 0)
 
+    def test_3d_image_struct_accepted_by_manager(self) -> None:
+        """(H,W,1) Image struct must pass validation and reach the algorithm."""
+        h, w = 64, 64
+        prev_arr = np.zeros((h, w, 1), dtype=np.uint8)
+        curr_arr = np.zeros((h, w, 1), dtype=np.uint8)
+        curr_arr[10:50, 10:50] = 255
+        manager = self._real_manager(motion_fraction_threshold=0.05, min_bbox_area=100)
+        result = manager.detect(self._motion_input(prev_arr, curr_arr))
+        self.assertIn("detected", result)
+
+    def test_morphology_open_removes_single_pixel_noise(self) -> None:
+        """Sparse salt noise should be removed before contour extraction."""
+        h, w = 128, 128
+        prev_img = np.zeros((h, w), dtype=np.uint8)
+        curr_img = np.zeros((h, w), dtype=np.uint8)
+
+        # Place isolated points with at least one empty pixel around each point.
+        ys = np.arange(8, h - 8, 8)
+        xs = np.arange(8, w - 8, 8)
+        for y in ys:
+            for x in xs:
+                curr_img[y, x] = 255
+
+        manager = MotionDetectionManager(config=MotionDetectionConfig(
+            motion_threshold=25,
+            motion_fraction_threshold=0.0001,
+            min_bbox_area=1,
+            blur_kernel_size=3,
+            morph_open_iterations=1,
+            morph_close_iterations=0,
+            dilation_iterations=0,
+        ))
+        result = manager.detect(self._motion_input(prev_img, curr_img))
+        self.assertFalse(result["detected"])
+        self.assertEqual(result["bboxes"], [])
+
+
+class GlobalMotionCompensationTests(unittest.TestCase):
+    def test_global_motion_compensation_suppresses_shifted_static_scene(self) -> None:
+        prev_img = _make_textured_scene(seed=11)
+        curr_img = _shift_image(prev_img, dx=8, dy=5)
+
+        manager = MotionDetectionManager(config=MotionDetectionConfig(
+            motion_threshold=25,
+            motion_fraction_threshold=0.02,
+            min_bbox_area=50,
+            enable_global_motion_compensation=True,
+            max_features=300,
+            min_feature_matches=20,
+            max_transform_shift=20.0,
+            global_motion_changed_ratio_threshold=0.20,
+            fallback_on_alignment_failure=True,
+        ))
+
+        result = manager.detect(_make_motion_input_from_arrays(prev_img, curr_img))
+        debug = manager.get_last_debug_info()
+
+        self.assertFalse(result["detected"])
+        self.assertTrue(debug["enable_global_motion_compensation"])
+        self.assertTrue(debug["alignment_succeeded"])
+        self.assertGreaterEqual(debug["feature_match_count"], 20)
+        self.assertLess(debug["changed_pixel_ratio_after_alignment"], debug["changed_pixel_ratio_before_alignment"])
+
+    def test_global_motion_compensation_disabled_detects_large_shift_motion(self) -> None:
+        prev_img = _make_textured_scene(seed=12)
+        curr_img = _shift_image(prev_img, dx=8, dy=5)
+
+        manager = MotionDetectionManager(config=MotionDetectionConfig(
+            motion_threshold=25,
+            motion_fraction_threshold=0.02,
+            min_bbox_area=50,
+            enable_global_motion_compensation=False,
+        ))
+
+        result = manager.detect(_make_motion_input_from_arrays(prev_img, curr_img))
+        debug = manager.get_last_debug_info()
+
+        self.assertTrue(result["detected"])
+        self.assertFalse(debug["enable_global_motion_compensation"])
+        self.assertFalse(debug["alignment_succeeded"])
+        self.assertGreater(debug["changed_pixel_ratio_before_alignment"], 0.02)
+
+    def test_alignment_failure_follows_fallback_configuration(self) -> None:
+        prev_img = np.tile(np.linspace(120, 136, 256, dtype=np.uint8), (192, 1))
+        transform = np.array([[1.0, 0.0, 6.0], [0.0, 1.0, 4.0]], dtype=np.float32)
+        curr_img = cv2.warpAffine(
+            prev_img,
+            transform,
+            (prev_img.shape[1], prev_img.shape[0]),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+
+        manager = MotionDetectionManager(config=MotionDetectionConfig(
+            motion_threshold=10,
+            motion_fraction_threshold=0.001,
+            min_bbox_area=1,
+            enable_global_motion_compensation=True,
+            max_features=50,
+            min_feature_matches=12,
+            max_transform_shift=15.0,
+            global_motion_changed_ratio_threshold=0.05,
+            fallback_on_alignment_failure=True,
+        ))
+
+        result = manager.detect(_make_motion_input_from_arrays(prev_img, curr_img))
+        debug = manager.get_last_debug_info()
+
+        self.assertFalse(debug["alignment_succeeded"])
+        self.assertTrue(debug["alignment_fallback_used"])
+        self.assertTrue(result["detected"])
+
+    def test_alignment_preserves_local_motion_after_global_compensation(self) -> None:
+        prev_img = _make_textured_scene(seed=13)
+        curr_img = _shift_image(prev_img, dx=7, dy=4)
+        cv2.rectangle(curr_img, (100, 70), (138, 124), 255, -1)
+
+        manager = MotionDetectionManager(config=MotionDetectionConfig(
+            motion_threshold=20,
+            motion_fraction_threshold=0.01,
+            min_bbox_area=150,
+            enable_global_motion_compensation=True,
+            max_features=300,
+            min_feature_matches=20,
+            max_transform_shift=20.0,
+            global_motion_changed_ratio_threshold=0.20,
+            fallback_on_alignment_failure=True,
+            morph_close_iterations=1,
+        ))
+
+        result = manager.detect(_make_motion_input_from_arrays(prev_img, curr_img))
+        debug = manager.get_last_debug_info()
+
+        self.assertTrue(result["detected"])
+        self.assertTrue(debug["alignment_succeeded"])
+        self.assertGreater(debug["changed_pixel_ratio_after_alignment"], 0.0)
+        self.assertTrue(any(bbox["x"] <= 120 <= bbox["x"] + bbox["width"] and bbox["y"] <= 97 <= bbox["y"] + bbox["height"] for bbox in result["bboxes"]))
+
+    def test_camera_shake_detected_for_excessive_global_shift(self) -> None:
+        prev_img = _make_textured_scene(seed=14)
+        curr_img = _shift_image(prev_img, dx=32, dy=24)
+
+        manager = MotionDetectionManager(config=MotionDetectionConfig(
+            motion_threshold=25,
+            motion_fraction_threshold=0.02,
+            min_bbox_area=50,
+            enable_global_motion_compensation=True,
+            max_features=300,
+            min_feature_matches=20,
+            max_transform_shift=10.0,
+            global_motion_changed_ratio_threshold=0.20,
+            fallback_on_alignment_failure=False,
+        ))
+
+        result = manager.detect(_make_motion_input_from_arrays(prev_img, curr_img))
+        debug = manager.get_last_debug_info()
+
+        self.assertFalse(result["detected"])
+        self.assertTrue(debug["camera_shake_detected"])
+        self.assertGreater(debug["estimated_global_shift"], 10.0)
+        self.assertIsNotNone(debug["estimated_transform_matrix"])
+
+
+class _StaticMeasurementAlgorithm:
+    def __init__(self, bboxes: list[BoundingBox], motion_fraction: float = 0.2) -> None:
+        self._bboxes = list(bboxes)
+        self._motion_fraction = motion_fraction
+
+    def measure(self, previous_image: np.ndarray, current_image: np.ndarray) -> MotionMeasurementResult:
+        return MotionMeasurementResult(
+            motion_fraction=self._motion_fraction,
+            bboxes=list(self._bboxes),
+            debug_info={
+                "motion_bboxes_raw_count": len(self._bboxes),
+                "motion_bboxes_after_filter_count": len(self._bboxes),
+            },
+        )
+
+
+class BboxMergingAndTemporalPersistenceTests(unittest.TestCase):
+    def _manager_for_test(
+        self,
+        *,
+        bboxes: list[BoundingBox],
+        enable_bbox_merging: bool = True,
+        bbox_merge_iou_threshold: float = 0.2,
+        bbox_merge_distance_threshold: float = 8.0,
+        enable_temporal_persistence: bool = False,
+        min_persistence_frames: int = 2,
+        persistence_iou_threshold: float = 0.3,
+        max_history_frames: int = 4,
+    ) -> MotionDetectionManager:
+        cfg = MotionDetectionConfig(
+            motion_threshold=25,
+            motion_fraction_threshold=0.05,
+            min_bbox_area=1,
+            enable_bbox_merging=enable_bbox_merging,
+            bbox_merge_iou_threshold=bbox_merge_iou_threshold,
+            bbox_merge_distance_threshold=bbox_merge_distance_threshold,
+            enable_temporal_persistence=enable_temporal_persistence,
+            min_persistence_frames=min_persistence_frames,
+            persistence_iou_threshold=persistence_iou_threshold,
+            max_history_frames=max_history_frames,
+        )
+        algo = _StaticMeasurementAlgorithm(bboxes=bboxes)
+        return MotionDetectionManager(config=cfg, algorithm=algo)
+
+    def test_overlapping_bboxes_merge_correctly(self) -> None:
+        manager = self._manager_for_test(
+            bboxes=[
+                BoundingBox(x=10, y=10, width=20, height=20),
+                BoundingBox(x=18, y=18, width=20, height=20),
+            ],
+            bbox_merge_iou_threshold=0.05,
+        )
+        result = manager.detect(_make_input(height=80, width=80))
+        self.assertTrue(result["detected"])
+        self.assertEqual(len(result["bboxes"]), 1)
+        merged = result["bboxes"][0]
+        self.assertEqual(merged["x"], 10)
+        self.assertEqual(merged["y"], 10)
+        self.assertEqual(merged["width"], 28)
+        self.assertEqual(merged["height"], 28)
+
+    def test_nearby_bboxes_merge_correctly(self) -> None:
+        manager = self._manager_for_test(
+            bboxes=[
+                BoundingBox(x=5, y=10, width=10, height=12),
+                BoundingBox(x=18, y=10, width=9, height=12),
+            ],
+            bbox_merge_iou_threshold=0.5,
+            bbox_merge_distance_threshold=4.0,
+        )
+        result = manager.detect(_make_input(height=80, width=80))
+        self.assertEqual(len(result["bboxes"]), 1)
+        merged = result["bboxes"][0]
+        self.assertEqual(merged["x"], 5)
+        self.assertEqual(merged["width"], 22)
+
+    def test_distant_bboxes_stay_separate(self) -> None:
+        manager = self._manager_for_test(
+            bboxes=[
+                BoundingBox(x=5, y=5, width=10, height=10),
+                BoundingBox(x=40, y=40, width=10, height=10),
+            ],
+            bbox_merge_distance_threshold=3.0,
+        )
+        result = manager.detect(_make_input(height=80, width=80))
+        self.assertEqual(len(result["bboxes"]), 2)
+
+    def test_merged_bboxes_stay_inside_image_bounds(self) -> None:
+        manager = self._manager_for_test(
+            bboxes=[
+                BoundingBox(x=-5, y=-5, width=20, height=20),
+                BoundingBox(x=12, y=12, width=80, height=80),
+            ],
+            bbox_merge_distance_threshold=10.0,
+        )
+        result = manager.detect(_make_input(height=64, width=64))
+        self.assertEqual(len(result["bboxes"]), 1)
+        bbox = result["bboxes"][0]
+        self.assertGreaterEqual(bbox["x"], 0)
+        self.assertGreaterEqual(bbox["y"], 0)
+        self.assertLessEqual(bbox["x"] + bbox["width"], 64)
+        self.assertLessEqual(bbox["y"] + bbox["height"], 64)
+
+    def test_one_frame_noise_is_suppressed(self) -> None:
+        manager = self._manager_for_test(
+            bboxes=[BoundingBox(x=10, y=10, width=12, height=12)],
+            enable_temporal_persistence=True,
+            min_persistence_frames=2,
+        )
+        result = manager.detect(_make_input(camera_id="cam-noise"))
+        self.assertFalse(result["detected"])
+        self.assertEqual(result["bboxes"], [])
+
+    def test_persistent_motion_across_frames_is_emitted(self) -> None:
+        manager = self._manager_for_test(
+            bboxes=[BoundingBox(x=10, y=10, width=12, height=12)],
+            enable_temporal_persistence=True,
+            min_persistence_frames=2,
+            persistence_iou_threshold=0.2,
+        )
+        first = manager.detect(_make_input(camera_id="cam-persist"))
+        second = manager.detect(_make_input(camera_id="cam-persist"))
+        self.assertFalse(first["detected"])
+        self.assertTrue(second["detected"])
+        self.assertEqual(len(second["bboxes"]), 1)
+
+    def test_different_cameras_maintain_isolated_histories(self) -> None:
+        manager = self._manager_for_test(
+            bboxes=[BoundingBox(x=10, y=10, width=12, height=12)],
+            enable_temporal_persistence=True,
+            min_persistence_frames=2,
+        )
+        cam_a_first = manager.detect(_make_input(camera_id="cam-A"))
+        cam_b_first = manager.detect(_make_input(camera_id="cam-B"))
+        cam_a_second = manager.detect(_make_input(camera_id="cam-A"))
+        self.assertFalse(cam_a_first["detected"])
+        self.assertFalse(cam_b_first["detected"])
+        self.assertTrue(cam_a_second["detected"])
+
+    def test_disappearing_motion_is_removed_from_history(self) -> None:
+        persistent_manager = self._manager_for_test(
+            bboxes=[BoundingBox(x=10, y=10, width=12, height=12)],
+            enable_temporal_persistence=True,
+            min_persistence_frames=2,
+        )
+        persistent_manager.detect(_make_input(camera_id="cam-drop"))
+        persistent_manager.detect(_make_input(camera_id="cam-drop"))
+
+        class EmptyAlgorithm:
+            def measure(self, previous_image: np.ndarray, current_image: np.ndarray) -> MotionMeasurementResult:
+                return MotionMeasurementResult(motion_fraction=0.2, bboxes=[])
+
+        persistent_manager._algorithm = EmptyAlgorithm()  # type: ignore[assignment]
+        dropped = persistent_manager.detect(_make_input(camera_id="cam-drop"))
+        self.assertFalse(dropped["detected"])
+        self.assertEqual(dropped["bboxes"], [])
+
+    def test_iou_based_persistence_matching_works(self) -> None:
+        cfg = MotionDetectionConfig(
+            motion_threshold=25,
+            motion_fraction_threshold=0.05,
+            min_bbox_area=1,
+            enable_bbox_merging=False,
+            enable_temporal_persistence=True,
+            min_persistence_frames=2,
+            persistence_iou_threshold=0.3,
+            max_history_frames=4,
+        )
+
+        class SequenceAlgorithm:
+            def __init__(self) -> None:
+                self._index = 0
+
+            def measure(self, previous_image: np.ndarray, current_image: np.ndarray) -> MotionMeasurementResult:
+                sequence = [
+                    [BoundingBox(x=10, y=10, width=12, height=12)],
+                    [BoundingBox(x=12, y=11, width=12, height=12)],
+                ]
+                bboxes = sequence[min(self._index, len(sequence) - 1)]
+                self._index += 1
+                return MotionMeasurementResult(motion_fraction=0.2, bboxes=bboxes)
+
+        manager = MotionDetectionManager(config=cfg, algorithm=SequenceAlgorithm())
+        first = manager.detect(_make_input(camera_id="cam-iou"))
+        second = manager.detect(_make_input(camera_id="cam-iou"))
+        self.assertFalse(first["detected"])
+        self.assertTrue(second["detected"])
+
 
 # ---------------------------------------------------------------------------
 # AssetIntegrationTests — visual test assets smoke test
@@ -566,6 +1195,13 @@ class AssetIntegrationTests(unittest.TestCase):
                 if case_path.is_dir():
                     yield category, case_path.name, case_path
 
+    def _image_struct(self, arr: np.ndarray) -> Image:
+        h, w = arr.shape[0], arr.shape[1]
+        return Image(
+            data=arr, width=w, height=h,
+            color_format="GRAY", layout="HWC", dtype="uint8", value_range="[0,255]",
+        )
+
     def test_all_cases_process_without_error(self) -> None:
         manager = MotionDetectionManager()  # uses real algorithm by default
         for category, case_name, case_path in self._iter_case_paths():
@@ -574,28 +1210,28 @@ class AssetIntegrationTests(unittest.TestCase):
             if not prev_path.exists() or not curr_path.exists():
                 continue
 
-            prev_img = cv2.imread(str(prev_path), cv2.IMREAD_GRAYSCALE)
-            curr_img = cv2.imread(str(curr_path), cv2.IMREAD_GRAYSCALE)
-            if prev_img is None or curr_img is None:
+            prev_arr = cv2.imread(str(prev_path), cv2.IMREAD_GRAYSCALE)
+            curr_arr = cv2.imread(str(curr_path), cv2.IMREAD_GRAYSCALE)
+            if prev_arr is None or curr_arr is None:
                 self.fail(f"Could not load images from {case_path}")
 
-            inp: MotionDetectionInput = {
-                "current_frame": {
-                    "frame_id": "frame_0002",
-                    "camera_id": case_name,
-                    "timestamp_ms": 2000,
-                    "image": curr_img,
-                },
-                "previous_frame": {
-                    "frame_id": "frame_0001",
-                    "camera_id": case_name,
-                    "timestamp_ms": 1000,
-                    "image": prev_img,
-                },
-            }
+            inp = MotionDetectionInput(
+                current_frame=MotionInputFrame(
+                    frame_id="frame_0002",
+                    camera_id=case_name,
+                    timestamp_ms=2000,
+                    image=self._image_struct(curr_arr),
+                ),
+                previous_frame=MotionInputFrame(
+                    frame_id="frame_0001",
+                    camera_id=case_name,
+                    timestamp_ms=1000,
+                    image=self._image_struct(prev_arr),
+                ),
+            )
 
             with self.subTest(category=category, case=case_name):
-                result = manager.process(inp)
+                result = manager.detect(inp)
                 self.assertIn("detected", result)
                 self.assertIsInstance(result["detected"], bool)
                 self.assertIn("bboxes", result)
@@ -603,7 +1239,7 @@ class AssetIntegrationTests(unittest.TestCase):
                 # Structural guarantees when motion is detected
                 if result["detected"]:
                     self.assertGreater(len(result["bboxes"]), 0)
-                    h, w = curr_img.shape[0], curr_img.shape[1]
+                    h, w = curr_arr.shape[0], curr_arr.shape[1]
                     for bbox in result["bboxes"]:
                         self.assertGreater(bbox["width"], 0)
                         self.assertGreater(bbox["height"], 0)

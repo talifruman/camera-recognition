@@ -1,17 +1,23 @@
 from __future__ import annotations
 
-from image_processing.shared.contracts import (
+from .contracts import (
+    BoundingBox,
+    FaceLandmarks,
     GeometrySpec,
     Image,
     OutputImageType,
     PipelineStageInputContract,
+    Point,
     ResizePolicy,
 )
 
 __all__ = [
+    "BoundingBox",
+    "FaceLandmarks",
     "GeometrySpec",
     "Image",
     "OutputImageType",
     "PipelineStageInputContract",
+    "Point",
     "ResizePolicy",
 ]

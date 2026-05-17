@@ -13,9 +13,7 @@ class ResizePolicy(Enum):
     """
 
     NONE = "NONE"
-    STRETCH = "STRETCH"
     LETTERBOX = "LETTERBOX"
-    PRESERVE_ASPECT_RATIO = "PRESERVE_ASPECT_RATIO"
 
 
 class GeometrySpec(TypedDict):
@@ -25,7 +23,7 @@ class GeometrySpec(TypedDict):
 
     Rules:
     - resize_policy NONE  : width and height are ignored.
-    - resize_policy STRETCH / LETTERBOX / PRESERVE_ASPECT_RATIO : width and height must be > 0.
+    - resize_policy LETTERBOX : width and height must be > 0.
     """
 
     width: int
@@ -41,8 +39,6 @@ class OutputImageType(Enum):
 
     GRAYSCALE_UINT8_HWC = "GRAYSCALE_UINT8_HWC"
     RGB_UINT8_HWC = "RGB_UINT8_HWC"
-    RGB_FLOAT32_HWC_NORMALIZED_0_TO_1 = "RGB_FLOAT32_HWC_NORMALIZED_0_TO_1"
-    RGB_FLOAT32_HWC_NORMALIZED_MINUS1_TO_1 = "RGB_FLOAT32_HWC_NORMALIZED_MINUS1_TO_1"
 
 
 class PipelineStageInputContract(TypedDict):
@@ -55,6 +51,19 @@ class PipelineStageInputContract(TypedDict):
 
     output_image_type: OutputImageType
     geometry_spec: GeometrySpec
+
+
+class BoundingBox(TypedDict):
+    """Single canonical bounding-box type shared across the entire pipeline.
+
+    See shared_contracts.md §1 for the full contract.
+    All coordinates are integers. Coordinate space must be stated at the usage site.
+    """
+
+    x: int
+    y: int
+    width: int
+    height: int
 
 
 class Image(TypedDict):
@@ -73,3 +82,28 @@ class Image(TypedDict):
     layout: str        # "HWC", "CHW"
     dtype: str         # "uint8", "float32"
     value_range: str   # "[0,255]", "[0,1]", "[-1,1]"
+
+
+class Point(TypedDict):
+    """Single canonical pixel coordinate type shared across the entire pipeline.
+
+    See shared_contracts.md §7 for the full contract.
+    Coordinate space must be stated by context at the usage site.
+    """
+
+    x: int
+    y: int
+
+
+class FaceLandmarks(TypedDict):
+    """Canonical 5-point facial landmark struct shared across the entire pipeline.
+
+    See shared_contracts.md §8 for the full contract.
+    All coordinates are Point values; coordinate space must be stated by context.
+    """
+
+    left_eye: Point
+    right_eye: Point
+    nose: Point
+    mouth_left: Point
+    mouth_right: Point

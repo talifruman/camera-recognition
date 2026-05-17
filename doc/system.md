@@ -22,6 +22,58 @@ Always use **Obra Superpowers: Brainstorming** in **Planning Mode**.
 - 2026-03-25: `PayloadDecoder` introduced as an explicit component for deterministic payload decode before transformation.
 - 2026-03-25: No backward compatibility mode retained for `BaseImage` in documentation contracts.
 
+---
+
+## Service Startup Sequence — Gallery-to-Recognition Wiring
+
+`FaceGalleryLoaderModule` and `FaceRecognitionModule` are connected at service startup time by external startup code. Neither module depends on the other directly.
+
+### Startup Steps
+
+```
+1.  FaceGalleryLoaderModule.load_gallery(gallery_root_path)
+      └─ GalleryPathValidator → GalleryDirectoryScanner
+             → EmbeddingFileReader (NpyEmbeddingFileReader or Stub)
+             → FaceGalleryCache (internal to loader)
+
+2.  entries = FaceGalleryLoaderModule.get_all_embeddings()
+	└─ Returns list[LoadedGalleryEmbedding] (person_id + embedding per enrolled face)
+
+2b. startup wiring maps LoadedGalleryEmbedding[] → EnrolledIdentity[]
+	└─ enrolled = [EnrolledIdentity(person_id=e["person_id"], embedding=e["embedding"]) for e in entries]
+
+3.  FaceRecognitionModule(config, embedding_engine, gallery_entries=enrolled)
+	└─ Builds internal EnrolledIdentityCache (immutable, read-only during recognition)
+
+4.  RecognitionPipelineManager(…, face_recognition=FaceRecognitionModule)
+	└─ RPM holds FaceRecognitionInterface; never sees LoadedGalleryEmbedding, EnrolledIdentity, or gallery data
+```
+
+### Failure Handling at Startup
+
+| Failure | Effect |
+|---------|--------|
+| `load_gallery` raises `GalleryPathValidationError` | Startup aborts; `FaceRecognitionModule` is not created |
+| `load_gallery` raises `GalleryLoadError` (no valid embeddings) | Startup aborts; `FaceRecognitionModule` is not created |
+| Individual `.npy` file fails validation | File skipped with warning; load continues; other entries are included |
+
+### Module Ownership
+
+| Responsibility | Owner |
+|----------------|-------|
+| Gallery file reading | `FaceGalleryLoaderModule` (via `EmbeddingFileReader`) |
+| `LoadedGalleryEmbedding[]` production | `FaceGalleryLoaderModule.get_all_embeddings()` |
+| `LoadedGalleryEmbedding[]` → `EnrolledIdentity[]` mapping | External service startup code |
+| Internal `EnrolledIdentityCache` (recognition) | `FaceRecognitionModule` — immutable after construction |
+| Per-frame gallery lookup | `FaceMatcher` (internal to `FaceRecognitionModule`) |
+| RPM interaction with gallery | None — RPM never sees gallery data |
+
+> **Cross-references:**
+> - `FaceGalleryLoaderModule` API: `doc/image_processing_service/face_gallery_loader.md`
+> - `FaceRecognitionModule` construction: `doc/image_processing_service/face_recognition.md §9.2`
+
+---
+
 ## Plan: Smart Camera Monitoring System
 Learning-first microservices design that supports live/synthetic video, person recognition, event clips, and Telegram alerts while staying simple to evolve.
 

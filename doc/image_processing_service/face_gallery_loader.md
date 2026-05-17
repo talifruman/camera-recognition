@@ -10,7 +10,11 @@ This module is fully self-contained. It does not reference, depend on, or descri
 
 ### Purpose
 
-The FaceGalleryLoader module is responsible for loading precomputed face embeddings from an existing gallery directory on disk, validating their format and content, building an in-memory gallery cache, and providing read access to the loaded embeddings. It receives a `gallery_root_path` at load time and returns `GalleryEntry[]` values on read calls. This module is a stateful, read-only loader that prepares the in-memory gallery state required by downstream identity lookup.
+The FaceGalleryLoader module is responsible for loading precomputed face embeddings from an existing gallery directory on disk, validating their format and content, building an in-memory gallery cache, and providing read access to the loaded embeddings. It receives a `gallery_root_path` at load time and returns `LoadedGalleryEmbedding[]` values on read calls. This module is a stateful, read-only loader that prepares the in-memory gallery state required by downstream identity lookup.
+
+> **Downstream consumer:** The `LoadedGalleryEmbedding[]` produced by `get_all_embeddings()` is consumed by service startup code, which maps it to `EnrolledIdentity[]` and passes it to `FaceRecognitionModule` at construction time. See `doc/system.md` § "Service Startup Sequence" for the explicit wiring and `doc/image_processing_service/face_recognition.md §9.2` for the receiver.
+
+> **Domain separation:** `LoadedGalleryEmbedding` is the Face Gallery Loader output type. It is **not** `EnrolledIdentity`. It is **not** a Face Recognition type. It must **not** be moved to `shared_contracts.md`. Startup code is responsible for mapping `LoadedGalleryEmbedding[]` → `EnrolledIdentity[]` before passing to `FaceRecognitionModule`.
 
 ### In Scope
 
@@ -23,7 +27,7 @@ The FaceGalleryLoader module is responsible for loading precomputed face embeddi
 - Skipping malformed or unsupported embedding files without corrupting the gallery load
 - Raising a structured error if no valid embeddings are found across all persons
 - Building an in-memory `FaceGalleryCache` from all successfully loaded embeddings
-- Providing read access to all cached `GalleryEntry` values via `get_all_embeddings`
+- Providing read access to all cached `LoadedGalleryEmbedding` values via `get_all_embeddings`
 - Providing read access to embeddings filtered by `person_id` via `get_embeddings`
 - Providing the list of loaded person identifiers via `get_person_ids`
 
@@ -109,8 +113,11 @@ No image data, raw pixel data, or model tensors enter this module.
 
 ### 3.1 Output Structure
 
+`LoadedGalleryEmbedding` is a validated embedding record loaded from persistent gallery storage.
+It is the Face Gallery Loader output type. It is **not** `EnrolledIdentity`. It is **not** a Face Recognition type.
+
 ```text
-struct GalleryEntry {
+struct LoadedGalleryEmbedding {
     string        person_id;
     FaceEmbedding embedding;
 }
@@ -133,7 +140,7 @@ The output must NOT expose:
 - Per-file validation results, load warnings, or structured failure details
 - Person metadata such as `person_name` or any display label
 
-All load-time intermediate data (file paths, raw file contents, `PersonScanRecord` values, per-file validation state) remain strictly internal to the module. The only externally visible result is `GalleryEntry[]` containing `person_id` and `embedding`.
+All load-time intermediate data (file paths, raw file contents, `PersonScanRecord` values, per-file validation state) remain strictly internal to the module. The only externally visible result is `LoadedGalleryEmbedding[]` containing `person_id` and `embedding`.
 
 ---
 
@@ -141,8 +148,8 @@ All load-time intermediate data (file paths, raw file contents, `PersonScanRecor
 
 ```text
 load_gallery(gallery_root_path: string)    -> void
-get_all_embeddings()                       -> GalleryEntry[]
-get_embeddings(person_id: string)          -> GalleryEntry[]
+get_all_embeddings()                       -> LoadedGalleryEmbedding[]
+get_embeddings(person_id: string)          -> LoadedGalleryEmbedding[]
 get_person_ids()                           -> string[]
 ```
 
@@ -181,7 +188,7 @@ class NpyEmbeddingFileReader implements EmbeddingFileReader
 
 ### 6.3 Replaceability
 
-The module depends on the `EmbeddingFileReader` interface, not on `NpyEmbeddingFileReader` directly. Any file reader satisfying the interface may be substituted to support alternative embedding file formats (e.g., `.bin`, `.pt`, `.csv`) without changing `GalleryEntry`, `get_all_embeddings`, `get_embeddings`, or any other part of the public API. Replacing the reader does NOT affect the public API.
+The module depends on the `EmbeddingFileReader` interface, not on `NpyEmbeddingFileReader` directly. Any file reader satisfying the interface may be substituted to support alternative embedding file formats (e.g., `.bin`, `.pt`, `.csv`) without changing `LoadedGalleryEmbedding`, `get_all_embeddings`, `get_embeddings`, or any other part of the public API. Replacing the reader does NOT affect the public API.
 
 ---
 
@@ -191,11 +198,21 @@ Embedding file acceptance is validated by `EmbeddingFileReader`, with the skip-o
 
 - `GalleryDirectoryScanner` returns the full list of candidate file paths found under each person directory, filtered by `embedding_file_extension`. It applies no validation on file contents.
 - `EmbeddingFileReader` attempts to load each candidate file and validates its contents:
-  - If the file is well-formed, non-null, has the expected dimension, and matches the expected dtype → `EmbeddingFileReader` returns the `FaceEmbedding`; the file is accepted and its embedding is included in the gallery build.
-  - If the file is malformed, unreadable, has an unexpected shape or dtype, or produces a null value → `EmbeddingFileReader` returns a structured failure result; `FaceGalleryLoaderModule` skips the file, records a structured warning, and continues with remaining files.
+  - If the file is well-formed, non-null, has the expected dimension, matches the expected dtype, **and is L2-normalized** → `EmbeddingFileReader` returns the `FaceEmbedding`; the file is accepted and its embedding is included in the gallery build.
+  - If the file is malformed, unreadable, has an unexpected shape or dtype, is not L2-normalized, or produces a null value → `EmbeddingFileReader` returns a structured failure result; `FaceGalleryLoaderModule` skips the file, records a structured warning, and continues with remaining files.
 - If all candidate files across all person directories produce structured failures and zero valid embeddings are collected, `FaceGalleryLoaderModule` raises a structured error; the gallery load is aborted.
 - No file paths, rejection reasons, or per-file validation details are returned to the caller.
 - `EmbeddingFileReader` is the only place inside the module that decides whether a given file's embedding content is valid or invalid.
+
+### 7.1 L2 Normalization Requirement
+
+Embeddings stored in gallery `.npy` files **must be L2-normalized** (unit vectors; L2 norm = 1.0 within tolerance `1e-4`).
+
+**Why this is required:** The downstream `FaceMatcher` (inside `FaceRecognitionModule`) computes identity similarity using the dot product of the query embedding and each gallery embedding. The dot product of two L2-normalized vectors equals cosine similarity. If a gallery embedding is not L2-normalized, the dot product produces a mathematically incorrect similarity score without any runtime error — causing silent misidentification.
+
+**Validation in `NpyEmbeddingFileReader`:** After loading and dtype-checking the array, `NpyEmbeddingFileReader.read_embedding()` checks `abs(np.linalg.norm(arr) - 1.0) <= 1e-4`. If the embedding fails this check, `read_embedding()` emits a `warnings.warn` and returns `None` (structured failure); `FaceGalleryLoaderModule` then skips the file and continues.
+
+**Gallery preparation responsibility:** Gallery embeddings are expected to be produced by ArcFace (which outputs L2-normalized vectors by design). Any tool that generates or stores gallery embeddings must preserve L2 normalization.
 
 ---
 
@@ -209,7 +226,7 @@ Its responsibilities are:
 
 - receive `load_gallery` calls, coordinate internal components in the correct order, and update the in-memory cache
 - receive `get_all_embeddings`, `get_embeddings`, and `get_person_ids` calls and delegate directly to `FaceGalleryCache`
-- apply the skip-or-fail policy: collect all valid `GalleryEntry` values from `EmbeddingFileReader` results, skip files that produced a structured failure, and raise a structured error if zero valid entries were collected
+- apply the skip-or-fail policy: collect all valid `LoadedGalleryEmbedding` values from `EmbeddingFileReader` results, skip files that produced a structured failure, and raise a structured error if zero valid entries were collected
 - return results from `FaceGalleryCache` to the caller for all read operations
 
 During initialization, `FaceGalleryLoaderModule` is responsible for loading the module configuration and wiring each internal component with its required settings, including injecting `embedding_file_extension`, `expected_embedding_dim`, and `expected_dtype` into `EmbeddingFileReader` and injecting `embedding_file_extension` into `GalleryDirectoryScanner`.
@@ -261,7 +278,7 @@ Its responsibilities are:
 
 `EmbeddingFileReader` does not manage directories, assign `person_id` values, build the gallery cache, or apply the gallery-level skip-or-fail policy. It validates and returns one embedding per call only. This is the only component that knows the on-disk embedding file format. It does not interpret the semantic meaning of the embedding — it validates only its structural contract: non-null, expected dimension, expected dtype.
 
-`NpyEmbeddingFileReader` is the current default implementation of `EmbeddingFileReader`. The module depends on the `EmbeddingFileReader` abstraction, not on `NpyEmbeddingFileReader` directly, so a different file format reader can be substituted without changing `GalleryEntry`, `get_all_embeddings`, or any other part of the public API.
+`NpyEmbeddingFileReader` is the current default implementation of `EmbeddingFileReader`. The module depends on the `EmbeddingFileReader` abstraction, not on `NpyEmbeddingFileReader` directly, so a different file format reader can be substituted without changing `LoadedGalleryEmbedding`, `get_all_embeddings`, or any other part of the public API.
 
 ### 8.5 FaceGalleryCache
 
@@ -269,7 +286,7 @@ Its responsibilities are:
 
 Its responsibilities are:
 
-- receive a complete `GalleryEntry[]` list via `replace_all` and store it internally indexed by `person_id`
+- receive a complete `LoadedGalleryEmbedding[]` list via `replace_all` and store it internally indexed by `person_id`
 - return all entries on `get_all_entries()` in deterministic order: sorted by `person_id` lexicographically, then by file enumeration order within each person
 - return entries filtered by `person_id` on `get_entries_by_person(person_id)` in file enumeration order; return an empty list if `person_id` is not present
 - return all loaded person identifiers on `get_person_ids()` in lexicographically sorted order
@@ -287,14 +304,14 @@ For one invocation of `load_gallery`, the internal pipeline follows this order:
 2. `FaceGalleryLoaderModule` calls `GalleryPathValidator.validate(gallery_root_path)`.
 3. `FaceGalleryLoaderModule` calls `GalleryDirectoryScanner.scan(gallery_root_path, embedding_file_extension)` → `PersonScanRecord[]`.
 4. For each `PersonScanRecord` and each file path it contains, `FaceGalleryLoaderModule` calls `EmbeddingFileReader.read_embedding(file_path)` → `FaceEmbedding` or structured failure.
-5. `FaceGalleryLoaderModule` collects successful results as `GalleryEntry(person_id, embedding)` values; skips and records a structured warning for each file that returned a failure.
-6. `FaceGalleryLoaderModule` verifies at least one `GalleryEntry` was collected; raises a structured error if none were collected.
-7. `FaceGalleryLoaderModule` calls `FaceGalleryCache.replace_all(GalleryEntry[])`.
+5. `FaceGalleryLoaderModule` collects successful results as `LoadedGalleryEmbedding(person_id, embedding)` values; skips and records a structured warning for each file that returned a failure.
+6. `FaceGalleryLoaderModule` verifies at least one `LoadedGalleryEmbedding` was collected; raises a structured error if none were collected.
+7. `FaceGalleryLoaderModule` calls `FaceGalleryCache.replace_all(LoadedGalleryEmbedding[])`.
 8. `FaceGalleryLoaderModule` returns control to the caller.
 
-For `get_all_embeddings`: `FaceGalleryLoaderModule` calls `FaceGalleryCache.get_all_entries()` → `GalleryEntry[]` and returns the result directly.
+For `get_all_embeddings`: `FaceGalleryLoaderModule` calls `FaceGalleryCache.get_all_entries()` → `LoadedGalleryEmbedding[]` and returns the result directly.
 
-For `get_embeddings(person_id)`: `FaceGalleryLoaderModule` calls `FaceGalleryCache.get_entries_by_person(person_id)` → `GalleryEntry[]` and returns the result directly.
+For `get_embeddings(person_id)`: `FaceGalleryLoaderModule` calls `FaceGalleryCache.get_entries_by_person(person_id)` → `LoadedGalleryEmbedding[]` and returns the result directly.
 
 For `get_person_ids`: `FaceGalleryLoaderModule` calls `FaceGalleryCache.get_person_ids()` → `string[]` and returns the result directly.
 
@@ -329,8 +346,8 @@ Injection at construction time:
 ## 10. Internal Data Structures
 
 - **`PersonScanRecord`** — person directory scan result containing `person_id` (string, derived from subdirectory name) and `file_paths` (list of matched embedding file paths under that person's directory); produced by `GalleryDirectoryScanner`, consumed by `FaceGalleryLoaderModule`; lifecycle: per `load_gallery` call
-- **`GalleryEntry`** — loaded gallery record containing `person_id` and `FaceEmbedding`; constructed by `FaceGalleryLoaderModule` from accepted `EmbeddingFileReader` results, stored by `FaceGalleryCache`; lifecycle: persistent in `FaceGalleryCache` after load, replaced atomically on reload
-- **`FaceEmbedding`** — opaque fixed-dimension float vector loaded from disk by `EmbeddingFileReader`; consumed by `FaceGalleryLoaderModule` for `GalleryEntry` construction; lifecycle: per file read, then persistent within `GalleryEntry` in the cache
+- **`LoadedGalleryEmbedding`** — validated embedding record loaded from persistent gallery storage; contains `person_id` and `FaceEmbedding`; constructed by `FaceGalleryLoaderModule` from accepted `EmbeddingFileReader` results, stored by `FaceGalleryCache`; lifecycle: persistent in `FaceGalleryCache` after load, replaced atomically on reload. This is the Face Gallery Loader output type. It is not `EnrolledIdentity` and must not be moved to `shared_contracts.md`.
+- **`FaceEmbedding`** — opaque fixed-dimension float vector loaded from disk by `EmbeddingFileReader`; consumed by `FaceGalleryLoaderModule` for `LoadedGalleryEmbedding` construction; lifecycle: per file read, then persistent within `LoadedGalleryEmbedding` in the cache
 
 ---
 
@@ -393,8 +410,8 @@ Module is stateful. Cache state persists across all read calls. Cache is replace
 classDiagram
     class FaceGalleryLoaderModule {
         +load_gallery(gallery_root_path: string) void
-        +get_all_embeddings() GalleryEntry[]
-        +get_embeddings(person_id: string) GalleryEntry[]
+        +get_all_embeddings() LoadedGalleryEmbedding[]
+        +get_embeddings(person_id: string) LoadedGalleryEmbedding[]
         +get_person_ids() string[]
     }
 
@@ -416,14 +433,14 @@ classDiagram
     }
 
     class FaceGalleryCache {
-        -entries: GalleryEntry[]
-        +replace_all(entries: GalleryEntry[]) void
-        +get_all_entries() GalleryEntry[]
-        +get_entries_by_person(person_id: string) GalleryEntry[]
+        -entries: LoadedGalleryEmbedding[]
+        +replace_all(entries: LoadedGalleryEmbedding[]) void
+        +get_all_entries() LoadedGalleryEmbedding[]
+        +get_entries_by_person(person_id: string) LoadedGalleryEmbedding[]
         +get_person_ids() string[]
     }
 
-    class GalleryEntry {
+    class LoadedGalleryEmbedding {
         +person_id: string
         +embedding: FaceEmbedding
     }
@@ -438,8 +455,8 @@ classDiagram
     FaceGalleryLoaderModule --> EmbeddingFileReader : orchestrates
     FaceGalleryLoaderModule --> FaceGalleryCache : reads and updates
     NpyEmbeddingFileReader ..|> EmbeddingFileReader : implements
-    FaceGalleryLoaderModule --> GalleryEntry : constructs and returns
-    FaceGalleryCache --> GalleryEntry : stores
+    FaceGalleryLoaderModule --> LoadedGalleryEmbedding : constructs and returns
+    FaceGalleryCache --> LoadedGalleryEmbedding : stores
     GalleryDirectoryScanner --> PersonScanRecord : returns
 ```
 
@@ -467,8 +484,8 @@ sequenceDiagram
         EmbeddingFileReader->>EmbeddingFileReader: open, deserialize, validate shape and dtype
         EmbeddingFileReader-->>FaceGalleryLoaderModule: FaceEmbedding or structured failure
     end
-    FaceGalleryLoaderModule->>FaceGalleryLoaderModule: collect GalleryEntry[], verify non-empty
-    FaceGalleryLoaderModule->>FaceGalleryCache: replace_all(GalleryEntry[])
+    FaceGalleryLoaderModule->>FaceGalleryLoaderModule: collect LoadedGalleryEmbedding[], verify non-empty
+    FaceGalleryLoaderModule->>FaceGalleryCache: replace_all(LoadedGalleryEmbedding[])
     FaceGalleryCache-->>FaceGalleryLoaderModule: cache updated
     FaceGalleryLoaderModule-->>Caller: void
 ```
@@ -483,9 +500,9 @@ flowchart TD
     B["GalleryPathValidator<br/>validated gallery_root_path"]
     C["GalleryDirectoryScanner<br/>PersonScanRecord[]<br/>(person_id + file_paths per person)"]
     D["EmbeddingFileReader<br/>FaceEmbedding<br/>(per file: float vector, dim N, dtype T)"]
-    E["FaceGalleryLoaderModule<br/>GalleryEntry[]<br/>(person_id + embedding, per valid file)"]
-    F["FaceGalleryCache<br/>GalleryEntry[]<br/>(indexed by person_id, in-memory)"]
-    G["Caller / External Component<br/>GalleryEntry[] or string[]"]
+    E["FaceGalleryLoaderModule<br/>LoadedGalleryEmbedding[]<br/>(person_id + embedding, per valid file)"]
+    F["FaceGalleryCache<br/>LoadedGalleryEmbedding[]<br/>(indexed by person_id, in-memory)"]
+    G["Caller / External Component<br/>LoadedGalleryEmbedding[] or string[]"]
 
     A --> B
     B --> C
@@ -509,8 +526,8 @@ flowchart TD
 
 **What must remain stable:**
 
-- `load_gallery(gallery_root_path: string) -> void`, `get_all_embeddings() -> GalleryEntry[]`, `get_embeddings(person_id: string) -> GalleryEntry[]`, `get_person_ids() -> string[]` signatures
-- Output schema: `GalleryEntry { person_id: string, embedding: FaceEmbedding }`
+- `load_gallery(gallery_root_path: string) -> void`, `get_all_embeddings() -> LoadedGalleryEmbedding[]`, `get_embeddings(person_id: string) -> LoadedGalleryEmbedding[]`, `get_person_ids() -> string[]` signatures
+- Output schema: `LoadedGalleryEmbedding { person_id: string, embedding: FaceEmbedding }`
 - Empty list semantics for `get_embeddings` when `person_id` is not found in the cache
 - Structured error semantics for invalid path, unreadable directory, and empty gallery
 - Deterministic ordering: `get_person_ids()` returns lexicographically sorted person IDs; `get_all_embeddings()` and `get_embeddings(person_id)` return entries in stable, reproducible order
@@ -520,7 +537,7 @@ flowchart TD
 ## 18. Module Compliance Checklist
 
 - [ ] Read-only guarantee — module performs no write operations to disk, to embeddings, or to identity records at any point
-- [ ] No file paths or internal storage details exposed — `GalleryEntry` must contain only `person_id` and `embedding`; no file name, directory name, record ID, or cache key is returned
+- [ ] No file paths or internal storage details exposed — `LoadedGalleryEmbedding` must contain only `person_id` and `embedding`; no file name, directory name, record ID, or cache key is returned
 - [ ] No embedding generation — no inference engine is invoked; all embeddings are loaded from pre-existing files on disk
 - [ ] No matching logic — no similarity computation, threshold comparison, or identity decision is performed inside this module
 - [ ] Engine abstraction respected — `FaceGalleryLoaderModule` depends on the `EmbeddingFileReader` interface, not on `NpyEmbeddingFileReader` directly

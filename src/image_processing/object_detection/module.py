@@ -8,6 +8,7 @@ from typing import Any, TypedDict
 import numpy as np
 
 from image_processing.shared.contracts import (
+    BoundingBox,
     GeometrySpec,
     Image,
     OutputImageType,
@@ -16,21 +17,12 @@ from image_processing.shared.contracts import (
 )
 
 
-class BoundingBox(TypedDict):
-    x: int
-    y: int
-    width: int
-    height: int
-
-
 class ObjectDetectionInput(TypedDict):
     frame_id: str
     camera_id: str
     timestamp_ms: int
     roi_image: Image
     roi_bbox_frame: BoundingBox
-    width: int
-    height: int
 
 
 class FrameMetadata(TypedDict):
@@ -92,8 +84,6 @@ class InputValidator:
             raise ValueError("timestamp_ms is required")
         if not isinstance(metadata["timestamp_ms"], int):
             raise TypeError("timestamp_ms must be an int")
-        if metadata["width"] <= 0 or metadata["height"] <= 0:
-            raise ValueError("width and height must be positive")
         roi_bbox = metadata.get("roi_bbox_frame")
         if roi_bbox is None:
             raise ValueError("roi_bbox_frame is required")
@@ -134,9 +124,9 @@ class InputValidator:
                 f"roi_image.value_range must be '{_EXPECTED_VALUE_RANGE}', "
                 f"got {roi_image.get('value_range')!r}"
             )
-        # Shape consistency: data must match the standalone width/height
-        if data.shape[0] != metadata["height"] or data.shape[1] != metadata["width"]:
-            raise ValueError("metadata width and height must match roi_image.data shape")
+        # Shape consistency: data must match roi_image.width and roi_image.height
+        if data.shape[0] != roi_image["height"] or data.shape[1] != roi_image["width"]:
+            raise ValueError("roi_image.data shape must match roi_image.width and roi_image.height")
 
 
 class UltralyticsInferenceEngine:
@@ -300,16 +290,29 @@ class ObjectDetectionModule:
 
     def detect(self, input: ObjectDetectionInput) -> PersonDetectionResult:
         """Primary public integration method. Called by PipelineOrchestrator via ObjectDetectionInterface."""
-        metadata: FrameMetadata = {
-            "camera_id": input["camera_id"],
-            "frame_id": input["frame_id"],
-            "timestamp_ms": input["timestamp_ms"],
-            "width": input["width"],
-            "height": input["height"],
-            "roi_bbox_frame": input["roi_bbox_frame"],
-        }
-        self._input_validator.validate_input(input["roi_image"], metadata, self._config)
-        return self.process(input["roi_image"]["data"], metadata)
+        try:
+            roi_image = input.get("roi_image") if isinstance(input, dict) else None  # type: ignore[union-attr]
+            if not isinstance(roi_image, dict):
+                raise TypeError(
+                    f"ObjectDetectionInput.roi_image must be an Image struct (dict), got {type(roi_image).__name__}"
+                )
+            metadata: FrameMetadata = {
+                "camera_id": input["camera_id"],
+                "frame_id": input["frame_id"],
+                "timestamp_ms": input["timestamp_ms"],
+                "width": roi_image["width"],
+                "height": roi_image["height"],
+                "roi_bbox_frame": input["roi_bbox_frame"],
+            }
+            self._input_validator.validate_input(roi_image, metadata, self._config)
+            return self.process(roi_image["data"], metadata)
+        except Exception:
+            frame_id = input.get("frame_id", "") if isinstance(input, dict) else ""
+            return PersonDetectionResult(
+                frame_id=frame_id,
+                person_detected=False,
+                persons=[],
+            )
 
     def get_input_contract(self) -> PipelineStageInputContract:
         """Return the image format and geometry required by this stage.

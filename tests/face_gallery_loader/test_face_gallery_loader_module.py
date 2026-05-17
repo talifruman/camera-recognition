@@ -33,6 +33,7 @@ from src.image_processing.face_gallery_loader import (
     FaceGalleryLoaderModule,
     GalleryLoadError,
     GalleryPathValidationError,
+    StubEmbeddingFileReader,
 )
 
 # ------------------------------------------------------------------ constants
@@ -63,8 +64,14 @@ def _make_config() -> FaceGalleryLoaderConfig:
 
 
 def _make_module() -> FaceGalleryLoaderModule:
-    """Return a FaceGalleryLoaderModule wired with StubEmbeddingFileReader."""
-    return FaceGalleryLoaderModule(config=_make_config())
+    """Return a FaceGalleryLoaderModule wired with StubEmbeddingFileReader (explicit injection for unit tests)."""
+    config = _make_config()
+    stub_reader = StubEmbeddingFileReader(
+        embedding_file_extension=config.embedding_file_extension,
+        expected_embedding_dim=config.expected_embedding_dim,
+        expected_dtype=config.expected_dtype,
+    )
+    return FaceGalleryLoaderModule(config=config, reader=stub_reader)
 
 
 def _loaded_module() -> FaceGalleryLoaderModule:
@@ -110,7 +117,7 @@ class TestPersonCount:
 class TestEntryCount:
 
     def test_correct_number_of_entries_loaded(self) -> None:
-        """get_all_embeddings() must return 57 GalleryEntry values."""
+        """get_all_embeddings() must return 57 LoadedGalleryEmbedding values."""
         module = _loaded_module()
         entries = module.get_all_embeddings()
         assert len(entries) == _EXPECTED_TOTAL_ENTRIES, (
@@ -146,7 +153,7 @@ class TestAllEmbeddings:
         assert len(entries) == _EXPECTED_TOTAL_ENTRIES
 
     def test_all_entries_have_person_id_and_embedding(self) -> None:
-        """Every GalleryEntry must have non-empty person_id and an embedding."""
+        """Every LoadedGalleryEmbedding must have non-empty person_id and an embedding."""
         module = _loaded_module()
         for entry in module.get_all_embeddings():
             assert entry["person_id"], "person_id must be non-empty"
@@ -308,3 +315,34 @@ class TestConstantEmbedding:
         assert embedding.shape[0] == 512, (
             f"Embedding dimension expected 512, got {embedding.shape[0]}"
         )
+
+
+    # ==================================================================
+    # Test 12 — Default reader is NpyEmbeddingFileReader (Phase 2)
+    # ==================================================================
+
+    class TestDefaultReader:
+
+        def test_default_reader_is_npy_embedding_file_reader(self) -> None:
+            """FaceGalleryLoaderModule() with no reader arg must default to NpyEmbeddingFileReader."""
+            from src.image_processing.face_gallery_loader import NpyEmbeddingFileReader
+        
+            config = _make_config()
+            loader = FaceGalleryLoaderModule(config=config)  # no reader arg
+            assert isinstance(loader._reader, NpyEmbeddingFileReader), (
+                f"Expected default reader to be NpyEmbeddingFileReader, "
+                f"got {type(loader._reader).__name__}"
+            )
+
+        def test_stub_reader_can_be_injected_explicitly(self) -> None:
+            """StubEmbeddingFileReader must still be available for explicit test injection."""
+            config = _make_config()
+            stub_reader = StubEmbeddingFileReader(
+                embedding_file_extension=config.embedding_file_extension,
+                expected_embedding_dim=config.expected_embedding_dim,
+                expected_dtype=config.expected_dtype,
+            )
+            loader = FaceGalleryLoaderModule(config=config, reader=stub_reader)
+            assert loader._reader is stub_reader, (
+                "Explicitly injected StubEmbeddingFileReader must be used"
+            )

@@ -13,13 +13,15 @@ The following types used by this module are defined in [shared_contracts.md](sha
 
 ### Purpose
 
-The Motion Detection module is responsible for detecting motion between two frames provided per invocation. It receives a `MotionDetectionInput` containing `current_frame` and `previous_frame`, compares them, applies threshold-based decision logic, and returns a `MotionResult`. The module is stateless: it does not store frames internally.
+The Motion Detection module is responsible for detecting motion between two frames provided per invocation. It receives a `MotionDetectionInput` containing `current_frame` and `previous_frame`, compares them, applies bbox filtering/merging and threshold-based decision logic, and returns a `MotionResult`. The module does not store frame pixels, but may keep short per-camera motion bbox history for temporal persistence gating.
 
 ### In Scope
 
 - Validating the incoming `MotionDetectionInput`
 - Computing motion measurements using a configurable motion detection algorithm
 - Filtering candidate bounding boxes by minimum area
+- Merging overlapping and nearby bounding boxes when enabled
+- Applying temporal persistence gating using per-camera bbox history when enabled
 - Applying threshold-based decision logic to produce a binary `detected` result
 - Returning `MotionResult` to the caller
 
@@ -30,7 +32,7 @@ The Motion Detection Module does NOT:
 - Perform image format conversion, color space conversion, layout conversion, dtype conversion, or normalization
 - Detect specific objects, faces, or persons
 - Perform identity matching or recognition
-- Store frames internally or maintain any per-camera state across invocations
+- Store frame pixels internally
 - Expose raw pixel difference values, motion fractions, or pixel counts in any output
 
 ---
@@ -39,7 +41,7 @@ The Motion Detection Module does NOT:
 
 ### 2.1 Input Responsibility Boundary
 
-The module expects the input `MotionDetectionInput` to already conform to the required image contract before `process` is called. Image format conversion, layout conversion, dtype conversion, and normalization are applied to both `current_frame.image` and `previous_frame.image` outside this module. The Motion Detection module does not perform any preprocessing. The module enforces the image contract at the boundary via `InputValidator`.
+The module expects the input `MotionDetectionInput` to already conform to the required image contract before `detect` is called. Image format conversion, layout conversion, dtype conversion, and normalization are applied to both `current_frame.image` and `previous_frame.image` outside this module. The Motion Detection module does not perform any preprocessing. The module enforces the image contract at the boundary via `InputValidator`.
 
 The module processes exactly one `MotionDetectionInput` per invocation.
 
@@ -63,7 +65,7 @@ struct MotionDetectionInput {
 
 > **Note on naming.** This module uses `MotionInputFrame` instead of `FramePacket` to avoid ambiguity with the `FramePacket` type defined by the Frame Transformation Layer (which carries raw `image_bytes` as bytes, not a shared `Image` struct). `MotionInputFrame` is a motion-detection-specific input container carrying a fully prepared shared `Image`.
 
-- `frame_id` identifies the source frame for traceability.
+- `frame_id` identifies the source frame for traceability. Must be non-empty and non-null; Motion Detection validates its presence.
 - `camera_id` identifies the source camera; preserved unchanged for traceability.
 - `timestamp_ms` is the capture timestamp in milliseconds.
 - `image` is the prepared grayscale image for the frame (`Image` — see [shared_contracts.md §6](shared_contracts.md)).
@@ -150,10 +152,15 @@ All motion measurement computations and intermediate results remain strictly int
 ## 4. Public API
 
 ```text
-MotionResult process(input: MotionDetectionInput)
+MotionResult detect(input: MotionDetectionInput)
+PipelineStageInputContract get_input_contract()
 ```
 
-The method does not return a status enum. The result of the module is fully expressed through `MotionResult`.
+`detect()` is the single RPM-facing public stage API. It accepts one `MotionDetectionInput` per invocation and returns a `MotionResult`. It does not return a status enum. The result of the module is fully expressed through `MotionResult`.
+
+`get_input_contract()` is called by RPM at initialization to determine the image format and geometry this stage requires. It returns a `PipelineStageInputContract` (see [shared_contracts.md §5](shared_contracts.md)) with:
+- `output_image_type = OutputImageType.GRAYSCALE_UINT8_HWC`
+- `geometry_spec = GeometrySpec(width=0, height=0, resize_policy=ResizePolicy.NONE)` — the FTL returns the full frame at its natural size
 
 The API must remain stable regardless of which motion detection algorithm is configured. `motion_fraction_threshold`, `motion_threshold`, and `min_bbox_area` are never parameters — they are immutable internal configuration state loaded at initialization.
 
@@ -161,7 +168,8 @@ The API must remain stable regardless of which motion detection algorithm is con
 
 ## 5. Non-Functional Requirements
 
-- **Stateless — the module does not store or reuse any frame data across invocations** — all frame data is provided as part of the input and is not retained after the call returns
+- **No frame-pixel storage** — frame pixel buffers are provided by input and are not retained after return
+- **Optional per-camera bbox history** — when temporal persistence is enabled, only lightweight bbox history is retained per `camera_id`
 - **Single input per invocation** — the module processes exactly one `MotionDetectionInput` per invocation and must not accept batched input
 - **Real-time capable** — suitable for per-frame online processing
 - **Deterministic** — same `MotionDetectionInput` and same configuration produce the same output
@@ -193,7 +201,9 @@ class FrameDifferencingMotionDetector implements MotionDetectionAlgorithm
 3. Run contour or connected-component analysis on the binary mask to extract candidate motion regions.
 4. Convert each candidate region to a `BoundingBox` with fields `(x, y, width, height)` relative to `current_frame.image` (the image actually used for motion measurement), where `(x, y)` is the top-left corner.
 5. Discard any `BoundingBox` whose area (`width * height`) is less than `min_bbox_area`.
-6. Return all surviving boxes together with `motion_fraction` in a `MotionMeasurementResult`.
+6. Optionally merge overlapping and nearby boxes (IoU and distance thresholds).
+7. Optionally apply temporal persistence gating so one-frame transients are suppressed.
+8. Return all surviving boxes together with `motion_fraction` in a `MotionMeasurementResult`.
 
 It does not decide whether motion occurred.
 
@@ -300,16 +310,18 @@ Its responsibilities are:
 
 ### 8.6 End-to-End Processing Flow
 
-For one invocation of `process`, the internal pipeline follows this order:
+For one invocation of `detect`, the internal pipeline follows this order:
 
-**InputValidator → MotionDetectionAlgorithm → MotionDecisionPolicy → MotionOutputBuilder**
+**InputValidator → MotionDetectionAlgorithm → BBoxMerge (optional) → TemporalPersistence (optional) → MotionDecisionPolicy → MotionOutputBuilder**
 
-1. `MotionDetectionManager` receives `MotionDetectionInput`.
+1. `MotionDetectionManager` receives `MotionDetectionInput` via `detect(input)`.
 2. `MotionDetectionManager` calls `InputValidator.validate(input)` → void. On failure: constructs `MotionDetectionResultInternal{detected: false}`, calls `MotionOutputBuilder.build(resultInternal)` → `MotionResult`, and terminates processing.
-3. `MotionDetectionManager` calls `MotionDetectionAlgorithm.measure(input.previous_frame.image, input.current_frame.image)` → `MotionMeasurementResult`.
-4. `MotionDetectionManager` calls `MotionDecisionPolicy.decide(measurementResult)` → `MotionDetectionResultInternal`.
-5. `MotionDetectionManager` calls `MotionOutputBuilder.build(resultInternal)` → `MotionResult`.
-6. `MotionDetectionManager` returns `MotionResult`.
+3. `MotionDetectionManager` calls `MotionDetectionAlgorithm.measure(input.previous_frame.image.data, input.current_frame.image.data)` → `MotionMeasurementResult`. (The raw numpy arrays are extracted from the `Image` struct internally; the algorithm layer operates on `np.ndarray`.)
+4. `MotionDetectionManager` optionally merges candidate bboxes using configured IoU and distance thresholds.
+5. `MotionDetectionManager` optionally applies temporal persistence per `camera_id` before final decision.
+6. `MotionDetectionManager` calls `MotionDecisionPolicy.decide(measurementResult)` → `MotionDetectionResultInternal`.
+7. `MotionDetectionManager` calls `MotionOutputBuilder.build(resultInternal)` → `MotionResult`.
+8. `MotionDetectionManager` returns `MotionResult`.
 
 All intermediate data (`MotionMeasurementResult`, `MotionDetectionResultInternal`, raw bboxes, motion fractions, pixel counts) remain strictly internal to the module.
 
@@ -324,6 +336,13 @@ struct MotionDetectionConfig {
     int32  motion_threshold;               // per-pixel intensity difference to classify a pixel as changed
     float  motion_fraction_threshold;      // fraction of frame pixels that must change to trigger detection
     int32  min_bbox_area;                  // minimum bounding box area in pixels; smaller boxes are discarded
+    bool   enable_bbox_merging;
+    float  bbox_merge_iou_threshold;
+    float  bbox_merge_distance_threshold;
+    bool   enable_temporal_persistence;
+    int32  min_persistence_frames;
+    float  persistence_iou_threshold;
+    int32  max_history_frames;
 }
 ```
 
@@ -335,6 +354,7 @@ Injection at construction time:
 
 - `motion_threshold` and `min_bbox_area` → `FrameDifferencingMotionDetector`
 - `motion_fraction_threshold` → `MotionDecisionPolicy`
+- bbox merging and temporal persistence fields → `MotionDetectionManager` post-measurement pipeline
 - `MotionDetectionAlgorithm` is injected as an abstract dependency, with `FrameDifferencingMotionDetector` as the default implementation
 
 ---
@@ -396,8 +416,15 @@ Stateless — the module does not store or reuse any frame data across invocatio
 
 ```mermaid
 classDiagram
+    class MotionDetectionInterface {
+        <<Protocol>>
+        +detect(input: MotionDetectionInput) MotionResult
+        +get_input_contract() PipelineStageInputContract
+    }
+
     class MotionDetectionManager {
-        +process(input: MotionDetectionInput) MotionResult
+        +detect(input: MotionDetectionInput) MotionResult
+        +get_input_contract() PipelineStageInputContract
     }
 
     class InputValidator {
@@ -406,11 +433,11 @@ classDiagram
 
     class MotionDetectionAlgorithm {
         <<interface>>
-        +measure(previous: Image, current: Image) MotionMeasurementResult
+        +measure(previous: np.ndarray, current: np.ndarray) MotionMeasurementResult
     }
 
     class FrameDifferencingMotionDetector {
-        +measure(previous: Image, current: Image) MotionMeasurementResult
+        +measure(previous: np.ndarray, current: np.ndarray) MotionMeasurementResult
     }
 
     class MotionDecisionPolicy {
@@ -455,6 +482,7 @@ classDiagram
         +height: int32
     }
 
+    MotionDetectionManager ..|> MotionDetectionInterface : implements
     MotionDetectionManager --> InputValidator : orchestrates
     MotionDetectionManager --> MotionDetectionAlgorithm : orchestrates
     MotionDetectionManager --> MotionDecisionPolicy : orchestrates
@@ -481,7 +509,7 @@ sequenceDiagram
     participant Policy as MotionDecisionPolicy
     participant Builder as MotionOutputBuilder
 
-    Caller->>Manager: process(input)
+    Caller->>Manager: detect(input)
 
     alt invalid input
         Manager->>Validator: validate(input)
@@ -492,7 +520,7 @@ sequenceDiagram
     else valid input
         Manager->>Validator: validate(input)
         Validator-->>Manager: input valid
-        Manager->>Alg: measure(input.previous_frame.image, input.current_frame.image)
+        Manager->>Alg: measure(input.previous_frame.image.data, input.current_frame.image.data)
         Alg->>Alg: run frame differencing
         Alg-->>Manager: MotionMeasurementResult
         Manager->>Policy: decide(measurementResult)
@@ -534,8 +562,8 @@ flowchart TD
 
 **What must remain stable:**
 
-- `process(input: MotionDetectionInput) -> MotionResult` signature
-- The module's external contract is defined by `MotionDetectionInput` and `MotionResult`.
+- `detect(input: MotionDetectionInput) -> MotionResult` signature — the single RPM-facing public stage API
+- `get_input_contract() -> PipelineStageInputContract` signature
 - `detected = false` semantics for invalid input, missing or invalid `previous_frame`, and no-motion scenarios
 - The module produces spatial motion regions valid for direct geometric use without further normalization; the `bboxes` output is fully defined, axis-aligned, and coordinate-stable relative to `current_frame.image` (the image actually used for motion measurement); all coordinates remain within the input image space and are never projected outside it
 
@@ -556,3 +584,4 @@ flowchart TD
 - [ ] Module does not expose control-flow enums via public API
 - [ ] All outcomes are expressed via `MotionResult` return value only
 - [ ] MotionDecisionPolicy is the only component that sets detected
+- [ ] `detect()` is the only RPM-facing public stage API; `get_input_contract()` is the only initialization-time contract method

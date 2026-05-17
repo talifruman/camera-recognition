@@ -22,8 +22,13 @@ FaceEmbedding = np.ndarray
 # ---------------------------------------------------------------------------
 
 
-class GalleryEntry(TypedDict):
-    """Loaded gallery record (spec §3.1).  person_id and embedding only."""
+class LoadedGalleryEmbedding(TypedDict):
+    """Validated embedding record loaded from persistent gallery storage (spec §3.1).
+
+    This is the Face Gallery Loader output type.  It is NOT EnrolledIdentity.
+    It is not a Face Recognition type.  It must not be moved to shared_contracts.
+    Fields: person_id and embedding only.
+    """
     person_id: str
     embedding: FaceEmbedding
 
@@ -168,6 +173,7 @@ class NpyEmbeddingFileReader:
           - the file extension does not match the configured extension
           - the array shape is not (expected_embedding_dim,)
           - the array dtype does not match expected_dtype
+          - the array is not L2-normalized (|norm - 1.0| > 1e-4)
           - any I/O or format error occurs
         """
         if not os.path.isfile(file_path):
@@ -183,7 +189,16 @@ class NpyEmbeddingFileReader:
             return None
         if arr.dtype != np.dtype(self._dtype):
             return None
-        return arr.astype(np.float32)
+        arr = arr.astype(np.float32)
+        norm = float(np.linalg.norm(arr))
+        if abs(norm - 1.0) > 1e-4:
+            warnings.warn(
+                f"Embedding in '{file_path}' is not L2-normalized "
+                f"(norm={norm:.6f}); skipping.",
+                stacklevel=2,
+            )
+            return None
+        return arr
 
 
 # ---------------------------------------------------------------------------
@@ -319,15 +334,15 @@ class FaceGalleryCache:
 
     This is the only component that holds gallery state in memory.
 
-    Internal storage: dict[person_id, list[GalleryEntry]] where the list
+    Internal storage: dict[person_id, list[LoadedGalleryEmbedding]] where the list
     preserves file enumeration order within each person.
     """
 
     def __init__(self) -> None:
         # _index maps person_id → entries in file enumeration order.
-        self._index: dict[str, list[GalleryEntry]] = {}
+        self._index: dict[str, list[LoadedGalleryEmbedding]] = {}
 
-    def replace_all(self, entries: list[GalleryEntry]) -> None:
+    def replace_all(self, entries: list[LoadedGalleryEmbedding]) -> None:
         """
         Atomically replace all stored entries (spec §8.5).
 
@@ -335,7 +350,7 @@ class FaceGalleryCache:
         expected to be sorted by person_id then by file order within each
         person (enforced by the orchestrator).
         """
-        new_index: dict[str, list[GalleryEntry]] = {}
+        new_index: dict[str, list[LoadedGalleryEmbedding]] = {}
         for entry in entries:
             pid = entry["person_id"]
             if pid not in new_index:
@@ -344,17 +359,17 @@ class FaceGalleryCache:
         # Atomic replacement.
         self._index = new_index
 
-    def get_all_entries(self) -> list[GalleryEntry]:
+    def get_all_entries(self) -> list[LoadedGalleryEmbedding]:
         """
         Return all entries sorted by person_id lexicographically, then by
         file enumeration order within each person (spec §5, §8.5).
         """
-        result: list[GalleryEntry] = []
+        result: list[LoadedGalleryEmbedding] = []
         for pid in sorted(self._index.keys()):
             result.extend(self._index[pid])
         return result
 
-    def get_entries_by_person(self, person_id: str) -> list[GalleryEntry]:
+    def get_entries_by_person(self, person_id: str) -> list[LoadedGalleryEmbedding]:
         """
         Return entries for the given person_id in file enumeration order.
         Returns an empty list if person_id is not present (not an error).
@@ -381,8 +396,8 @@ class FaceGalleryLoaderModule:
 
     Public API (spec §4):
         load_gallery(gallery_root_path: str) -> None
-        get_all_embeddings()               -> list[GalleryEntry]
-        get_embeddings(person_id: str)     -> list[GalleryEntry]
+        get_all_embeddings()               -> list[LoadedGalleryEmbedding]
+        get_embeddings(person_id: str)     -> list[LoadedGalleryEmbedding]
         get_person_ids()                   -> list[str]
     """
 
@@ -395,18 +410,19 @@ class FaceGalleryLoaderModule:
         Initialize the module and wire internal components.
 
         config  — if None, a default FaceGalleryLoaderConfig is used.
-        reader  — if None, StubEmbeddingFileReader is used (Phase 1 default).
-                  In Phase 2, pass NpyEmbeddingFileReader(config) here to
-                  switch to real deserialization without any other change.
+        reader  — if None, NpyEmbeddingFileReader is used (production default).
+                  To use StubEmbeddingFileReader (test/dev only), pass it explicitly:
+                  FaceGalleryLoaderModule(config, reader=StubEmbeddingFileReader(...))
         """
         if config is None:
             config = FaceGalleryLoaderConfig()
 
         self._config = config
 
-        # Wire the reader: Phase 1 default is the stub.
+        # Wire the reader: default is NpyEmbeddingFileReader (production).
+        # For test/dev use, inject StubEmbeddingFileReader explicitly.
         if reader is None:
-            reader = StubEmbeddingFileReader(
+            reader = NpyEmbeddingFileReader(
                 embedding_file_extension=config.embedding_file_extension,
                 expected_embedding_dim=config.expected_embedding_dim,
                 expected_dtype=config.expected_dtype,
@@ -429,7 +445,7 @@ class FaceGalleryLoaderModule:
           1. GalleryPathValidator.validate
           2. GalleryDirectoryScanner.scan  →  PersonScanRecord[]
           3. EmbeddingFileReader.read_embedding per file  →  skip failures
-          4. Verify at least one GalleryEntry collected
+          4. Verify at least one LoadedGalleryEmbedding collected
           5. FaceGalleryCache.replace_all
 
         Raises GalleryPathValidationError if the path is invalid.
@@ -443,7 +459,7 @@ class FaceGalleryLoaderModule:
         person_records = self._scanner.scan(gallery_root_path)
 
         # Step 3 & 4: load embeddings; apply skip-or-fail policy.
-        collected: list[GalleryEntry] = []
+        collected: list[LoadedGalleryEmbedding] = []
         skipped_count = 0
 
         for record in person_records:
@@ -460,7 +476,7 @@ class FaceGalleryLoaderModule:
                     )
                     continue
                 collected.append(
-                    GalleryEntry(person_id=record.person_id, embedding=embedding)
+                    LoadedGalleryEmbedding(person_id=record.person_id, embedding=embedding)
                 )
 
         # Step 5: verify non-empty.
@@ -474,13 +490,13 @@ class FaceGalleryLoaderModule:
         # Step 6: atomic cache replacement.
         self._cache.replace_all(collected)
 
-    def get_all_embeddings(self) -> list[GalleryEntry]:
-        """Return all cached GalleryEntry values (spec §4)."""
+    def get_all_embeddings(self) -> list[LoadedGalleryEmbedding]:
+        """Return all cached LoadedGalleryEmbedding values (spec §4)."""
         return self._cache.get_all_entries()
 
-    def get_embeddings(self, person_id: str) -> list[GalleryEntry]:
+    def get_embeddings(self, person_id: str) -> list[LoadedGalleryEmbedding]:
         """
-        Return GalleryEntry values for person_id.
+        Return LoadedGalleryEmbedding values for person_id.
 
         Returns an empty list if person_id is not found — not an error
         (spec §2.4, §4, §11).

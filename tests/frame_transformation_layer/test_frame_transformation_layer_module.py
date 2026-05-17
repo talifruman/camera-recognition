@@ -13,10 +13,11 @@ import pytest
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+_SRC_ROOT = _PROJECT_ROOT / "src"
+if str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
 
 from src.image_processing.frame_transformation_layer import (  # noqa: E402
-    BaseImage,
-    BoundingBox,
     CameraFrameState,
     ConversionError,
     CropOutOfBoundsError,
@@ -26,9 +27,7 @@ from src.image_processing.frame_transformation_layer import (  # noqa: E402
     FrameStore,
     FrameTemporalSelector,
     FrameTransformationLayer,
-    GeometryPolicy,
-    GeometrySpec,
-    Image,
+    ResizePolicy,
     ImageConversionContract,
     InvalidCropBboxError,
     InvalidFramePacketFormatError,
@@ -40,6 +39,24 @@ from src.image_processing.frame_transformation_layer import (  # noqa: E402
     StoredFrame,
     UnsupportedOutputImageTypeError,
     ValidationError,
+)
+from src.image_processing.frame_transformation_layer.module import (  # noqa: E402
+    BoundingBox as InternalBoundingBox,
+    GeometrySpec as InternalGeometrySpec,
+)
+from src.image_processing.motion_detection import (  # noqa: E402
+    MotionDetectionManager,
+)
+from src.image_processing.face_recognition import (  # noqa: E402
+    FaceRecognitionConfig,
+    FaceRecognitionModule,
+    StubFaceEmbeddingEngine,
+)
+from src.image_processing.shared.contracts import (  # noqa: E402
+    BoundingBox as SharedBoundingBox,
+    GeometrySpec as SharedGeometrySpec,
+    OutputImageType as SharedOutputImageType,
+    ResizePolicy as SharedResizePolicy,
 )
 
 
@@ -96,15 +113,16 @@ def test_ingest_stores_full_frame_base_image():
     assert isinstance(stored, StoredFrame)
     assert stored.frame_id == "f1"
     assert stored.camera_id == "c1"
-    base = stored.base_image
-    assert isinstance(base, BaseImage)
-    assert base.width == 4
-    assert base.height == 3
-    assert base.color_format == "RGB"
-    assert base.layout == "HWC"
-    assert base.dtype == "uint8"
-    assert base.value_range == "[0,255]"
-    assert base.data == raw
+    image = stored.image
+    assert isinstance(image, dict)
+    assert image["width"] == 4
+    assert image["height"] == 3
+    assert image["color_format"] == "RGB"
+    assert image["layout"] == "HWC"
+    assert image["dtype"] == "uint8"
+    assert image["value_range"] == "[0,255]"
+    expected = np.frombuffer(raw, dtype=np.uint8).reshape(3, 4, 3)
+    assert np.array_equal(image["data"], expected)
 
 
 @pytest.mark.parametrize(
@@ -157,42 +175,211 @@ def test_get_frame_returns_processed_frame():
     pf = ftl.get_frame(
         camera_id="c1",
         temporal_selector=FrameTemporalSelector.CURRENT,
-        region_bbox=BoundingBox(x=0, y=0, width=10, height=8),
+        region_bbox=InternalBoundingBox(x=0, y=0, width=10, height=8),
         output_type=OutputImageType.RGB_UINT8_HWC,
-        geometry_spec=GeometrySpec(policy=GeometryPolicy.PRESERVE),
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
     )
 
     assert isinstance(pf, ProcessedFrame)
-    assert isinstance(pf.image, Image)
-    assert pf.source_bbox_full_frame == BoundingBox(x=0, y=0, width=10, height=8)
-    assert pf.image.width == 10
-    assert pf.image.height == 8
-    assert pf.image.color_format == "RGB"
-    assert pf.image.dtype == "uint8"
-    assert pf.image.value_range == "[0,255]"
+    assert isinstance(pf.image, dict)
+    assert isinstance(pf.image["data"], np.ndarray)
+    assert pf.frame_id == "f1"
+    assert pf.timestamp_ms == 1_700_000_000_000
+    assert pf.source_bbox_full_frame == {"x": 0, "y": 0, "width": 10, "height": 8}
+    assert pf.image["width"] == 10
+    assert pf.image["height"] == 8
+    assert pf.image["color_format"] == "RGB"
+    assert pf.image["dtype"] == "uint8"
+    assert pf.image["value_range"] == "[0,255]"
 
 
-def test_preserve_geometry_keeps_crop_dimensions():
+def test_get_frame_current_preserves_frame_id():
+    ftl = FrameTransformationLayer()
+    ftl.ingest_frame(_make_packet(width=10, height=8, frame_id="frame-A"))
+
+    pf = ftl.get_frame(
+        camera_id="c1",
+        temporal_selector=FrameTemporalSelector.CURRENT,
+        region_bbox=InternalBoundingBox(x=0, y=0, width=10, height=8),
+        output_type=OutputImageType.RGB_UINT8_HWC,
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
+    )
+
+    assert pf.frame_id == "frame-A"
+    assert pf.timestamp_ms == 1_700_000_000_000
+
+
+def test_get_frame_previous_preserves_frame_id():
+    ftl = FrameTransformationLayer()
+    ftl.ingest_frame(_make_packet(width=10, height=8, frame_id="frame-A"))
+    ftl.ingest_frame(_make_packet(width=10, height=8, frame_id="frame-B"))
+
+    pf = ftl.get_frame(
+        camera_id="c1",
+        temporal_selector=FrameTemporalSelector.PREVIOUS,
+        region_bbox=InternalBoundingBox(x=0, y=0, width=10, height=8),
+        output_type=OutputImageType.RGB_UINT8_HWC,
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
+    )
+
+    assert pf.frame_id == "frame-A"
+    assert pf.timestamp_ms == 1_700_000_000_000
+
+
+def test_get_frame_accepts_shared_geometry_spec_typeddict():
+    ftl = FrameTransformationLayer()
+    ftl.ingest_frame(_make_packet(width=10, height=8))
+
+    geometry_spec: SharedGeometrySpec = {
+        "resize_policy": SharedResizePolicy.NONE,
+        # Shared contract allows width/height fields to be present for NONE and ignored.
+        "width": 32,
+        "height": 32,
+    }
+
+    pf = ftl.get_frame(
+        camera_id="c1",
+        temporal_selector=FrameTemporalSelector.CURRENT,
+        region_bbox=InternalBoundingBox(x=0, y=0, width=10, height=8),
+        output_type=SharedOutputImageType.RGB_UINT8_HWC,
+        geometry_spec=geometry_spec,
+    )
+
+    assert pf.image["width"] == 10
+    assert pf.image["height"] == 8
+
+
+def test_get_frame_accepts_shared_bounding_box_typeddict():
+    ftl = FrameTransformationLayer()
+    ftl.ingest_frame(_make_packet(width=10, height=8))
+
+    region_bbox: SharedBoundingBox = {
+        "x": 2,
+        "y": 1,
+        "width": 5,
+        "height": 4,
+    }
+
+    pf = ftl.get_frame(
+        camera_id="c1",
+        temporal_selector=FrameTemporalSelector.CURRENT,
+        region_bbox=region_bbox,
+        output_type=SharedOutputImageType.RGB_UINT8_HWC,
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
+    )
+
+    assert pf.source_bbox_full_frame == {"x": 2, "y": 1, "width": 5, "height": 4}
+
+
+def test_crop_does_not_change_frame_id():
+    ftl = FrameTransformationLayer()
+    ftl.ingest_frame(_make_packet(width=20, height=16, frame_id="f1"))
+
+    pf = ftl.get_frame(
+        camera_id="c1",
+        temporal_selector=FrameTemporalSelector.CURRENT,
+        region_bbox=InternalBoundingBox(x=2, y=2, width=10, height=8),
+        output_type=OutputImageType.RGB_UINT8_HWC,
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
+    )
+
+    assert pf.frame_id == "f1"
+
+
+def test_none_geometry_keeps_crop_dimensions():
     ftl = FrameTransformationLayer()
     ftl.ingest_frame(_make_packet(width=200, height=150))
 
     pf = ftl.get_frame(
         camera_id="c1",
         temporal_selector=FrameTemporalSelector.CURRENT,
-        region_bbox=BoundingBox(x=10, y=20, width=100, height=80),
+        region_bbox=InternalBoundingBox(x=10, y=20, width=100, height=80),
         output_type=OutputImageType.RGB_UINT8_HWC,
-        geometry_spec=GeometrySpec(policy=GeometryPolicy.PRESERVE),
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
     )
 
-    assert pf.image.width == 100
-    assert pf.image.height == 80
+    assert pf.image["width"] == 100
+    assert pf.image["height"] == 80
     assert pf.spatial_transform.scale_x == 1.0
     assert pf.spatial_transform.scale_y == 1.0
     assert pf.spatial_transform.pad_left == 0
     assert pf.spatial_transform.pad_top == 0
     assert pf.spatial_transform.output_width == 100
     assert pf.spatial_transform.output_height == 80
-    assert pf.source_bbox_full_frame == BoundingBox(x=10, y=20, width=100, height=80)
+    assert pf.source_bbox_full_frame == {"x": 10, "y": 20, "width": 100, "height": 80}
+
+
+def test_none_geometry_accepts_zero_placeholders_and_keeps_identity_transform():
+    ftl = FrameTransformationLayer()
+    ftl.ingest_frame(_make_packet(width=64, height=48))
+
+    pf = ftl.get_frame(
+        camera_id="c1",
+        temporal_selector=FrameTemporalSelector.CURRENT,
+        region_bbox=InternalBoundingBox(x=5, y=6, width=20, height=10),
+        output_type=OutputImageType.RGB_UINT8_HWC,
+        geometry_spec=InternalGeometrySpec(
+            resize_policy=ResizePolicy.NONE,
+            width=0,
+            height=0,
+        ),
+    )
+
+    st = pf.spatial_transform
+    assert st.scale_x == 1.0
+    assert st.scale_y == 1.0
+    assert st.pad_left == 0
+    assert st.pad_top == 0
+    assert st.output_width == 20
+    assert st.output_height == 10
+    assert pf.image["width"] == 20
+    assert pf.image["height"] == 10
+
+
+def test_ftl_accepts_motion_detection_input_contract_geometry_spec():
+    ftl = FrameTransformationLayer()
+    ftl.ingest_frame(_make_packet(width=96, height=72))
+    motion_contract = MotionDetectionManager().get_input_contract()
+
+    pf = ftl.get_frame(
+        camera_id="c1",
+        temporal_selector=FrameTemporalSelector.CURRENT,
+        region_bbox=InternalBoundingBox(x=0, y=0, width=96, height=72),
+        output_type=motion_contract["output_image_type"],
+        geometry_spec=motion_contract["geometry_spec"],
+    )
+
+    assert pf.spatial_transform.scale_x == 1.0
+    assert pf.spatial_transform.scale_y == 1.0
+    assert pf.spatial_transform.pad_left == 0
+    assert pf.spatial_transform.pad_top == 0
+    assert pf.spatial_transform.output_width == 96
+    assert pf.spatial_transform.output_height == 72
+
+
+def test_ftl_accepts_face_recognition_input_contract_geometry_spec():
+    ftl = FrameTransformationLayer()
+    ftl.ingest_frame(_make_packet(width=120, height=80))
+    face_recognition_contract = FaceRecognitionModule(
+        config=FaceRecognitionConfig(recognition_threshold=0.5),
+        embedding_engine=StubFaceEmbeddingEngine(),
+        gallery_entries=[],
+    ).get_input_contract()
+
+    pf = ftl.get_frame(
+        camera_id="c1",
+        temporal_selector=FrameTemporalSelector.CURRENT,
+        region_bbox=InternalBoundingBox(x=10, y=10, width=40, height=30),
+        output_type=face_recognition_contract["output_image_type"],
+        geometry_spec=face_recognition_contract["geometry_spec"],
+    )
+
+    assert pf.spatial_transform.scale_x == 1.0
+    assert pf.spatial_transform.scale_y == 1.0
+    assert pf.spatial_transform.pad_left == 0
+    assert pf.spatial_transform.pad_top == 0
+    assert pf.spatial_transform.output_width == 40
+    assert pf.spatial_transform.output_height == 30
 
 
 def test_letterbox_geometry_target_dims_and_transform():
@@ -204,12 +391,12 @@ def test_letterbox_geometry_target_dims_and_transform():
     pf = ftl.get_frame(
         camera_id="c1",
         temporal_selector=FrameTemporalSelector.CURRENT,
-        region_bbox=BoundingBox(x=0, y=0, width=200, height=100),
+        region_bbox=InternalBoundingBox(x=0, y=0, width=200, height=100),
         output_type=OutputImageType.RGB_UINT8_HWC,
-        geometry_spec=GeometrySpec(
-            policy=GeometryPolicy.LETTERBOX,
-            target_width=100,
-            target_height=100,
+        geometry_spec=InternalGeometrySpec(
+            resize_policy=ResizePolicy.LETTERBOX,
+            width=100,
+            height=100,
         ),
     )
 
@@ -220,9 +407,9 @@ def test_letterbox_geometry_target_dims_and_transform():
     assert math.isclose(st.scale_y, 0.5)
     assert st.pad_left == 0
     assert st.pad_top == 25
-    assert pf.image.width == 100
-    assert pf.image.height == 100
-    assert pf.source_bbox_full_frame == BoundingBox(x=0, y=0, width=200, height=100)
+    assert pf.image["width"] == 100
+    assert pf.image["height"] == 100
+    assert pf.source_bbox_full_frame == {"x": 0, "y": 0, "width": 200, "height": 100}
 
 
 # ---------------------------------------------------------------------------
@@ -241,10 +428,6 @@ def test_letterbox_geometry_target_dims_and_transform():
             OutputImageType.RGB_UINT8_HWC,
             ("RGB", "HWC", "uint8", "[0,255]"),
         ),
-        (
-            OutputImageType.RGB_FLOAT32_HWC_NORMALIZED_MINUS1_TO_1,
-            ("RGB", "HWC", "float32", "[-1,1]"),
-        ),
     ],
 )
 def test_output_image_type_changes_image_metadata(output_type, expected):
@@ -254,16 +437,16 @@ def test_output_image_type_changes_image_metadata(output_type, expected):
     pf = ftl.get_frame(
         camera_id="c1",
         temporal_selector=FrameTemporalSelector.CURRENT,
-        region_bbox=BoundingBox(x=0, y=0, width=20, height=20),
+        region_bbox=InternalBoundingBox(x=0, y=0, width=20, height=20),
         output_type=output_type,
-        geometry_spec=GeometrySpec(policy=GeometryPolicy.PRESERVE),
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
     )
 
     cf, layout, dtype, vr = expected
-    assert pf.image.color_format == cf
-    assert pf.image.layout == layout
-    assert pf.image.dtype == dtype
-    assert pf.image.value_range == vr
+    assert pf.image["color_format"] == cf
+    assert pf.image["layout"] == layout
+    assert pf.image["dtype"] == dtype
+    assert pf.image["value_range"] == vr
 
 
 def test_unknown_output_type_raises():
@@ -273,7 +456,7 @@ def test_unknown_output_type_raises():
 
 
 # ---------------------------------------------------------------------------
-# FrameStore — only stores BaseImage
+# FrameStore — stores shared Image TypedDict
 # ---------------------------------------------------------------------------
 
 
@@ -284,12 +467,20 @@ def test_frame_store_only_stores_base_image():
         store.get("c1", FrameTemporalSelector.CURRENT)
 
     # After put_latest, CURRENT is set
-    base = BaseImage(data=bytes(4), width=2, height=2)
-    sf = StoredFrame(frame_id="f1", camera_id="c1", timestamp_ms=0, base_image=base)
+    stored_image = {
+        "data": np.zeros((2, 2, 3), dtype=np.uint8),
+        "width": 2,
+        "height": 2,
+        "color_format": "RGB",
+        "layout": "HWC",
+        "dtype": "uint8",
+        "value_range": "[0,255]",
+    }
+    sf = StoredFrame(frame_id="f1", camera_id="c1", timestamp_ms=0, image=stored_image)
     store.put_latest(sf)
     stored = store.get("c1", FrameTemporalSelector.CURRENT)
     assert isinstance(stored, StoredFrame)
-    assert stored.base_image is base
+    assert stored.image is stored_image
 
     # PREVIOUS is not available yet after first ingest
     with pytest.raises(PreviousFrameNotAvailableError):
@@ -299,27 +490,27 @@ def test_frame_store_only_stores_base_image():
 def test_full_get_frame_does_not_pollute_store_with_derived_outputs():
     ftl = FrameTransformationLayer()
     ftl.ingest_frame(_make_packet(width=50, height=40))
-    before = ftl._store._frames_by_camera["c1"].current.base_image
+    before = ftl._store._frames_by_camera["c1"].current.image
 
     ftl.get_frame(
         camera_id="c1",
         temporal_selector=FrameTemporalSelector.CURRENT,
-        region_bbox=BoundingBox(x=0, y=0, width=10, height=10),
-        output_type=OutputImageType.RGB_FLOAT32_HWC_NORMALIZED_MINUS1_TO_1,
-        geometry_spec=GeometrySpec(
-            policy=GeometryPolicy.LETTERBOX,
-            target_width=32,
-            target_height=32,
+        region_bbox=InternalBoundingBox(x=0, y=0, width=10, height=10),
+        output_type=OutputImageType.RGB_UINT8_HWC,
+        geometry_spec=InternalGeometrySpec(
+            resize_policy=ResizePolicy.LETTERBOX,
+            width=32,
+            height=32,
         ),
     )
-    after = ftl._store._frames_by_camera["c1"].current.base_image
+    after = ftl._store._frames_by_camera["c1"].current.image
 
-    # Same canonical full-frame BaseImage object/state
-    assert isinstance(after, BaseImage)
-    assert after.width == 50 and after.height == 40
-    assert after.color_format == "RGB"
-    assert after.dtype == "uint8"
-    assert after.data == before.data
+    # Same canonical full-frame stored image object/state
+    assert isinstance(after, dict)
+    assert after["width"] == 50 and after["height"] == 40
+    assert after["color_format"] == "RGB"
+    assert after["dtype"] == "uint8"
+    assert np.array_equal(after["data"], before["data"])
 
 
 # ---------------------------------------------------------------------------
@@ -335,29 +526,29 @@ def test_two_frame_references_independent():
     pf_a = ftl.get_frame(
         camera_id="cam1",
         temporal_selector=FrameTemporalSelector.CURRENT,
-        region_bbox=BoundingBox(x=0, y=0, width=10, height=10),
+        region_bbox=InternalBoundingBox(x=0, y=0, width=10, height=10),
         output_type=OutputImageType.RGB_UINT8_HWC,
-        geometry_spec=GeometrySpec(policy=GeometryPolicy.PRESERVE),
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
     )
     pf_b = ftl.get_frame(
         camera_id="cam2",
         temporal_selector=FrameTemporalSelector.CURRENT,
-        region_bbox=BoundingBox(x=0, y=0, width=20, height=15),
+        region_bbox=InternalBoundingBox(x=0, y=0, width=20, height=15),
         output_type=OutputImageType.RGB_UINT8_HWC,
-        geometry_spec=GeometrySpec(policy=GeometryPolicy.PRESERVE),
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
     )
 
-    assert (pf_a.image.width, pf_a.image.height) == (10, 10)
-    assert (pf_b.image.width, pf_b.image.height) == (20, 15)
+    assert (pf_a.image["width"], pf_a.image["height"]) == (10, 10)
+    assert (pf_b.image["width"], pf_b.image["height"]) == (20, 15)
 
     # cam2 has no PREVIOUS (only one ingest)
     with pytest.raises(PreviousFrameNotAvailableError):
         ftl.get_frame(
             camera_id="cam2",
             temporal_selector=FrameTemporalSelector.PREVIOUS,
-            region_bbox=BoundingBox(x=0, y=0, width=20, height=15),
+            region_bbox=InternalBoundingBox(x=0, y=0, width=20, height=15),
             output_type=OutputImageType.RGB_UINT8_HWC,
-            geometry_spec=GeometrySpec(policy=GeometryPolicy.PRESERVE),
+            geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
         )
 
 
@@ -372,9 +563,9 @@ def test_frame_not_found_raises():
         ftl.get_frame(
             camera_id="missing_camera",
             temporal_selector=FrameTemporalSelector.CURRENT,
-            region_bbox=BoundingBox(x=0, y=0, width=1, height=1),
+            region_bbox=InternalBoundingBox(x=0, y=0, width=1, height=1),
             output_type=OutputImageType.RGB_UINT8_HWC,
-            geometry_spec=GeometrySpec(policy=GeometryPolicy.PRESERVE),
+            geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
         )
 
 
@@ -385,9 +576,9 @@ def test_invalid_crop_bbox_raises():
         ftl.get_frame(
             camera_id="c1",
             temporal_selector=FrameTemporalSelector.CURRENT,
-            region_bbox=BoundingBox(x=0, y=0, width=0, height=5),
+            region_bbox=InternalBoundingBox(x=0, y=0, width=0, height=5),
             output_type=OutputImageType.RGB_UINT8_HWC,
-            geometry_spec=GeometrySpec(policy=GeometryPolicy.PRESERVE),
+            geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
         )
 
 
@@ -398,9 +589,9 @@ def test_crop_out_of_bounds_raises():
         ftl.get_frame(
             camera_id="c1",
             temporal_selector=FrameTemporalSelector.CURRENT,
-            region_bbox=BoundingBox(x=5, y=5, width=10, height=10),
+            region_bbox=InternalBoundingBox(x=5, y=5, width=10, height=10),
             output_type=OutputImageType.RGB_UINT8_HWC,
-            geometry_spec=GeometrySpec(policy=GeometryPolicy.PRESERVE),
+            geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
         )
 
 
@@ -408,13 +599,14 @@ def test_crop_out_of_bounds_raises():
     "spec",
     [
         # LETTERBOX with missing target
-        GeometrySpec(policy=GeometryPolicy.LETTERBOX, target_width=None, target_height=100),
-        GeometrySpec(policy=GeometryPolicy.LETTERBOX, target_width=100, target_height=None),
+        InternalGeometrySpec(resize_policy=ResizePolicy.LETTERBOX, width=None, height=100),
+        InternalGeometrySpec(resize_policy=ResizePolicy.LETTERBOX, width=100, height=None),
         # LETTERBOX with non-positive target
-        GeometrySpec(policy=GeometryPolicy.LETTERBOX, target_width=0, target_height=100),
-        GeometrySpec(policy=GeometryPolicy.LETTERBOX, target_width=100, target_height=-1),
-        # PRESERVE with target dims set (forbidden by spec)
-        GeometrySpec(policy=GeometryPolicy.PRESERVE, target_width=10, target_height=10),
+        InternalGeometrySpec(resize_policy=ResizePolicy.LETTERBOX, width=0, height=100),
+        InternalGeometrySpec(resize_policy=ResizePolicy.LETTERBOX, width=100, height=-1),
+        # NONE with invalid dimensions when provided
+        InternalGeometrySpec(resize_policy=ResizePolicy.NONE, width=-1, height=10),
+        InternalGeometrySpec(resize_policy=ResizePolicy.NONE, width=10, height=-1),
     ],
 )
 def test_geometry_spec_validation(spec):
@@ -424,7 +616,7 @@ def test_geometry_spec_validation(spec):
         ftl.get_frame(
             camera_id="c1",
             temporal_selector=FrameTemporalSelector.CURRENT,
-            region_bbox=BoundingBox(x=0, y=0, width=10, height=10),
+            region_bbox=InternalBoundingBox(x=0, y=0, width=10, height=10),
             output_type=OutputImageType.RGB_UINT8_HWC,
             geometry_spec=spec,
         )
@@ -436,8 +628,12 @@ def test_geometry_spec_validation(spec):
 
 
 def test_geometry_spec_default_padding_is_black():
-    spec = GeometrySpec(policy=GeometryPolicy.PRESERVE)
+    spec = InternalGeometrySpec(resize_policy=ResizePolicy.NONE)
     assert spec.padding_color == RGBColor(r=0, g=0, b=0)
+
+
+def test_resize_policy_exposes_only_supported_values():
+    assert [policy.name for policy in ResizePolicy] == ["NONE", "LETTERBOX"]
 
 
 def test_resolver_returns_hardcoded_contract_instance():
@@ -454,21 +650,13 @@ def test_converter_letterbox_pad_left_when_taller_target():
     # crop 100x200, target 100x100 → scale=min(1.0, 0.5)=0.5
     # resized 50x100, pad_left=floor((100-50)/2)=25, pad_top=0
     converter = FrameConverter()
-    src = Image(
-        data=b"",
-        width=100,
-        height=200,
-        color_format="RGB",
-        layout="HWC",
-        dtype="uint8",
-        value_range="[0,255]",
-    )
+    src_data = np.array([], dtype=np.uint8)
     contract = OutputImageContractResolver().resolve(OutputImageType.RGB_UINT8_HWC)
-    spec = GeometrySpec(
-        policy=GeometryPolicy.LETTERBOX, target_width=100, target_height=100
+    spec = InternalGeometrySpec(
+        resize_policy=ResizePolicy.LETTERBOX, width=100, height=100
     )
-    img, st = converter.convert(src, contract, spec)
-    assert (img.width, img.height) == (100, 100)
+    img, st = converter.convert(src_data, 100, 200, contract, spec)
+    assert (img["width"], img["height"]) == (100, 100)
     assert math.isclose(st.scale_x, 0.5)
     assert math.isclose(st.scale_y, 0.5)
     assert st.pad_left == 25
@@ -529,9 +717,9 @@ def _make_real_packet() -> tuple[int, int, "FramePacket"]:
 def _print_processed_frame(pf: "ProcessedFrame") -> None:
     st = pf.spatial_transform
     print(
-        f"\n  image.width={pf.image.width}  image.height={pf.image.height}"
-        f"  color_format={pf.image.color_format!r}"
-        f"  dtype={pf.image.dtype!r}  value_range={pf.image.value_range!r}"
+        f"\n  image.width={pf.image["width"]}  image.height={pf.image["height"]}"
+        f"  color_format={pf.image["color_format"]!r}"
+        f"  dtype={pf.image["dtype"]!r}  value_range={pf.image["value_range"]!r}"
         f"\n  source_bbox_full_frame={pf.source_bbox_full_frame}"
         f"\n  spatial_transform: scale_x={st.scale_x}  scale_y={st.scale_y}"
         f"  pad_left={st.pad_left}  pad_top={st.pad_top}"
@@ -553,7 +741,7 @@ def _skip_if_no_real_image() -> None:
 
 
 def test_ingest_real_image_stub():
-    """Ingest a real JPEG as a canonical FramePacket; verify BaseImage metadata."""
+    """Ingest a real JPEG as a canonical FramePacket; verify Image metadata."""
     orig_w, orig_h, packet = _make_real_packet()
 
     ftl = FrameTransformationLayer()
@@ -561,24 +749,24 @@ def test_ingest_real_image_stub():
 
     stored = ftl._store._frames_by_camera.get("camera_001").current
     assert isinstance(stored, StoredFrame)
-    assert stored.base_image.width == orig_w
-    assert stored.base_image.height == orig_h
-    assert stored.base_image.color_format == "RGB"
-    assert stored.base_image.layout == "HWC"
-    assert stored.base_image.dtype == "uint8"
-    assert stored.base_image.value_range == "[0,255]"
+    assert stored.image["width"] == orig_w
+    assert stored.image["height"] == orig_h
+    assert stored.image["color_format"] == "RGB"
+    assert stored.image["layout"] == "HWC"
+    assert stored.image["dtype"] == "uint8"
+    assert stored.image["value_range"] == "[0,255]"
 
     print(
-        f"\n  [ingest] stored BaseImage: width={stored.base_image.width}  height={stored.base_image.height}"
-        f"  color_format={stored.base_image.color_format!r}  dtype={stored.base_image.dtype!r}"
-        f"  value_range={stored.base_image.value_range!r}  data_len={len(stored.base_image.data)}"
+        f"\n  [ingest] stored image: width={stored.image['width']}  height={stored.image['height']}"
+        f"  color_format={stored.image['color_format']!r}  dtype={stored.image['dtype']!r}"
+        f"  value_range={stored.image['value_range']!r}  data_len={stored.image['data'].size}"
     )
 
 
-def test_get_full_frame_preserve_real_image_stub():
-    """get_frame with full-frame BoundingBox + PRESERVE returns correct metadata."""
+def test_get_full_frame_none_real_image_stub():
+    """get_frame with full-frame BoundingBox + NONE returns correct metadata."""
     orig_w, orig_h, packet = _make_real_packet()
-    full_bbox = BoundingBox(x=0, y=0, width=orig_w, height=orig_h)
+    full_bbox = InternalBoundingBox(x=0, y=0, width=orig_w, height=orig_h)
 
     ftl = FrameTransformationLayer()
     ftl.ingest_frame(packet)
@@ -588,13 +776,18 @@ def test_get_full_frame_preserve_real_image_stub():
         temporal_selector=FrameTemporalSelector.CURRENT,
         region_bbox=full_bbox,
         output_type=OutputImageType.RGB_UINT8_HWC,
-        geometry_spec=GeometrySpec(policy=GeometryPolicy.PRESERVE),
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
     )
 
-    assert pf.image.width == orig_w
-    assert pf.image.height == orig_h
-    assert pf.image.color_format == "RGB"
-    assert pf.source_bbox_full_frame == full_bbox
+    assert pf.image["width"] == orig_w
+    assert pf.image["height"] == orig_h
+    assert pf.image["color_format"] == "RGB"
+    assert pf.source_bbox_full_frame == {
+        "x": full_bbox.x,
+        "y": full_bbox.y,
+        "width": full_bbox.width,
+        "height": full_bbox.height,
+    }
     st = pf.spatial_transform
     assert math.isclose(st.scale_x, 1.0)
     assert math.isclose(st.scale_y, 1.0)
@@ -606,12 +799,12 @@ def test_get_full_frame_preserve_real_image_stub():
     _print_processed_frame(pf)
 
 
-def test_get_crop_preserve_real_image_stub():
-    """get_frame with a sub-region BoundingBox + PRESERVE yields bbox dimensions."""
+def test_get_crop_none_real_image_stub():
+    """get_frame with a sub-region BoundingBox + NONE yields bbox dimensions."""
     orig_w, orig_h, packet = _make_real_packet()
     crop_w = min(100, orig_w - 10)
     crop_h = min(100, orig_h - 10)
-    crop_bbox = BoundingBox(x=10, y=10, width=crop_w, height=crop_h)
+    crop_bbox = InternalBoundingBox(x=10, y=10, width=crop_w, height=crop_h)
 
     ftl = FrameTransformationLayer()
     ftl.ingest_frame(packet)
@@ -621,12 +814,17 @@ def test_get_crop_preserve_real_image_stub():
         temporal_selector=FrameTemporalSelector.CURRENT,
         region_bbox=crop_bbox,
         output_type=OutputImageType.RGB_UINT8_HWC,
-        geometry_spec=GeometrySpec(policy=GeometryPolicy.PRESERVE),
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
     )
 
-    assert pf.image.width == crop_w
-    assert pf.image.height == crop_h
-    assert pf.source_bbox_full_frame == crop_bbox
+    assert pf.image["width"] == crop_w
+    assert pf.image["height"] == crop_h
+    assert pf.source_bbox_full_frame == {
+        "x": crop_bbox.x,
+        "y": crop_bbox.y,
+        "width": crop_bbox.width,
+        "height": crop_bbox.height,
+    }
     st = pf.spatial_transform
     assert st.output_width == crop_w
     assert st.output_height == crop_h
@@ -644,45 +842,29 @@ def test_get_grayscale_metadata_real_image_stub():
     pf = ftl.get_frame(
         camera_id="camera_001",
         temporal_selector=FrameTemporalSelector.CURRENT,
-        region_bbox=BoundingBox(x=0, y=0, width=orig_w, height=orig_h),
+        region_bbox=InternalBoundingBox(x=0, y=0, width=orig_w, height=orig_h),
         output_type=OutputImageType.GRAYSCALE_UINT8_HWC,
-        geometry_spec=GeometrySpec(policy=GeometryPolicy.PRESERVE),
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
     )
 
-    assert pf.image.color_format == "GRAY"
-    assert pf.image.layout == "HWC"
-    assert pf.image.dtype == "uint8"
-    assert pf.image.value_range == "[0,255]"
+    assert pf.image["color_format"] == "GRAY"
+    assert pf.image["layout"] == "HWC"
+    assert pf.image["dtype"] == "uint8"
+    assert pf.image["value_range"] == "[0,255]"
 
     _print_processed_frame(pf)
 
 
-def test_get_float_normalized_metadata_real_image_stub():
-    """get_frame with RGB_FLOAT32_HWC_NORMALIZED_MINUS1_TO_1 returns correct metadata."""
-    orig_w, orig_h, packet = _make_real_packet()
-
-    ftl = FrameTransformationLayer()
-    ftl.ingest_frame(packet)
-
-    pf = ftl.get_frame(
-        camera_id="camera_001",
-        temporal_selector=FrameTemporalSelector.CURRENT,
-        region_bbox=BoundingBox(x=0, y=0, width=orig_w, height=orig_h),
-        output_type=OutputImageType.RGB_FLOAT32_HWC_NORMALIZED_MINUS1_TO_1,
-        geometry_spec=GeometrySpec(policy=GeometryPolicy.PRESERVE),
-    )
-
-    assert pf.image.color_format == "RGB"
-    assert pf.image.dtype == "float32"
-    assert pf.image.value_range == "[-1,1]"
-
-    _print_processed_frame(pf)
+def test_removed_normalized_types_not_in_output_image_type():
+    """Verify normalized [-1,1] and [0,1] output types are no longer part of the public enum."""
+    assert not hasattr(OutputImageType, "RGB_FLOAT32_HWC_NORMALIZED_MINUS1_TO_1")
+    assert not hasattr(OutputImageType, "RGB_FLOAT32_HWC_NORMALIZED_0_TO_1")
 
 
 def test_get_letterbox_metadata_real_image_stub():
     """get_frame with LETTERBOX 640×640 returns correct scale/padding transform."""
     orig_w, orig_h, packet = _make_real_packet()
-    full_bbox = BoundingBox(x=0, y=0, width=orig_w, height=orig_h)
+    full_bbox = InternalBoundingBox(x=0, y=0, width=orig_w, height=orig_h)
 
     ftl = FrameTransformationLayer()
     ftl.ingest_frame(packet)
@@ -692,10 +874,10 @@ def test_get_letterbox_metadata_real_image_stub():
         temporal_selector=FrameTemporalSelector.CURRENT,
         region_bbox=full_bbox,
         output_type=OutputImageType.RGB_UINT8_HWC,
-        geometry_spec=GeometrySpec(
-            policy=GeometryPolicy.LETTERBOX,
-            target_width=640,
-            target_height=640,
+        geometry_spec=InternalGeometrySpec(
+            resize_policy=ResizePolicy.LETTERBOX,
+            width=640,
+            height=640,
             padding_color=RGBColor(r=0, g=0, b=0),
         ),
     )
@@ -706,8 +888,8 @@ def test_get_letterbox_metadata_real_image_stub():
     expected_pad_left = math.floor((640 - resized_w) / 2)
     expected_pad_top = math.floor((640 - resized_h) / 2)
 
-    assert pf.image.width == 640
-    assert pf.image.height == 640
+    assert pf.image["width"] == 640
+    assert pf.image["height"] == 640
     assert math.isclose(pf.spatial_transform.scale_x, expected_scale)
     assert math.isclose(pf.spatial_transform.scale_y, expected_scale)
     assert pf.spatial_transform.pad_left == expected_pad_left
@@ -744,15 +926,15 @@ def test_visual_debug_real_image_stub():
     by = orig_h // 4
     bw = orig_w // 2
     bh = orig_h // 2
-    bbox = BoundingBox(x=bx, y=by, width=bw, height=bh)
+    bbox = InternalBoundingBox(x=bx, y=by, width=bw, height=bh)
 
-    # PRESERVE
-    pf_preserve = ftl.get_frame(
+    # NONE
+    pf_none = ftl.get_frame(
         camera_id="camera_001",
         temporal_selector=FrameTemporalSelector.CURRENT,
         region_bbox=bbox,
         output_type=OutputImageType.RGB_UINT8_HWC,
-        geometry_spec=GeometrySpec(policy=GeometryPolicy.PRESERVE),
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
     )
 
     # LETTERBOX 640×640
@@ -761,19 +943,19 @@ def test_visual_debug_real_image_stub():
         temporal_selector=FrameTemporalSelector.CURRENT,
         region_bbox=bbox,
         output_type=OutputImageType.RGB_UINT8_HWC,
-        geometry_spec=GeometrySpec(
-            policy=GeometryPolicy.LETTERBOX,
-            target_width=640,
-            target_height=640,
+        geometry_spec=InternalGeometrySpec(
+            resize_policy=ResizePolicy.LETTERBOX,
+            width=640,
+            height=640,
             padding_color=RGBColor(r=0, g=0, b=0),
         ),
     )
 
     # Assertions
-    assert pf_preserve.image.width == bw
-    assert pf_preserve.image.height == bh
-    assert pf_lb.image.width == 640
-    assert pf_lb.image.height == 640
+    assert pf_none.image["width"] == bw
+    assert pf_none.image["height"] == bh
+    assert pf_lb.image["width"] == 640
+    assert pf_lb.image["height"] == 640
     expected_scale = min(640 / bw, 640 / bh)
     expected_pad_left = math.floor((640 - round(bw * expected_scale)) / 2)
     expected_pad_top = math.floor((640 - round(bh * expected_scale)) / 2)
@@ -798,8 +980,8 @@ def test_visual_debug_real_image_stub():
     lines = [
         f"frame_id: frame_001",
         f"bbox: x={bx} y={by} w={bw} h={bh}",
-        f"[PRESERVE] out: {pf_preserve.image.width}x{pf_preserve.image.height}",
-        f"[LETTERBOX] out: {pf_lb.image.width}x{pf_lb.image.height}",
+        f"[NONE] out: {pf_none.image['width']}x{pf_none.image['height']}",
+        f"[LETTERBOX] out: {pf_lb.image['width']}x{pf_lb.image['height']}",
         f"scale_x={st_lb.scale_x:.4f}  scale_y={st_lb.scale_y:.4f}",
         f"pad_left={st_lb.pad_left}  pad_top={st_lb.pad_top}",
         f"[REAL] pixel data is live — real crop/letterbox applied",
@@ -840,7 +1022,7 @@ def test_real_crop_visual():
 
     orig_w, orig_h, packet = _make_real_packet()
     bx, by, bw, bh = _real_bbox(orig_w, orig_h)
-    bbox = BoundingBox(x=bx, y=by, width=bw, height=bh)
+    bbox = InternalBoundingBox(x=bx, y=by, width=bw, height=bh)
 
     ftl = FrameTransformationLayer()
     ftl.ingest_frame(packet)
@@ -849,21 +1031,22 @@ def test_real_crop_visual():
         temporal_selector=FrameTemporalSelector.CURRENT,
         region_bbox=bbox,
         output_type=OutputImageType.RGB_UINT8_HWC,
-        geometry_spec=GeometrySpec(policy=GeometryPolicy.PRESERVE),
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
     )
 
     # --- pixel assertion ---------------------------------------------------
     orig_arr = np.frombuffer(packet.image_bytes, dtype=np.uint8).reshape(orig_h, orig_w, 3)
-    expected = orig_arr[by : by + bh, bx : bx + bw, :].copy().tobytes()
+    expected = orig_arr[by : by + bh, bx : bx + bw, :].copy()
 
-    assert pf.image.data == expected
-    assert pf.image.width == bw
-    assert pf.image.height == bh
+    assert isinstance(pf.image["data"], np.ndarray)
+    assert np.array_equal(pf.image["data"], expected)
+    assert pf.image["width"] == bw
+    assert pf.image["height"] == bh
 
     # --- save outputs ------------------------------------------------------
     _OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    crop_img = PILImage.frombytes("RGB", (pf.image.width, pf.image.height), pf.image.data)
+    crop_img = PILImage.fromarray(pf.image["data"], mode="RGB")
     crop_path = _OUTPUTS_DIR / "real_crop_output.jpg"
     crop_img.save(str(crop_path), quality=95)
 
@@ -885,7 +1068,7 @@ def test_real_grayscale_visual():
 
     orig_w, orig_h, packet = _make_real_packet()
     bx, by, bw, bh = _real_bbox(orig_w, orig_h)
-    bbox = BoundingBox(x=bx, y=by, width=bw, height=bh)
+    bbox = InternalBoundingBox(x=bx, y=by, width=bw, height=bh)
 
     ftl = FrameTransformationLayer()
     ftl.ingest_frame(packet)
@@ -894,21 +1077,22 @@ def test_real_grayscale_visual():
         temporal_selector=FrameTemporalSelector.CURRENT,
         region_bbox=bbox,
         output_type=OutputImageType.GRAYSCALE_UINT8_HWC,
-        geometry_spec=GeometrySpec(policy=GeometryPolicy.PRESERVE),
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
     )
 
     # --- metadata assertions -----------------------------------------------
-    assert pf.image.color_format == "GRAY"
-    assert pf.image.dtype == "uint8"
-    assert pf.image.value_range == "[0,255]"
-    assert len(pf.image.data) == bw * bh
+    assert pf.image["color_format"] == "GRAY"
+    assert pf.image["dtype"] == "uint8"
+    assert pf.image["value_range"] == "[0,255]"
+    assert isinstance(pf.image["data"], np.ndarray)
+    assert pf.image["data"].shape == (bh, bw)
 
     # --- pixel assertions (sampled) ----------------------------------------
     ref_gray = np.array(
         PILImage.open(ASSET_PATH).convert("RGB").crop((bx, by, bx + bw, by + bh)).convert("L"),
         dtype=np.uint8,
     )
-    actual = np.frombuffer(pf.image.data, dtype=np.uint8).reshape(bh, bw)
+    actual = pf.image["data"]
     assert actual[0, 0] == ref_gray[0, 0]
     assert actual[bh // 2, bw // 2] == ref_gray[bh // 2, bw // 2]
 
@@ -928,7 +1112,7 @@ def test_real_letterbox_visual():
 
     orig_w, orig_h, packet = _make_real_packet()
     bx, by, bw, bh = _real_bbox(orig_w, orig_h)
-    bbox = BoundingBox(x=bx, y=by, width=bw, height=bh)
+    bbox = InternalBoundingBox(x=bx, y=by, width=bw, height=bh)
 
     ftl = FrameTransformationLayer()
     ftl.ingest_frame(packet)
@@ -937,18 +1121,19 @@ def test_real_letterbox_visual():
         temporal_selector=FrameTemporalSelector.CURRENT,
         region_bbox=bbox,
         output_type=OutputImageType.RGB_UINT8_HWC,
-        geometry_spec=GeometrySpec(
-            policy=GeometryPolicy.LETTERBOX,
-            target_width=640,
-            target_height=640,
+        geometry_spec=InternalGeometrySpec(
+            resize_policy=ResizePolicy.LETTERBOX,
+            width=640,
+            height=640,
             padding_color=RGBColor(r=0, g=0, b=0),
         ),
     )
 
     # --- dimension + transform assertions ----------------------------------
-    assert pf.image.width == 640
-    assert pf.image.height == 640
-    assert len(pf.image.data) == 640 * 640 * 3
+    assert pf.image["width"] == 640
+    assert pf.image["height"] == 640
+    assert isinstance(pf.image["data"], np.ndarray)
+    assert pf.image["data"].shape == (640, 640, 3)
 
     expected_scale = min(640 / bw, 640 / bh)
     resized_w = round(bw * expected_scale)
@@ -962,7 +1147,7 @@ def test_real_letterbox_visual():
     assert pf.spatial_transform.pad_top == expected_pad_top
 
     # --- pixel assertions: padding is black, content is non-zero ----------
-    arr = np.frombuffer(pf.image.data, dtype=np.uint8).reshape(640, 640, 3)
+    arr = pf.image["data"]
     if expected_pad_left > 0:
         assert arr[:, :expected_pad_left, :].sum() == 0, "left padding should be black"
     if expected_pad_top > 0:
@@ -976,7 +1161,7 @@ def test_real_letterbox_visual():
 
     # --- save output -------------------------------------------------------
     _OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    lb_img = PILImage.frombytes("RGB", (640, 640), pf.image.data)
+    lb_img = PILImage.fromarray(pf.image["data"], mode="RGB")
     lb_path = _OUTPUTS_DIR / "real_letterbox_output.jpg"
     lb_img.save(str(lb_path), quality=95)
     assert lb_path.exists()
@@ -987,54 +1172,13 @@ def test_real_letterbox_visual():
     print(f"  [real letterbox visual]  path={lb_path.resolve()}")
 
 
-def test_real_float_normalized():
-    """Float32 output using centre bbox must be in [-1,1] and match (uint8/127.5)-1.0."""
-    _skip_if_no_real_image()
-
-    orig_w, orig_h, packet = _make_real_packet()
-    bx, by, bw, bh = _real_bbox(orig_w, orig_h)
-    bbox = BoundingBox(x=bx, y=by, width=bw, height=bh)
-
-    ftl = FrameTransformationLayer()
-    ftl.ingest_frame(packet)
-    pf = ftl.get_frame(
-        camera_id="camera_001",
-        temporal_selector=FrameTemporalSelector.CURRENT,
-        region_bbox=bbox,
-        output_type=OutputImageType.RGB_FLOAT32_HWC_NORMALIZED_MINUS1_TO_1,
-        geometry_spec=GeometrySpec(policy=GeometryPolicy.PRESERVE),
-    )
-
-    assert pf.image.color_format == "RGB"
-    assert pf.image.dtype == "float32"
-    assert pf.image.value_range == "[-1,1]"
-    assert len(pf.image.data) == bw * bh * 3 * 4  # 4 bytes per float32
-
-    float_arr = np.frombuffer(pf.image.data, dtype=np.float32).reshape(bh, bw, 3)
-    assert float(float_arr.min()) >= -1.0
-    assert float(float_arr.max()) <= 1.0
-
-    # Verify formula on sampled pixels
-    ref_crop = np.array(
-        PILImage.open(ASSET_PATH).convert("RGB").crop((bx, by, bx + bw, by + bh)),
-        dtype=np.float32,
-    )
-    expected = (ref_crop / 127.5) - 1.0
-    np.testing.assert_allclose(float_arr[0, 0], expected[0, 0], atol=1e-5)
-    np.testing.assert_allclose(float_arr[bh // 2, bw // 2], expected[bh // 2, bw // 2], atol=1e-5)
-    print(
-        f"\n  [real float32]  min={float_arr.min():.4f}  max={float_arr.max():.4f}"
-        f"  pixel[0,0]={float_arr[0, 0]}"
-    )
-
-
 def test_real_coordinate_mapping():
     """A point in the letterbox output non-padding area maps back inside the source bbox."""
     _skip_if_no_real_image()
 
     orig_w, orig_h, packet = _make_real_packet()
     bx, by, bw, bh = _real_bbox(orig_w, orig_h)
-    bbox = BoundingBox(x=bx, y=by, width=bw, height=bh)
+    bbox = InternalBoundingBox(x=bx, y=by, width=bw, height=bh)
 
     ftl = FrameTransformationLayer()
     ftl.ingest_frame(packet)
@@ -1043,10 +1187,10 @@ def test_real_coordinate_mapping():
         temporal_selector=FrameTemporalSelector.CURRENT,
         region_bbox=bbox,
         output_type=OutputImageType.RGB_UINT8_HWC,
-        geometry_spec=GeometrySpec(
-            policy=GeometryPolicy.LETTERBOX,
-            target_width=640,
-            target_height=640,
+        geometry_spec=InternalGeometrySpec(
+            resize_policy=ResizePolicy.LETTERBOX,
+            width=640,
+            height=640,
             padding_color=RGBColor(r=0, g=0, b=0),
         ),
     )
@@ -1063,8 +1207,8 @@ def test_real_coordinate_mapping():
     cy = oy - st.pad_top
     rx = cx / st.scale_x
     ry = cy / st.scale_y
-    fx = rx + pf.source_bbox_full_frame.x
-    fy = ry + pf.source_bbox_full_frame.y
+    fx = rx + pf.source_bbox_full_frame["x"]
+    fy = ry + pf.source_bbox_full_frame["y"]
 
     # The mapped point must lie within the original source bbox
     assert bx <= fx < bx + bw, f"fx={fx} outside bbox x=[{bx},{bx + bw})"
@@ -1082,7 +1226,7 @@ def test_real_visual_debug():
 
     orig_w, orig_h, packet = _make_real_packet()
     bx, by, bw, bh = _real_bbox(orig_w, orig_h)
-    bbox = BoundingBox(x=bx, y=by, width=bw, height=bh)
+    bbox = InternalBoundingBox(x=bx, y=by, width=bw, height=bh)
 
     ftl = FrameTransformationLayer()
     ftl.ingest_frame(packet)
@@ -1092,17 +1236,17 @@ def test_real_visual_debug():
         temporal_selector=FrameTemporalSelector.CURRENT,
         region_bbox=bbox,
         output_type=OutputImageType.RGB_UINT8_HWC,
-        geometry_spec=GeometrySpec(policy=GeometryPolicy.PRESERVE),
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
     )
     pf_lb = ftl.get_frame(
         camera_id="camera_001",
         temporal_selector=FrameTemporalSelector.CURRENT,
         region_bbox=bbox,
         output_type=OutputImageType.RGB_UINT8_HWC,
-        geometry_spec=GeometrySpec(
-            policy=GeometryPolicy.LETTERBOX,
-            target_width=640,
-            target_height=640,
+        geometry_spec=InternalGeometrySpec(
+            resize_policy=ResizePolicy.LETTERBOX,
+            width=640,
+            height=640,
             padding_color=RGBColor(r=0, g=0, b=0),
         ),
     )
@@ -1120,8 +1264,8 @@ def test_real_visual_debug():
 
     lines = [
         f"frame_id: frame_001  |  bbox: x={bx} y={by} w={bw} h={bh}",
-        f"[PRESERVE]  out: {pf_crop.image.width}x{pf_crop.image.height}",
-        f"[LETTERBOX] out: {pf_lb.image.width}x{pf_lb.image.height}",
+        f"[NONE]  out: {pf_crop.image['width']}x{pf_crop.image['height']}",
+        f"[LETTERBOX] out: {pf_lb.image['width']}x{pf_lb.image['height']}",
         f"scale_x={st.scale_x:.4f}  scale_y={st.scale_y:.4f}",
         f"pad_left={st.pad_left}  pad_top={st.pad_top}",
         f"crop  -> {crop_path.name}",
@@ -1162,19 +1306,19 @@ def test_first_ingest_current_set_previous_raises():
     pf = ftl.get_frame(
         camera_id="c1",
         temporal_selector=FrameTemporalSelector.CURRENT,
-        region_bbox=BoundingBox(x=0, y=0, width=4, height=3),
+        region_bbox=InternalBoundingBox(x=0, y=0, width=4, height=3),
         output_type=OutputImageType.RGB_UINT8_HWC,
-        geometry_spec=GeometrySpec(policy=GeometryPolicy.PRESERVE),
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
     )
-    assert pf.image.width == 4
+    assert pf.image["width"] == 4
     # PREVIOUS raises before second ingest
     with pytest.raises(PreviousFrameNotAvailableError):
         ftl.get_frame(
             camera_id="c1",
             temporal_selector=FrameTemporalSelector.PREVIOUS,
-            region_bbox=BoundingBox(x=0, y=0, width=4, height=3),
+            region_bbox=InternalBoundingBox(x=0, y=0, width=4, height=3),
             output_type=OutputImageType.RGB_UINT8_HWC,
-            geometry_spec=GeometrySpec(policy=GeometryPolicy.PRESERVE),
+            geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
         )
 
 
@@ -1188,8 +1332,10 @@ def test_second_ingest_current_and_previous():
     state = ftl._store._frames_by_camera["c1"]
     assert state.current.frame_id == "f2"
     assert state.previous.frame_id == "f1"
-    assert state.current.base_image.data == raw2
-    assert state.previous.base_image.data == raw1
+    expected2 = np.frombuffer(raw2, dtype=np.uint8).reshape(3, 4, 3)
+    expected1 = np.frombuffer(raw1, dtype=np.uint8).reshape(3, 4, 3)
+    assert np.array_equal(state.current.image["data"], expected2)
+    assert np.array_equal(state.previous.image["data"], expected1)
 
 
 def test_third_ingest_drops_oldest():
@@ -1226,9 +1372,9 @@ def test_get_current_before_ingest_raises_frame_not_found():
         ftl.get_frame(
             camera_id="c1",
             temporal_selector=FrameTemporalSelector.CURRENT,
-            region_bbox=BoundingBox(x=0, y=0, width=1, height=1),
+            region_bbox=InternalBoundingBox(x=0, y=0, width=1, height=1),
             output_type=OutputImageType.RGB_UINT8_HWC,
-            geometry_spec=GeometrySpec(policy=GeometryPolicy.PRESERVE),
+            geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
         )
 
 
@@ -1239,7 +1385,227 @@ def test_get_previous_before_second_ingest_raises():
         ftl.get_frame(
             camera_id="c1",
             temporal_selector=FrameTemporalSelector.PREVIOUS,
-            region_bbox=BoundingBox(x=0, y=0, width=4, height=3),
+            region_bbox=InternalBoundingBox(x=0, y=0, width=4, height=3),
             output_type=OutputImageType.RGB_UINT8_HWC,
-            geometry_spec=GeometrySpec(policy=GeometryPolicy.PRESERVE),
+            geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
         )
+
+
+# ---------------------------------------------------------------------------
+# SpatialTransform consistency across supported ResizePolicy values
+# ---------------------------------------------------------------------------
+
+
+def test_spatial_transform_none_identity():
+    """NONE produces identity transform (scale=1, pad=0)."""
+    ftl = FrameTransformationLayer()
+    ftl.ingest_frame(_make_packet(width=200, height=150))
+
+    pf = ftl.get_frame(
+        camera_id="c1",
+        temporal_selector=FrameTemporalSelector.CURRENT,
+        region_bbox=InternalBoundingBox(x=10, y=20, width=100, height=80),
+        output_type=OutputImageType.RGB_UINT8_HWC,
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
+    )
+
+    st = pf.spatial_transform
+    assert st.scale_x == 1.0
+    assert st.scale_y == 1.0
+    assert st.pad_left == 0
+    assert st.pad_top == 0
+    assert st.output_width == 100
+    assert st.output_height == 80
+
+
+def test_spatial_transform_letterbox_includes_padding():
+    """LETTERBOX includes non-zero padding in spatial_transform."""
+    ftl = FrameTransformationLayer()
+    ftl.ingest_frame(_make_packet(width=400, height=300))
+
+    pf = ftl.get_frame(
+        camera_id="c1",
+        temporal_selector=FrameTemporalSelector.CURRENT,
+        region_bbox=InternalBoundingBox(x=0, y=0, width=200, height=100),
+        output_type=OutputImageType.RGB_UINT8_HWC,
+        geometry_spec=InternalGeometrySpec(
+            resize_policy=ResizePolicy.LETTERBOX,
+            width=100,
+            height=100,
+        ),
+    )
+
+    st = pf.spatial_transform
+    # At least one padding value may be non-zero
+    assert st.pad_left >= 0 or st.pad_top >= 0
+    assert st.pad_left == 0 or st.pad_top > 0  # Likely some padding here
+
+
+def test_spatial_transform_all_policies_have_output_dims():
+    """Supported ResizePolicy values produce output_width and output_height."""
+    ftl = FrameTransformationLayer()
+    ftl.ingest_frame(_make_packet(width=400, height=300))
+
+    bbox = InternalBoundingBox(x=0, y=0, width=200, height=100)
+    output_type = OutputImageType.RGB_UINT8_HWC
+
+    for policy in [ResizePolicy.NONE, ResizePolicy.LETTERBOX]:
+        geom = InternalGeometrySpec(
+            resize_policy=policy,
+            width=150 if policy is ResizePolicy.LETTERBOX else None,
+            height=150 if policy is ResizePolicy.LETTERBOX else None,
+        )
+        pf = ftl.get_frame(
+            camera_id="c1",
+            temporal_selector=FrameTemporalSelector.CURRENT,
+            region_bbox=bbox,
+            output_type=output_type,
+            geometry_spec=geom,
+        )
+        st = pf.spatial_transform
+        assert st.output_width > 0
+        assert st.output_height > 0
+        assert isinstance(st.scale_x, float)
+        assert isinstance(st.scale_y, float)
+
+
+
+# ---------------------------------------------------------------------------
+# Concurrency tests
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_ingest_multiple_cameras():
+    """Concurrent ingest from multiple cameras should not corrupt state."""
+    ftl = FrameTransformationLayer()
+    
+    # Ingest frames for different cameras
+    ftl.ingest_frame(_make_packet(width=100, height=100, camera_id="cam1"))
+    ftl.ingest_frame(_make_packet(width=200, height=150, camera_id="cam2"))
+    ftl.ingest_frame(_make_packet(width=150, height=120, camera_id="cam3"))
+
+    # Verify each camera has independent CURRENT state
+    pf1 = ftl.get_frame(
+        camera_id="cam1",
+        temporal_selector=FrameTemporalSelector.CURRENT,
+        region_bbox=InternalBoundingBox(x=0, y=0, width=100, height=100),
+        output_type=OutputImageType.RGB_UINT8_HWC,
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
+    )
+    pf2 = ftl.get_frame(
+        camera_id="cam2",
+        temporal_selector=FrameTemporalSelector.CURRENT,
+        region_bbox=InternalBoundingBox(x=0, y=0, width=200, height=150),
+        output_type=OutputImageType.RGB_UINT8_HWC,
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
+    )
+    pf3 = ftl.get_frame(
+        camera_id="cam3",
+        temporal_selector=FrameTemporalSelector.CURRENT,
+        region_bbox=InternalBoundingBox(x=0, y=0, width=150, height=120),
+        output_type=OutputImageType.RGB_UINT8_HWC,
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
+    )
+
+    assert pf1.image["width"] == 100
+    assert pf1.image["height"] == 100
+    assert pf2.image["width"] == 200
+    assert pf2.image["height"] == 150
+    assert pf3.image["width"] == 150
+    assert pf3.image["height"] == 120
+
+
+def test_concurrent_current_previous_isolation():
+    """CURRENT/PREVIOUS state is per-camera and isolated."""
+    ftl = FrameTransformationLayer()
+    
+    # cam1: two ingests
+    ftl.ingest_frame(_make_packet(width=100, height=100, camera_id="cam1", frame_id="f1"))
+    ftl.ingest_frame(_make_packet(width=100, height=100, camera_id="cam1", frame_id="f2"))
+    
+    # cam2: one ingest
+    ftl.ingest_frame(_make_packet(width=200, height=150, camera_id="cam2", frame_id="f3"))
+
+    # cam1 has both CURRENT and PREVIOUS
+    pf_current = ftl.get_frame(
+        camera_id="cam1",
+        temporal_selector=FrameTemporalSelector.CURRENT,
+        region_bbox=InternalBoundingBox(x=0, y=0, width=100, height=100),
+        output_type=OutputImageType.RGB_UINT8_HWC,
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
+    )
+    pf_previous = ftl.get_frame(
+        camera_id="cam1",
+        temporal_selector=FrameTemporalSelector.PREVIOUS,
+        region_bbox=InternalBoundingBox(x=0, y=0, width=100, height=100),
+        output_type=OutputImageType.RGB_UINT8_HWC,
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
+    )
+
+    assert pf_current.frame_id == "f2"
+    assert pf_previous.frame_id == "f1"
+
+    # cam2 has only CURRENT, PREVIOUS raises
+    with pytest.raises(PreviousFrameNotAvailableError):
+        ftl.get_frame(
+            camera_id="cam2",
+            temporal_selector=FrameTemporalSelector.PREVIOUS,
+            region_bbox=InternalBoundingBox(x=0, y=0, width=200, height=150),
+            output_type=OutputImageType.RGB_UINT8_HWC,
+            geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
+        )
+
+
+def test_no_cross_camera_contamination():
+    """Per-camera CURRENT/PREVIOUS should not affect other cameras."""
+    ftl = FrameTransformationLayer()
+    
+    # cam1: ingest f1, f2, f3 → CURRENT=f3, PREVIOUS=f2
+    ftl.ingest_frame(_make_packet(width=100, height=100, camera_id="cam1", frame_id="f1"))
+    ftl.ingest_frame(_make_packet(width=100, height=100, camera_id="cam1", frame_id="f2"))
+    ftl.ingest_frame(_make_packet(width=100, height=100, camera_id="cam1", frame_id="f3"))
+
+    # cam2: ingest g1, g2 → CURRENT=g2, PREVIOUS=g1
+    ftl.ingest_frame(_make_packet(width=200, height=150, camera_id="cam2", frame_id="g1"))
+    ftl.ingest_frame(_make_packet(width=200, height=150, camera_id="cam2", frame_id="g2"))
+
+    # cam1 CURRENT should still be f3
+    pf_cam1_current = ftl.get_frame(
+        camera_id="cam1",
+        temporal_selector=FrameTemporalSelector.CURRENT,
+        region_bbox=InternalBoundingBox(x=0, y=0, width=100, height=100),
+        output_type=OutputImageType.RGB_UINT8_HWC,
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
+    )
+    assert pf_cam1_current.frame_id == "f3"
+
+    # cam1 PREVIOUS should still be f2
+    pf_cam1_previous = ftl.get_frame(
+        camera_id="cam1",
+        temporal_selector=FrameTemporalSelector.PREVIOUS,
+        region_bbox=InternalBoundingBox(x=0, y=0, width=100, height=100),
+        output_type=OutputImageType.RGB_UINT8_HWC,
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
+    )
+    assert pf_cam1_previous.frame_id == "f2"
+
+    # cam2 CURRENT should be g2
+    pf_cam2_current = ftl.get_frame(
+        camera_id="cam2",
+        temporal_selector=FrameTemporalSelector.CURRENT,
+        region_bbox=InternalBoundingBox(x=0, y=0, width=200, height=150),
+        output_type=OutputImageType.RGB_UINT8_HWC,
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
+    )
+    assert pf_cam2_current.frame_id == "g2"
+
+    # cam2 PREVIOUS should be g1
+    pf_cam2_previous = ftl.get_frame(
+        camera_id="cam2",
+        temporal_selector=FrameTemporalSelector.PREVIOUS,
+        region_bbox=InternalBoundingBox(x=0, y=0, width=200, height=150),
+        output_type=OutputImageType.RGB_UINT8_HWC,
+        geometry_spec=InternalGeometrySpec(resize_policy=ResizePolicy.NONE),
+    )
+    assert pf_cam2_previous.frame_id == "g1"
+

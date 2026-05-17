@@ -5,8 +5,8 @@ pixel-level processing defined in
 ``doc/image_processing_service/frame_transformation_layer.md``.
 
 CropProcessor performs real HWC byte slicing via NumPy.
-FrameConverter performs real geometry (PRESERVE / LETTERBOX) and
-pixel-format conversion (RGB uint8, grayscale uint8, RGB float32 [-1,1])
+FrameConverter performs real geometry (NONE / LETTERBOX) and
+pixel-format conversion (RGB uint8, grayscale uint8)
 via Pillow.  SpatialTransform values follow the MD formulas exactly.
 """
 
@@ -16,43 +16,51 @@ import math
 import threading
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 
-
-# ---------------------------------------------------------------------------
-# Enums
-# ---------------------------------------------------------------------------
-
-
-class OutputImageType(Enum):
-    """Pixel representation of the output image returned by ``get_frame``."""
-
-    GRAYSCALE_UINT8_HWC = "GRAYSCALE_UINT8_HWC"
-    RGB_UINT8_HWC = "RGB_UINT8_HWC"
-    RGB_FLOAT32_HWC_NORMALIZED_MINUS1_TO_1 = (
-        "RGB_FLOAT32_HWC_NORMALIZED_MINUS1_TO_1"
+try:
+    from ..shared.contracts import (
+        BoundingBox as SharedBoundingBox,
+        GeometrySpec as SharedGeometrySpec,
+        Image as SharedImage,
+        OutputImageType,
+        ResizePolicy,
     )
-
-
-class GeometryPolicy(Enum):
-    """Spatial transformation policy applied during ``get_frame``."""
-
-    PRESERVE = "PRESERVE"
-    LETTERBOX = "LETTERBOX"
-
-
-class FrameTemporalSelector(Enum):
-    """Selects which stored frame to retrieve for a given camera."""
-
-    CURRENT = "CURRENT"
-    PREVIOUS = "PREVIOUS"
+    from .contracts import (
+        FrameNotFoundError,
+        FramePacket,
+        FrameTemporalSelector,
+        PreviousFrameNotAvailableError,
+        ProcessedFrame,
+        SpatialTransform,
+    )
+except ImportError:  # pragma: no cover - fallback when imported outside package
+    from src.image_processing.shared.contracts import (  # type: ignore[no-redef]
+        BoundingBox as SharedBoundingBox,
+        GeometrySpec as SharedGeometrySpec,
+        Image as SharedImage,
+        OutputImageType,
+        ResizePolicy,
+    )
+    from src.image_processing.frame_transformation_layer.contracts import (  # type: ignore[no-redef]
+        FrameNotFoundError,
+        FramePacket,
+        FrameTemporalSelector,
+        PreviousFrameNotAvailableError,
+        ProcessedFrame,
+        SpatialTransform,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
+
+# FrameTemporalSelector, FramePacket, SpatialTransform, ProcessedFrame,
+# PreviousFrameNotAvailableError, and FrameNotFoundError are defined in
+# .contracts and imported above.  They remain part of the public API.
 
 
 class ValidationError(Exception):
@@ -61,14 +69,6 @@ class ValidationError(Exception):
 
 class InvalidFramePacketFormatError(Exception):
     """``FramePacket`` does not satisfy the canonical input format."""
-
-
-class PreviousFrameNotAvailableError(Exception):
-    """``get_frame(camera_id, PREVIOUS, ...)`` called before two successful ingests."""
-
-
-class FrameNotFoundError(Exception):
-    """``get_frame`` called for a camera with no CURRENT frame stored yet."""
 
 
 class InvalidCropBboxError(Exception):
@@ -93,48 +93,6 @@ class ConversionError(Exception):
 
 
 @dataclass(frozen=True)
-class FramePacket:
-    """Immutable canonical raw RGB pixel container — input to ``ingest_frame``."""
-
-    frame_id: str
-    camera_id: str
-    timestamp_ms: int
-    width: int
-    height: int
-    pixel_format: str  # must be "RGB"
-    layout: str  # must be "HWC"
-    num_color_channels: int  # must be 3
-    bits_per_channel: int  # must be 8
-    image_bytes: bytes
-
-
-@dataclass(frozen=True)
-class BaseImage:
-    """Canonical full-frame internal image. Always RGB/HWC/uint8/[0,255]."""
-
-    data: bytes
-    width: int
-    height: int
-    color_format: str = "RGB"
-    layout: str = "HWC"
-    dtype: str = "uint8"
-    value_range: str = "[0,255]"
-
-
-@dataclass(frozen=True)
-class Image:
-    """Generic processed-image container produced by crop/convert."""
-
-    data: bytes
-    width: int
-    height: int
-    color_format: str
-    layout: str
-    dtype: str
-    value_range: str
-
-
-@dataclass(frozen=True)
 class BoundingBox:
     """Axis-aligned rectangle. Origin top-left; right/bottom edges exclusive."""
 
@@ -155,20 +113,10 @@ class RGBColor:
 class GeometrySpec:
     """Spatial transformation spec supplied by the caller of ``get_frame``."""
 
-    policy: GeometryPolicy
-    target_width: Optional[int] = None
-    target_height: Optional[int] = None
+    resize_policy: ResizePolicy
+    width: Optional[int] = None
+    height: Optional[int] = None
     padding_color: RGBColor = field(default_factory=RGBColor)
-
-
-@dataclass(frozen=True)
-class SpatialTransform:
-    scale_x: float
-    scale_y: float
-    pad_left: int
-    pad_top: int
-    output_width: int
-    output_height: int
 
 
 @dataclass(frozen=True)
@@ -182,13 +130,6 @@ class ImageConversionContract:
 
 
 @dataclass(frozen=True)
-class ProcessedFrame:
-    image: Image
-    source_bbox_full_frame: BoundingBox
-    spatial_transform: SpatialTransform
-
-
-@dataclass(frozen=True)
 class ValidationResult:
     ok: bool
     errors: tuple[str, ...] = ()
@@ -196,12 +137,12 @@ class ValidationResult:
 
 @dataclass(frozen=True)
 class StoredFrame:
-    """Wraps a full-frame ``BaseImage`` with identifying metadata for ``FrameStore``."""
+    """Wraps a full-frame shared ``Image`` with identifying metadata for ``FrameStore``."""
 
     frame_id: str
     camera_id: str
     timestamp_ms: int
-    base_image: BaseImage
+    image: SharedImage
 
 
 @dataclass
@@ -229,12 +170,6 @@ _OUTPUT_IMAGE_TYPE_CONTRACTS: dict[OutputImageType, ImageConversionContract] = {
         layout="HWC",
         dtype="uint8",
         value_range="[0,255]",
-    ),
-    OutputImageType.RGB_FLOAT32_HWC_NORMALIZED_MINUS1_TO_1: ImageConversionContract(
-        color_format="RGB",
-        layout="HWC",
-        dtype="float32",
-        value_range="[-1,1]",
     ),
 }
 
@@ -307,13 +242,14 @@ class FramePacketValidator:
 
 
 class BaseImageBuilder:
-    """Wraps canonical ``FramePacket.image_bytes`` into a full-frame ``BaseImage``.
+    """Converts canonical ``FramePacket.image_bytes`` into shared ``Image``.
 
+    Converts bytes → np.ndarray (once, eagerly) and wraps as shared Image TypedDict.
     Re-validates the canonical-format constraints to keep this class safe to
     invoke independently of :class:`FramePacketValidator`.
     """
 
-    def build(self, frame_packet: FramePacket) -> BaseImage:
+    def build(self, frame_packet: FramePacket) -> SharedImage:
         if frame_packet.pixel_format != "RGB":
             raise InvalidFramePacketFormatError("pixel_format must be 'RGB'")
         if frame_packet.layout != "HWC":
@@ -329,15 +265,20 @@ class BaseImageBuilder:
                 "image_bytes size does not match width*height*3"
             )
 
-        return BaseImage(
-            data=frame_packet.image_bytes,
-            width=frame_packet.width,
-            height=frame_packet.height,
-            color_format="RGB",
-            layout="HWC",
-            dtype="uint8",
-            value_range="[0,255]",
-        )
+        # Convert bytes → np.ndarray (once, eagerly during ingest)
+        arr = np.frombuffer(frame_packet.image_bytes, dtype=np.uint8).reshape(
+            frame_packet.height, frame_packet.width, 3
+        ).copy()
+
+        return {
+            "data": arr,
+            "width": frame_packet.width,
+            "height": frame_packet.height,
+            "color_format": "RGB",
+            "layout": "HWC",
+            "dtype": "uint8",
+            "value_range": "[0,255]",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -390,61 +331,63 @@ class FrameStore:
 
 
 class CropProcessor:
-    """Validates ``region_bbox`` and slices a derived cropped ``Image`` from a
-    ``BaseImage`` using real pixel data.  The stored ``BaseImage`` is never
-    modified.
+    """Validates ``region_bbox`` and extracts pixel data as ndarray from a
+    shared ``Image``. The stored image is never modified.
     """
 
     def crop(
-        self, base_image: BaseImage, region_bbox: BoundingBox
-    ) -> tuple[Image, BoundingBox]:
-        if region_bbox.width <= 0 or region_bbox.height <= 0:
+        self, image: SharedImage, region_bbox: SharedBoundingBox
+    ) -> tuple[np.ndarray, SharedBoundingBox]:
+        x = self._bbox_attr(region_bbox, "x")
+        y = self._bbox_attr(region_bbox, "y")
+        width = self._bbox_attr(region_bbox, "width")
+        height = self._bbox_attr(region_bbox, "height")
+
+        if width <= 0 or height <= 0:
             raise InvalidCropBboxError(
                 f"region_bbox must have positive width/height "
-                f"(got width={region_bbox.width}, height={region_bbox.height})"
+                f"(got width={width}, height={height})"
             )
-        if region_bbox.x < 0 or region_bbox.y < 0:
+        if x < 0 or y < 0:
             raise CropOutOfBoundsError(
                 f"region_bbox origin must be non-negative "
-                f"(got x={region_bbox.x}, y={region_bbox.y})"
+                f"(got x={x}, y={y})"
             )
         if (
-            region_bbox.x + region_bbox.width > base_image.width
-            or region_bbox.y + region_bbox.height > base_image.height
+            x + width > image["width"]
+            or y + height > image["height"]
         ):
             raise CropOutOfBoundsError(
                 f"region_bbox extends outside frame "
-                f"({region_bbox.x},{region_bbox.y},"
-                f"{region_bbox.width},{region_bbox.height}) "
-                f"vs frame {base_image.width}x{base_image.height}"
+                f"({x},{y},{width},{height}) "
+                f"vs frame {image['width']}x{image['height']}"
             )
 
-        # Real pixel slice: reshape flat bytes -> HWC array, copy crop region.
-        arr = np.frombuffer(base_image.data, dtype=np.uint8).reshape(
-            base_image.height, base_image.width, 3
-        )
-        crop_arr = arr[
-            region_bbox.y : region_bbox.y + region_bbox.height,
-            region_bbox.x : region_bbox.x + region_bbox.width,
+        # Real pixel slice: extract crop region from ndarray.
+        data = image["data"]
+        crop_arr = data[
+            y : y + height,
+            x : x + width,
             :,
         ].copy()
 
-        cropped = Image(
-            data=bytes(crop_arr.tobytes()),
-            width=region_bbox.width,
-            height=region_bbox.height,
-            color_format="RGB",
-            layout="HWC",
-            dtype="uint8",
-            value_range="[0,255]",
-        )
-        source_bbox_full_frame = BoundingBox(
-            x=region_bbox.x,
-            y=region_bbox.y,
-            width=region_bbox.width,
-            height=region_bbox.height,
-        )
-        return cropped, source_bbox_full_frame
+        source_bbox_full_frame: SharedBoundingBox = {
+            "x": x,
+            "y": y,
+            "width": width,
+            "height": height,
+        }
+        return crop_arr, source_bbox_full_frame
+
+    @staticmethod
+    def _bbox_attr(region_bbox: object, key: str) -> int:
+        if isinstance(region_bbox, dict):
+            value = region_bbox.get(key)
+        else:
+            value = getattr(region_bbox, key, None)
+        if not isinstance(value, int):
+            raise ValidationError(f"region_bbox.{key} must be an integer")
+        return value
 
 
 # ---------------------------------------------------------------------------
@@ -455,8 +398,23 @@ class CropProcessor:
 class OutputImageContractResolver:
     """Resolves ``OutputImageType`` to its hardcoded ``ImageConversionContract``."""
 
-    def resolve(self, output_type: OutputImageType) -> ImageConversionContract:
-        contract = _OUTPUT_IMAGE_TYPE_CONTRACTS.get(output_type)
+    def resolve(self, output_type: OutputImageType | Enum) -> ImageConversionContract:
+        normalized_output_type: OutputImageType
+        if isinstance(output_type, OutputImageType):
+            normalized_output_type = output_type
+        elif isinstance(output_type, Enum):
+            try:
+                normalized_output_type = OutputImageType(output_type.value)
+            except ValueError as exc:
+                raise UnsupportedOutputImageTypeError(
+                    f"Unsupported OutputImageType: {output_type!r}"
+                ) from exc
+        else:
+            raise UnsupportedOutputImageTypeError(
+                f"Unsupported OutputImageType: {output_type!r}"
+            )
+
+        contract = _OUTPUT_IMAGE_TYPE_CONTRACTS.get(normalized_output_type)
         if contract is None:
             raise UnsupportedOutputImageTypeError(
                 f"Unsupported OutputImageType: {output_type!r}"
@@ -472,51 +430,88 @@ class OutputImageContractResolver:
 class FrameConverter:
     """Applies spatial transformation (``GeometrySpec``) then pixel-format
     conversion (``ImageConversionContract``) to produce a concrete
-    :class:`Image` with real pixel data.
+    shared ``Image`` TypedDict with real pixel data.
 
-    Geometry policies:
-    - ``PRESERVE``: no resize or padding; ``SpatialTransform`` is identity.
+        Geometry policies:
+        - ``NONE``: no resize or padding; ``SpatialTransform`` is identity.
     - ``LETTERBOX``: resize preserving aspect ratio then pad to target size
       with ``padding_color``; ``SpatialTransform`` reflects scale and offsets.
 
     Pixel-format contracts:
     - ``GRAY / uint8 / [0,255]``: single-channel luminance via Pillow ``L`` mode.
-    - ``RGB / float32 / [-1,1]``: ``(uint8 / 127.5) - 1.0`` via NumPy.
     - ``RGB / uint8 / [0,255]``: raw RGB bytes unchanged.
     """
 
     def convert(
         self,
-        image: Image,
+        image_data: np.ndarray,
+        image_width: int,
+        image_height: int,
         contract: ImageConversionContract,
-        geometry_spec: GeometrySpec,
-    ) -> tuple[Image, SpatialTransform]:
+        geometry_spec: object,
+    ) -> tuple[SharedImage, SpatialTransform]:
         try:
             from PIL import Image as _PILImage  # Pillow required for real conversion
 
-            # When data is empty (e.g. unit-test-level direct converter calls),
-            # synthesise a zero-filled image so metadata/SpatialTransform math
-            # can still be exercised without real pixels.
-            raw = image.data if image.data else bytes(image.width * image.height * 3)
-            pil_img = _PILImage.frombytes("RGB", (image.width, image.height), raw)
+            # Ensure we always have a concrete RGB uint8 HWC ndarray before geometry.
+            if image_data.size == 0:
+                rgb_arr = np.zeros((image_height, image_width, 3), dtype=np.uint8)
+            else:
+                rgb_arr = image_data
+
+            if rgb_arr.ndim != 3 or rgb_arr.shape[2] != 3:
+                raise ConversionError(
+                    f"image_data must be HWC RGB with 3 channels (got shape={rgb_arr.shape})"
+                )
+            if rgb_arr.shape[0] != image_height or rgb_arr.shape[1] != image_width:
+                raise ConversionError(
+                    "image_data shape does not match image_width/image_height metadata"
+                )
+            if rgb_arr.dtype != np.uint8:
+                rgb_arr = rgb_arr.astype(np.uint8, copy=False)
+
+            pil_img = _PILImage.fromarray(rgb_arr, mode="RGB")
+
+            resize_policy = FrameTransformationLayer._geometry_attr(
+                geometry_spec, "resize_policy"
+            )
+            tw = FrameTransformationLayer._geometry_attr(geometry_spec, "width")
+            th = FrameTransformationLayer._geometry_attr(geometry_spec, "height")
+
+            if isinstance(resize_policy, ResizePolicy):
+                normalized_resize_policy = resize_policy
+            elif isinstance(resize_policy, Enum):
+                try:
+                    normalized_resize_policy = ResizePolicy(resize_policy.value)
+                except ValueError as exc:
+                    raise ConversionError(
+                        f"Unknown ResizePolicy: {resize_policy!r}"
+                    ) from exc
+            else:
+                raise ConversionError(
+                    f"Unknown ResizePolicy: {resize_policy!r}"
+                )
 
             # ---- geometry -----------------------------------------------
-            if geometry_spec.policy is GeometryPolicy.PRESERVE:
+            if normalized_resize_policy is ResizePolicy.NONE:
                 spatial = SpatialTransform(
                     scale_x=1.0,
                     scale_y=1.0,
                     pad_left=0,
                     pad_top=0,
-                    output_width=image.width,
-                    output_height=image.height,
+                    output_width=image_width,
+                    output_height=image_height,
                 )
                 geom_img = pil_img
 
-            elif geometry_spec.policy is GeometryPolicy.LETTERBOX:
-                tw = geometry_spec.target_width
-                th = geometry_spec.target_height
-                cw = image.width
-                ch = image.height
+
+            elif normalized_resize_policy is ResizePolicy.LETTERBOX:
+                if tw is None or th is None:
+                    raise ConversionError(
+                        "LETTERBOX requires width and height"
+                    )
+                cw = image_width
+                ch = image_height
                 # MD formulas: deterministic, platform-independent.
                 scale = min(tw / cw, th / ch)
                 resized_w = round(cw * scale)
@@ -531,15 +526,17 @@ class FrameConverter:
                     output_width=int(tw),
                     output_height=int(th),
                 )
-                small = pil_img.resize((resized_w, resized_h), _PILImage.LANCZOS)
-                pc = geometry_spec.padding_color
-                canvas = _PILImage.new("RGB", (tw, th), (pc.r, pc.g, pc.b))
+                resampling = getattr(_PILImage, "Resampling", None)
+                lanczos = resampling.LANCZOS if resampling is not None else 1
+                small = pil_img.resize((resized_w, resized_h), lanczos)
+                pr, pg, pb = self._padding_color_rgb(geometry_spec)
+                canvas = _PILImage.new("RGB", (tw, th), (pr, pg, pb))
                 canvas.paste(small, (pad_left, pad_top))
                 geom_img = canvas
 
             else:  # pragma: no cover - enum exhaustive
                 raise ConversionError(
-                    f"Unknown GeometryPolicy: {geometry_spec.policy!r}"
+                    f"Unknown ResizePolicy: {resize_policy!r}"
                 )
 
             # ---- pixel-format conversion --------------------------------
@@ -547,32 +544,48 @@ class FrameConverter:
 
             if contract.color_format == "GRAY":
                 gray = geom_img.convert("L")
-                data = gray.tobytes()
+                data = np.asarray(gray, dtype=np.uint8)
                 out_w, out_h = gray.size
 
-            elif contract.dtype == "float32":
-                arr = np.array(geom_img, dtype=np.float32)
-                arr = (arr / 127.5) - 1.0
-                data = arr.tobytes()
-
             else:  # RGB uint8
-                data = geom_img.tobytes()
+                data = np.asarray(geom_img, dtype=np.uint8)
 
-            converted = Image(
-                data=data,
-                width=out_w,
-                height=out_h,
-                color_format=contract.color_format,
-                layout=contract.layout,
-                dtype=contract.dtype,
-                value_range=contract.value_range,
-            )
+            converted: SharedImage = {
+                "data": data,
+                "width": out_w,
+                "height": out_h,
+                "color_format": contract.color_format,
+                "layout": contract.layout,
+                "dtype": contract.dtype,
+                "value_range": contract.value_range,
+            }
             return converted, spatial
 
         except ConversionError:
             raise
         except Exception as exc:
             raise ConversionError(f"FrameConverter.convert failed: {exc}") from exc
+
+    @staticmethod
+    def _padding_color_rgb(geometry_spec: object) -> tuple[int, int, int]:
+        padding_color = FrameTransformationLayer._geometry_attr(
+            geometry_spec, "padding_color"
+        )
+        if padding_color is None:
+            return (0, 0, 0)
+
+        if isinstance(padding_color, dict):
+            r = padding_color.get("r")
+            g = padding_color.get("g")
+            b = padding_color.get("b")
+        else:
+            r = getattr(padding_color, "r", None)
+            g = getattr(padding_color, "g", None)
+            b = getattr(padding_color, "b", None)
+
+        if not all(isinstance(ch, int) and 0 <= ch <= 255 for ch in (r, g, b)):
+            raise ConversionError("geometry_spec.padding_color must be RGB integers in [0,255]")
+        return (r, g, b)
 
 
 # ---------------------------------------------------------------------------
@@ -603,14 +616,14 @@ class FrameTransformationLayer:
     def ingest_frame(self, frame_packet: FramePacket) -> None:
         # Validate (raises ValidationError or InvalidFramePacketFormatError)
         self._validator.validate(frame_packet)
-        # Build BaseImage (raises InvalidFramePacketFormatError on failure)
-        base_image = self._builder.build(frame_packet)
+        # Build shared Image (converts bytes → ndarray, raises InvalidFramePacketFormatError on failure)
+        image = self._builder.build(frame_packet)
         # Wrap as StoredFrame and rotate CURRENT/PREVIOUS in FrameStore
         stored_frame = StoredFrame(
             frame_id=frame_packet.frame_id,
             camera_id=frame_packet.camera_id,
             timestamp_ms=frame_packet.timestamp_ms,
-            base_image=base_image,
+            image=image,
         )
         self._store.put_latest(stored_frame)
 
@@ -619,21 +632,27 @@ class FrameTransformationLayer:
         self,
         camera_id: str,
         temporal_selector: FrameTemporalSelector,
-        region_bbox: BoundingBox,
+        region_bbox: SharedBoundingBox,
         output_type: OutputImageType,
-        geometry_spec: GeometrySpec,
+        geometry_spec: SharedGeometrySpec | object,
     ) -> ProcessedFrame:
         self._validate_geometry_spec(geometry_spec)
 
         stored_frame = self._store.get(camera_id, temporal_selector)
-        base_image = stored_frame.base_image
-        cropped_image, source_bbox_full_frame = self._crop.crop(base_image, region_bbox)
+        image = stored_frame.image
+        cropped_data, source_bbox_full_frame = self._crop.crop(image, region_bbox)
         contract = self._resolver.resolve(output_type)
         converted_image, spatial_transform = self._converter.convert(
-            cropped_image, contract, geometry_spec
+            cropped_data,
+            source_bbox_full_frame["width"],
+            source_bbox_full_frame["height"],
+            contract,
+            geometry_spec,
         )
 
         return ProcessedFrame(
+            frame_id=stored_frame.frame_id,
+            timestamp_ms=stored_frame.timestamp_ms,
             image=converted_image,
             source_bbox_full_frame=source_bbox_full_frame,
             spatial_transform=spatial_transform,
@@ -641,36 +660,56 @@ class FrameTransformationLayer:
 
     # ---- helpers -------------------------------------------------------
     @staticmethod
-    def _validate_geometry_spec(geometry_spec: GeometrySpec) -> None:
-        if not isinstance(geometry_spec, GeometrySpec):
-            raise ValidationError("geometry_spec must be a GeometrySpec instance")
-        if not isinstance(geometry_spec.policy, GeometryPolicy):
+    def _validate_geometry_spec(geometry_spec: object) -> None:
+        resize_policy = FrameTransformationLayer._geometry_attr(
+            geometry_spec, "resize_policy"
+        )
+        if isinstance(resize_policy, ResizePolicy):
+            normalized_resize_policy = resize_policy
+        elif isinstance(resize_policy, Enum):
+            try:
+                normalized_resize_policy = ResizePolicy(resize_policy.value)
+            except ValueError as exc:
+                raise ValidationError(
+                    "geometry_spec.resize_policy must be a ResizePolicy enum value"
+                ) from exc
+        else:
             raise ValidationError(
-                "geometry_spec.policy must be a GeometryPolicy enum value"
+                "geometry_spec.resize_policy must be a ResizePolicy enum value"
             )
 
-        if geometry_spec.policy is GeometryPolicy.PRESERVE:
-            if (
-                geometry_spec.target_width is not None
-                or geometry_spec.target_height is not None
-            ):
-                raise ValidationError(
-                    "PRESERVE geometry_spec must have target_width and "
-                    "target_height set to None"
-                )
-        elif geometry_spec.policy is GeometryPolicy.LETTERBOX:
-            tw = geometry_spec.target_width
-            th = geometry_spec.target_height
+        tw = FrameTransformationLayer._geometry_attr(geometry_spec, "width")
+        th = FrameTransformationLayer._geometry_attr(geometry_spec, "height")
+
+        if normalized_resize_policy is ResizePolicy.NONE:
+            for axis_name, axis_value in (("width", tw), ("height", th)):
+                if axis_value is not None and (
+                    not isinstance(axis_value, int) or axis_value < 0
+                ):
+                    raise ValidationError(
+                        f"NONE geometry_spec {axis_name} must be an integer >= 0 when provided"
+                    )
+        elif normalized_resize_policy is ResizePolicy.LETTERBOX:
             if tw is None or th is None:
                 raise ValidationError(
-                    "LETTERBOX geometry_spec requires target_width and target_height"
+                    "LETTERBOX geometry_spec requires width and height"
                 )
             if not isinstance(tw, int) or not isinstance(th, int):
                 raise ValidationError(
-                    "LETTERBOX target_width/target_height must be integers"
+                    "LETTERBOX width/height must be integers"
                 )
             if tw <= 0 or th <= 0:
                 raise ValidationError(
-                    f"LETTERBOX target_width/target_height must be > 0 "
+                    "LETTERBOX width/height must be > 0 "
                     f"(got {tw}, {th})"
                 )
+        else:
+            raise ValidationError(
+                f"Unsupported resize_policy: {normalized_resize_policy!r}"
+            )
+
+    @staticmethod
+    def _geometry_attr(geometry_spec: object, key: str) -> Any:
+        if isinstance(geometry_spec, dict):
+            return geometry_spec.get(key)
+        return getattr(geometry_spec, key, None)

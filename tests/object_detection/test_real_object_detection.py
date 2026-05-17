@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image as PILImage
 
 SRC_DIR = Path(__file__).resolve().parents[2] / "src"
 if str(SRC_DIR) not in sys.path:
@@ -114,7 +114,7 @@ class ObjectDetectionModuleTests(unittest.TestCase):
 class RealObjectDetectionSmokeTests(unittest.TestCase):
     def test_process_runs_real_inference_on_asset(self) -> None:
         asset_path = Path(__file__).resolve().parent / "assets" / "one_person" / "one_person_01.jpg"
-        image = np.array(Image.open(asset_path).convert("RGB"))
+        image = np.array(PILImage.open(asset_path).convert("RGB"))
         module = ObjectDetectionModule()
 
         result = module.process(
@@ -174,8 +174,6 @@ def _make_detect_input(
         "timestamp_ms": timestamp_ms,
         "roi_image": _make_roi_image(image),
         "roi_bbox_frame": roi_bbox_frame,
-        "width": image.shape[1],
-        "height": image.shape[0],
     }
 
 
@@ -247,54 +245,166 @@ class ObjectDetectionDetectMethodTests(unittest.TestCase):
         for person in result["persons"]:
             self.assertNotIn("confidence", person)
 
-    # --- detect() validation ---
+    # --- detect() validation — invalid inputs return empty result (never propagate) ---
 
-    def test_detect_raises_on_missing_timestamp_ms(self) -> None:
+    # --- detect() validation — invalid inputs return empty result (never propagate) ---
+
+    def test_detect_returns_empty_on_missing_timestamp_ms(self) -> None:
         module = self._module_with([])
         image = self._blank_image()
         bad_input: ObjectDetectionInput = {
             "frame_id": "f1",
             "camera_id": "cam",
             "timestamp_ms": 0,  # will be overridden below
-            "roi_image": image,
+            "roi_image": _make_roi_image(image),
             "roi_bbox_frame": _make_roi_bbox(),
-            "width": image.shape[1],
-            "height": image.shape[0],
         }
         # Simulate missing timestamp_ms via dict manipulation after construction
         del bad_input["timestamp_ms"]  # type: ignore[misc]
-        with self.assertRaises((ValueError, KeyError)):
-            module.detect(bad_input)
+        result = module.detect(bad_input)
+        self.assertFalse(result["person_detected"])
+        self.assertEqual(result["persons"], [])
 
-    def test_detect_raises_on_missing_roi_bbox_frame(self) -> None:
+    def test_detect_returns_empty_on_missing_roi_bbox_frame(self) -> None:
         module = self._module_with([])
         image = self._blank_image()
         bad_input: ObjectDetectionInput = {
             "frame_id": "f1",
             "camera_id": "cam",
             "timestamp_ms": 1000,
-            "roi_image": image,
+            "roi_image": _make_roi_image(image),
             "roi_bbox_frame": _make_roi_bbox(),
-            "width": image.shape[1],
-            "height": image.shape[0],
         }
         del bad_input["roi_bbox_frame"]  # type: ignore[misc]
-        with self.assertRaises((ValueError, KeyError)):
-            module.detect(bad_input)
+        result = module.detect(bad_input)
+        self.assertFalse(result["person_detected"])
+        self.assertEqual(result["persons"], [])
 
-    def test_detect_raises_on_zero_roi_bbox_width(self) -> None:
+    def test_detect_returns_empty_on_zero_roi_bbox_width(self) -> None:
         module = self._module_with([])
         image = self._blank_image()
         bad_roi_bbox: BoundingBox = {"x": 0, "y": 0, "width": 0, "height": 100}
-        with self.assertRaises(ValueError):
-            module.detect(_make_detect_input(image, roi_bbox_frame=bad_roi_bbox))
+        result = module.detect(_make_detect_input(image, roi_bbox_frame=bad_roi_bbox))
+        self.assertFalse(result["person_detected"])
+        self.assertEqual(result["persons"], [])
 
-    def test_detect_raises_on_zero_roi_bbox_height(self) -> None:
+    def test_detect_returns_empty_on_zero_roi_bbox_height(self) -> None:
         module = self._module_with([])
         image = self._blank_image()
         bad_roi_bbox: BoundingBox = {"x": 0, "y": 0, "width": 100, "height": 0}
-        with self.assertRaises(ValueError):
-            module.detect(_make_detect_input(image, roi_bbox_frame=bad_roi_bbox))
+        result = module.detect(_make_detect_input(image, roi_bbox_frame=bad_roi_bbox))
+        self.assertFalse(result["person_detected"])
+        self.assertEqual(result["persons"], [])
+
+    def test_detect_returns_empty_on_zero_roi_image_width(self) -> None:
+        module = self._module_with([])
+        image = self._blank_image()
+        roi_image: Image = {
+            "data": image,
+            "width": 0,
+            "height": image.shape[0],
+            "color_format": "RGB",
+            "layout": "HWC",
+            "dtype": "uint8",
+            "value_range": "[0,255]",
+        }
+        bad_input: ObjectDetectionInput = {
+            "frame_id": "f1",
+            "camera_id": "cam",
+            "timestamp_ms": 1000,
+            "roi_image": roi_image,
+            "roi_bbox_frame": _make_roi_bbox(),
+        }
+        result = module.detect(bad_input)
+        self.assertFalse(result["person_detected"])
+        self.assertEqual(result["persons"], [])
+
+    def test_detect_returns_empty_on_zero_roi_image_height(self) -> None:
+        module = self._module_with([])
+        image = self._blank_image()
+        roi_image: Image = {
+            "data": image,
+            "width": image.shape[1],
+            "height": 0,
+            "color_format": "RGB",
+            "layout": "HWC",
+            "dtype": "uint8",
+            "value_range": "[0,255]",
+        }
+        bad_input: ObjectDetectionInput = {
+            "frame_id": "f1",
+            "camera_id": "cam",
+            "timestamp_ms": 1000,
+            "roi_image": roi_image,
+            "roi_bbox_frame": _make_roi_bbox(),
+        }
+        result = module.detect(bad_input)
+        self.assertFalse(result["person_detected"])
+        self.assertEqual(result["persons"], [])
+
+    def test_detect_returns_empty_on_shape_mismatch(self) -> None:
+        # ndarray is 100 rows × 80 cols, but roi_image declares width=200, height=300
+        module = self._module_with([])
+        image = np.zeros((100, 80, 3), dtype=np.uint8)
+        roi_image: Image = {
+            "data": image,
+            "width": 200,
+            "height": 300,
+            "color_format": "RGB",
+            "layout": "HWC",
+            "dtype": "uint8",
+            "value_range": "[0,255]",
+        }
+        bad_input: ObjectDetectionInput = {
+            "frame_id": "f1",
+            "camera_id": "cam",
+            "timestamp_ms": 1000,
+            "roi_image": roi_image,
+            "roi_bbox_frame": _make_roi_bbox(),
+        }
+        result = module.detect(bad_input)
+        self.assertFalse(result["person_detected"])
+        self.assertEqual(result["persons"], [])
+
+    def test_detect_returns_empty_on_wrong_color_format(self) -> None:
+        module = self._module_with([])
+        od_input = _make_detect_input(self._blank_image())
+        od_input["roi_image"] = {**od_input["roi_image"], "color_format": "BGR"}  # type: ignore[misc]
+        result = module.detect(od_input)
+        self.assertFalse(result["person_detected"])
+        self.assertEqual(result["persons"], [])
+
+    def test_detect_returns_empty_on_wrong_layout(self) -> None:
+        module = self._module_with([])
+        od_input = _make_detect_input(self._blank_image())
+        od_input["roi_image"] = {**od_input["roi_image"], "layout": "CHW"}  # type: ignore[misc]
+        result = module.detect(od_input)
+        self.assertFalse(result["person_detected"])
+        self.assertEqual(result["persons"], [])
+
+    def test_detect_returns_empty_on_wrong_dtype(self) -> None:
+        module = self._module_with([])
+        od_input = _make_detect_input(self._blank_image())
+        od_input["roi_image"] = {**od_input["roi_image"], "dtype": "float32"}  # type: ignore[misc]
+        result = module.detect(od_input)
+        self.assertFalse(result["person_detected"])
+        self.assertEqual(result["persons"], [])
+
+    def test_detect_returns_empty_on_wrong_value_range(self) -> None:
+        module = self._module_with([])
+        od_input = _make_detect_input(self._blank_image())
+        od_input["roi_image"] = {**od_input["roi_image"], "value_range": "[0,1]"}  # type: ignore[misc]
+        result = module.detect(od_input)
+        self.assertFalse(result["person_detected"])
+        self.assertEqual(result["persons"], [])
+
+    def test_detect_returns_empty_on_raw_ndarray_as_roi_image(self) -> None:
+        module = self._module_with([])
+        od_input = _make_detect_input(self._blank_image())
+        od_input["roi_image"] = self._blank_image()  # type: ignore[assignment]
+        result = module.detect(od_input)
+        self.assertFalse(result["person_detected"])
+        self.assertEqual(result["persons"], [])
 
     # --- get_input_contract() ---
 

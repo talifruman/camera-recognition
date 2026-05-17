@@ -15,15 +15,15 @@ The following types used by the FTL are defined in [shared_contracts.md](shared_
 
 ## Purpose
 
-The Frame Transformation Layer (FTL) is an internal frame processing layer that ingests `FramePacket` objects containing canonical raw RGB pixel data, wraps them into a full-frame canonical `Image` (via `BaseImageBuilder`), maintains exactly two frames per camera (CURRENT and PREVIOUS) in `FrameStore`, and returns prepared `ProcessedFrame` outputs on demand. Cropping, resizing, letterboxing, and pixel-format conversion are derived operations performed only during `get_frame`; they never mutate or replace the stored full-frame `Image`.
+The Frame Transformation Layer (FTL) is an internal frame processing layer that ingests `FramePacket` objects containing canonical raw RGB pixel data in bytes, converts them to `np.ndarray` immediately during ingest, wraps them into full-frame shared `Image` structs, maintains exactly two frames per camera (CURRENT and PREVIOUS) in `FrameStore`, and returns prepared `ProcessedFrame` outputs on demand. Cropping, resizing, letterboxing, and pixel-format conversion are derived operations performed only during `get_frame`; they never mutate or replace the stored full-frame `Image`.
 
-The FTL receives `FramePacket` objects provided by a caller. These packets must always contain raw, unencoded canonical RGB pixel bytes in HWC layout. The FTL does not decode or convert any pixel format.
+The FTL receives `FramePacket` objects provided by a caller. These packets must always contain raw, unencoded canonical RGB pixel bytes in HWC layout. The FTL converts bytes → `np.ndarray` exactly once during ingest, then operates exclusively on ndarray data from that point forward.
 
 The layer has exactly three responsibilities:
 
-1. **Ingest** — validate an incoming `FramePacket` canonical format and wrap its pixel bytes into a full-frame `Image` (with canonical RGB/HWC/uint8/[0,255] metadata) via `BaseImageBuilder`, then store it as the new CURRENT frame for that camera in `FrameStore`, rotating the previous CURRENT to PREVIOUS. No crop, resize, letterbox, normalization, or output conversion occurs during ingest.
-2. **Store** — maintain exactly two full-frame `StoredFrame` instances per camera: CURRENT and PREVIOUS. CURRENT is updated only after successful validation and build; PREVIOUS is the frame that was CURRENT before the latest successful ingest. Only full-frame `Image` instances (wrapped in `StoredFrame`) are ever stored; cropped, resized, letterboxed, normalized, or otherwise derived images are never stored.
-3. **Prepare on demand** — given a `camera_id`, a `FrameTemporalSelector` (CURRENT or PREVIOUS), a `region_bbox`, an `OutputImageType`, and a `GeometrySpec`, resolve the stored full-frame `Image` for that camera and temporal position, crop the requested region, apply the hardcoded pixel-format `ImageConversionContract` for that `OutputImageType`, and apply the spatial transformation defined by `GeometrySpec`. All outputs are derived and temporary; they are never written back to `FrameStore`.
+1. **Ingest** — validate an incoming `FramePacket` canonical format, convert its pixel bytes to `np.ndarray` immediately, wrap it into a full-frame shared `Image` (with canonical RGB/HWC/uint8/[0,255] metadata), and store it as the new CURRENT frame for that camera in `FrameStore`, rotating the previous CURRENT to PREVIOUS. No crop, resize, letterbox, normalization, or output conversion occurs during ingest. The bytes → ndarray conversion happens exactly once here.
+2. **Store** — maintain exactly two full-frame `StoredFrame` instances per camera: CURRENT and PREVIOUS. CURRENT is updated only after successful validation, conversion, and build; PREVIOUS is the frame that was CURRENT before the latest successful ingest. Only full-frame shared `Image` instances (wrapped in `StoredFrame` with ndarray data) are ever stored; cropped, resized, letterboxed, normalized, or otherwise derived images are never stored.
+3. **Prepare on demand** — given a `camera_id`, a `FrameTemporalSelector` (CURRENT or PREVIOUS), a `region_bbox`, an `OutputImageType`, and a `GeometrySpec`, resolve the stored full-frame shared `Image` for that camera and temporal position, crop the requested region (ndarray slicing), apply the hardcoded pixel-format `ImageConversionContract` for that `OutputImageType`, and apply the spatial transformation defined by `GeometrySpec`. All outputs are derived and temporary; they are never written back to `FrameStore`.
 
 The FTL does not know why a frame is requested. It does not know which consumer will use the returned image. It receives an `OutputImageType` and a `GeometrySpec`, and returns one `ProcessedFrame` whose `image` field is a shared `Image` struct whose metadata fields (`color_format`, `layout`, `dtype`, `value_range`) match the hardcoded `ImageConversionContract` for that `OutputImageType` and whose spatial transformation is defined by `GeometrySpec`. `OutputImageType` defines pixel representation only. `GeometrySpec` defines spatial transformation.
 
@@ -36,9 +36,10 @@ The Frame Transformation Layer is an internal frame processing layer.
 Normative role:
 
 - Accept an immutable `FramePacket` and validate all required fields.
-- Validate that `FramePacket.image_bytes` is canonical RGB/HWC/uint8/[0,255] and build a full-frame `Image` via `BaseImageBuilder`.
-- Store `StoredFrame` (containing full-frame `Image`) in `FrameStore` as CURRENT for the camera; rotate old CURRENT to PREVIOUS.
-- On `get_frame`, resolve the `StoredFrame` for the given `camera_id` and `FrameTemporalSelector`, retrieve the stored full-frame `Image`, crop the requested region, resolve the hardcoded pixel-format `ImageConversionContract` from `OutputImageType`, apply spatial transformation from `GeometrySpec`, and return `ProcessedFrame`.
+- Convert `FramePacket.image_bytes` (canonical RGB/HWC/uint8/[0,255]) to `np.ndarray` immediately (exactly once during ingest).
+- Wrap the ndarray in a full-frame shared `Image` struct with canonical metadata.
+- Store `StoredFrame` (containing full-frame shared `Image` with ndarray data) in `FrameStore` as CURRENT for the camera; rotate old CURRENT to PREVIOUS.
+- On `get_frame`, resolve the `StoredFrame` for the given `camera_id` and `FrameTemporalSelector`, retrieve the stored full-frame shared `Image` (which contains ndarray data), crop the requested region (ndarray slicing), resolve the hardcoded pixel-format `ImageConversionContract` from `OutputImageType`, apply spatial transformation from `GeometrySpec`, and return `ProcessedFrame`.
 - Return `source_bbox_full_frame` and `SpatialTransform` as spatial references on every `ProcessedFrame`.
 
 Non-goals:
@@ -62,10 +63,11 @@ It returns one `ProcessedFrame` whose pixel format matches the hardcoded `ImageC
 ### In Scope
 
 - Validate `FramePacket` — all required fields including canonical format and byte-size consistency.
-- Build full-frame `Image` from validated `FramePacket` via `BaseImageBuilder`.
-- Store `StoredFrame` (containing full-frame `Image`) in `FrameStore`; rotate old CURRENT to PREVIOUS.
-- Resolve `StoredFrame` by `camera_id` and `FrameTemporalSelector` on `get_frame`; extract stored full-frame `Image`.
-- Crop the requested region via `CropProcessor`.
+- Convert `FramePacket.image_bytes` (canonical RGB/HWC/uint8/[0,255]) to `np.ndarray` eagerly during ingest.
+- Wrap ndarray in full-frame shared `Image` struct with canonical metadata.
+- Store `StoredFrame` (containing full-frame shared `Image` with ndarray data) in `FrameStore`; rotate old CURRENT to PREVIOUS.
+- Resolve `StoredFrame` by `camera_id` and `FrameTemporalSelector` on `get_frame`; extract stored full-frame shared `Image`.
+- Crop the requested region (ndarray slicing) via `CropProcessor`.
 - Resolve the hardcoded pixel-format `ImageConversionContract` from `OutputImageType` via `OutputImageContractResolver`.
 - Convert the cropped image via `FrameConverter`.
 - Return `source_bbox_full_frame` and `SpatialTransform` as spatial references on every `ProcessedFrame`.
@@ -74,7 +76,7 @@ It returns one `ProcessedFrame` whose pixel format matches the hardcoded `ImageC
 
 The Frame Transformation Layer does not:
 
-- Convert or decode any pixel format — input must already be canonical RGB/HWC/uint8/[0,255].
+- Decode compressed image formats (e.g., JPEG, PNG) — input must already be unencoded canonical RGB/HWC/uint8/[0,255] bytes.
 - Create `FramePacket` objects.
 - Perform inference or detection of any kind.
 - Accept caller-supplied conversion contracts.
@@ -104,44 +106,32 @@ Any `FramePacket` that does not satisfy all of these requirements is rejected wi
 
 `pixel_format` describes the raw pixel layout of `image_bytes` in the `FramePacket`. It is not an output format. `OutputImageType` describes the prepared in-memory image representation returned by `get_frame`.
 
-## FTL Internal Image Buffer (Internal Implementation Detail)
+## Internal Data Flow and Image Conversion
 
-> **Internal-only type.** `FrameBuffer` is an FTL-internal processing type used between `CropProcessor` and `FrameConverter`. It must not be referenced by any other module spec. All external image references — including the `image` field of `ProcessedFrame` and `StoredFrame` — use the shared `Image` struct defined in [shared_contracts.md §6](shared_contracts.md).
+**Bytes → ndarray conversion happens exactly once during ingest.**
 
-`FrameBuffer` is the FTL-internal container for pixel data in flight between internal processing stages. It is used as output from `CropProcessor`, input and output of `FrameConverter`.
+During `ingest_frame`:
 
-```text
-struct FrameBuffer {
-    bytes  data;
-    int32  width;
-    int32  height;
-    string color_format;   // output format: "RGB" or "GRAY" (GRAY only as a conversion output, never as a stored full-frame Image)
-    string layout;         // "HWC"
-    string dtype;          // "uint8" or "float32"
-    string value_range;    // "[0,255]" or "[-1,1]"
-}
-```
+1. Validate `FramePacket` canonical format (all required fields)
+2. Convert `FramePacket.image_bytes` → `np.ndarray` via `np.frombuffer(...).reshape(...).copy()`
+3. Wrap ndarray in shared `Image` TypedDict with canonical RGB/HWC/uint8/[0,255] metadata
+4. Store `StoredFrame` (containing shared `Image` with ndarray `data` field) in `FrameStore`
 
-## BaseImage (FTL-Internal Implementation Detail)
+During `get_frame`:
 
-> **Internal-only type.** `BaseImage` is an FTL-internal concept used by `BaseImageBuilder` and `FrameStore`. It must not be referenced by any other module spec or public API. Its responsibility as the canonical full-frame image representation is fulfilled externally by the shared `Image` struct (see [shared_contracts.md §6](shared_contracts.md)). The `StoredFrame.image` field exposed through `StoredFrame` uses the shared `Image` type.
-
-Internally, `BaseImageBuilder` constructs an `Image` struct from the validated `FramePacket`. The resulting `Image` is always fixed to the following canonical values:
-
-| Field | Fixed value |
-|-------|-------------|
-| `color_format` | `RGB` |
-| `layout` | `HWC` |
-| `dtype` | `uint8` |
-| `value_range` | `[0,255]` |
+1. Retrieve `StoredFrame` containing shared `Image` with ndarray `data`
+2. Crop: `data[y:y+h, x:x+w].copy()` (ndarray slicing)
+3. Convert: pixel-format conversion via PIL (RGB ↔ GRAY), output as shared `Image`
+4. Return `ProcessedFrame` with shared `Image`
 
 Rules:
 
-- Every `FramePacket` ingested by the FTL produces exactly one full-frame `Image` with the canonical RGB/HWC/uint8/[0,255] metadata.
-- If `FramePacket` does not satisfy the canonical input format, the FTL rejects it and no stored `Image` is produced.
-- `FrameStore` stores only these full-frame `Image` instances — never raw bytes, ROIs, or converted outputs.
-- All on-demand transformations operate exclusively on the stored full-frame `Image`.
-- `Image.width` and `Image.height` are set from `FramePacket.width` and `FramePacket.height` explicitly — they are not inferred from `Image.data.shape`.
+- Bytes → ndarray conversion is performed exactly once, eagerly, during ingest in `BaseImageBuilder`
+- After ingest, all internal image data is ndarray-based
+- `FrameStore` stores only full-frame shared `Image` instances with ndarray `data` — never raw bytes, ROIs, or converted outputs
+- All on-demand transformations operate exclusively on the stored full-frame `Image` ndarray
+- `Image.width` and `Image.height` are set from `FramePacket.width` and `FramePacket.height` explicitly — they are not inferred from `Image.data.shape`
+- Full-frame `Image` is never modified in place; all cropping, resizing, and format conversion produce temporary derived images
 
 ## OutputImageType Enum
 
@@ -155,8 +145,6 @@ Each `OutputImageType` maps to exactly one hardcoded `ImageConversionContract` c
 |----------------|--------------|--------|-------|-------------|
 | `GRAYSCALE_UINT8_HWC` | GRAY | HWC | uint8 | [0,255] |
 | `RGB_UINT8_HWC` | RGB | HWC | uint8 | [0,255] |
-| `RGB_FLOAT32_HWC_NORMALIZED_0_TO_1` | RGB | HWC | float32 | [0,1] |
-| `RGB_FLOAT32_HWC_NORMALIZED_MINUS1_TO_1` | RGB | HWC | float32 | [-1,1] |
 
 Rules:
 
@@ -169,14 +157,14 @@ Rules:
 
 `GeometrySpec` is defined in [shared_contracts.md §3](shared_contracts.md). It defines the spatial transformation applied during `get_frame`. It is provided by the caller as an explicit parameter, separate from `OutputImageType`.
 
-Fields: `width: int`, `height: int`, `resize_policy: ResizePolicy` — see [shared_contracts.md §2](shared_contracts.md) for `ResizePolicy` values.
+Fields: `width: int`, `height: int`, `resize_policy: ResizePolicy` — see [shared_contracts.md §2](shared_contracts.md) for supported `ResizePolicy` values (`NONE`, `LETTERBOX`).
 
 **FTL extension for LETTERBOX:** When `resize_policy = LETTERBOX`, the FTL internally supports an optional `padding_color` parameter (`RGBColor{r, g, b}`). This is an FTL implementation detail and is not part of the shared `GeometrySpec`. When not specified, padding defaults to black (`{0, 0, 0}`).
 
 Rules:
 
-- When `resize_policy = NONE`: `width` and `height` are ignored. No resize or padding is applied.
-- When `resize_policy = LETTERBOX`: `width` and `height` must be `> 0`.
+- When `resize_policy = NONE`: `width` and `height` are ignored. `width = 0` and `height = 0` are valid placeholders. No resize or padding is applied.
+- When `resize_policy = LETTERBOX`: `width` and `height` must be `> 0`; output is exactly `(width, height)` with aspect-preserving resize plus padding.
 - `GeometrySpec` is provided externally by the caller. It is not embedded in `OutputImageType` or `ImageConversionContract`.
 
 `FrameTemporalSelector` is the value passed to `get_frame` to select which frame to retrieve for a given camera.
@@ -299,6 +287,8 @@ struct SpatialTransform {
 }
 
 struct ProcessedFrame {
+    string           frame_id;               // copied unchanged from the source FramePacket.frame_id; traceability metadata — not modified by FTL operations (crop, resize, letterbox, pixel-format conversion)
+  uint64           timestamp_ms;           // copied unchanged from the source FramePacket.timestamp_ms through StoredFrame.timestamp_ms; traceability metadata — not modified by FTL operations
     Image            image;                   // See shared_contracts.md §6 — shared Image struct; metadata fields match the OutputImageType passed to get_frame; image.width and image.height reflect the output dimensions after geometry transformation
     BoundingBox      source_bbox_full_frame;
     SpatialTransform spatial_transform;
@@ -309,20 +299,25 @@ struct ProcessedFrame {
 
 Output rules:
 
+- `frame_id` is copied unchanged from `StoredFrame.frame_id`, which was copied from the ingested `FramePacket.frame_id`. FTL NONEs `frame_id` through all operations (crop, resize, letterbox, and pixel-format conversion). `frame_id` is traceability metadata and must not be generated, synthesized, or modified by FTL.
+- `timestamp_ms` is copied unchanged from `StoredFrame.timestamp_ms`, which was copied from the ingested `FramePacket.timestamp_ms`. `timestamp_ms` is traceability metadata and must not be generated, synthesized, or modified by FTL operations.
 - The `image` field carries a fully populated `Image` struct: `data`, `width`, `height`, `color_format`, `layout`, `dtype`, and `value_range` all reflect the resolved `ImageConversionContract` and applied geometry transformation.
 - `source_bbox_full_frame` ALWAYS refers to the original full-frame coordinate system.
 - `source_bbox_full_frame` enables callers to project locally computed coordinates back to full-frame coordinates.
 - If no crop is applied, `source_bbox_full_frame` equals the full frame dimensions.
 - `spatial_transform` carries the scale factors and padding offsets applied during geometry transformation.
-- For `geometry_spec.policy=PRESERVE`, `scale_x=scale_y=1.0`, `pad_left=pad_top=0`, output dimensions equal crop dimensions.
+- For `geometry_spec.resize_policy=NONE`, `scale_x=scale_y=1.0`, `pad_left=pad_top=0`, output dimensions equal crop dimensions.
+- For `geometry_spec.resize_policy=LETTERBOX`, `scale_x=scale_y=min(target_width/cropped_width, target_height/cropped_height)`, output dimensions equal target dimensions, and padding offsets are reflected in `pad_left`/`pad_top`.
 - The FTL returns only `ProcessedFrame`. `ProcessedFrame` is a derived output created on demand from the stored full-frame `Image`; it is never stored in `FrameStore`. Depending on request parameters, the `image` field may contain a cropped, resized, letterboxed, or pixel-format-converted image.
 - Returned output is a derived artifact; the FTL never mutates `FramePacket` or any stored full-frame `Image`.
+- `ProcessedFrame.image.data` must be treated as read-only by consumers. Mutation by downstream modules is forbidden by contract.
+- The FTL may return either copies or references for `ProcessedFrame.image.data`; this is an implementation detail and callers must not rely on mutability behavior.
 
 ## SpatialTransform Formulas
 
-The FTL applies spatial transforms deterministically based on `geometry_spec.policy`. `SpatialTransform` is derived from `GeometrySpec`, not from `OutputImageType`.
+The FTL applies spatial transforms deterministically based on `geometry_spec.resize_policy`. `SpatialTransform` is derived from `GeometrySpec`, not from `OutputImageType`.
 
-### geometry_spec.policy = PRESERVE
+### geometry_spec.resize_policy = NONE
 
 ```
 scale_x       = 1.0
@@ -333,32 +328,32 @@ output_width  = cropped_width
 output_height = cropped_height
 ```
 
-### geometry_spec.policy = LETTERBOX
+### geometry_spec.resize_policy = LETTERBOX
 
 ```
-scale         = min(target_width / cropped_width, target_height / cropped_height)
+scale         = min(width / cropped_width, height / cropped_height)
 resized_width = round(cropped_width × scale)
 resized_height= round(cropped_height × scale)
-pad_left      = floor((target_width  - resized_width)  / 2)
-pad_top       = floor((target_height - resized_height) / 2)
+pad_left      = floor((width  - resized_width)  / 2)
+pad_top       = floor((height - resized_height) / 2)
 scale_x       = scale
 scale_y       = scale
-output_width  = target_width
-output_height = target_height
+output_width  = width
+output_height = height
 ```
 
-`target_width` and `target_height` are provided by `GeometrySpec` (supplied by the caller; not embedded in `OutputImageType` or `ImageConversionContract`).
+`width` and `height` are provided by `GeometrySpec` (supplied by the caller; not embedded in `OutputImageType` or `ImageConversionContract`).
 
 All rounding operations used during letterbox resize must be deterministic and platform-independent. The implementation must use the same rounding policy consistently:
 
 - `resized_width = round(cropped_width × scale)`
 - `resized_height = round(cropped_height × scale)`
-- `pad_left = floor((target_width - resized_width) / 2)`
-- `pad_top = floor((target_height - resized_height) / 2)`
+- `pad_left = floor((width - resized_width) / 2)`
+- `pad_top = floor((height - resized_height) / 2)`
 
-## Crop and Letterbox Coordinate Mapping
+## Crop and Geometry Coordinate Mapping
 
-When a region is cropped and then letterboxed:
+When a region is cropped and then transformed by NONE or LETTERBOX:
 
 - `source_bbox_full_frame` identifies the crop location in the original full-frame coordinate system.
 - `SpatialTransform` describes the transform from cropped-image coordinates to output-image coordinates.
@@ -374,7 +369,15 @@ To map a point `(ox, oy)` from output-image coordinates back to full-frame coord
                      fy = ry + source_bbox_full_frame.y
 ```
 
+For `NONE`, this reduces to identity-plus-offset because `pad_left=pad_top=0` and `scale_x=scale_y=1.0`.
+
 The result `(fx, fy)` is the corresponding point in the original full-frame coordinate system.
+
+## Concurrency Expectations
+
+- `FrameStore` must be safe for concurrent `ingest_frame` and `get_frame` calls across multiple cameras.
+- CURRENT/PREVIOUS state is isolated per `camera_id`; operations for one camera must not mutate another camera state.
+- `get_frame` outputs are derived snapshots; no derived output may mutate stored full-frame image state.
 
 ## Internal Components
 
@@ -424,33 +427,33 @@ This section defines the minimal, language-agnostic public APIs and essential in
 **Responsibilities**
 
 - Validate that `FramePacket` already matches the canonical input format.
-- Wrap or copy `FramePacket.image_bytes` into a `BaseImage`.
+- Wrap or copy `FramePacket.image_bytes` into a `Image`.
 - Never decode compressed formats.
 - Never convert source formats.
 - Never infer missing metadata.
 
 **Methods**
 
-- `build(frame_packet: FramePacket) -> BaseImage`
-  - **Purpose:** Wrap canonical `image_bytes` from `frame_packet` into a `BaseImage`.
+- `build(frame_packet: FramePacket) -> Image`
+  - **Purpose:** Wrap canonical `image_bytes` from `frame_packet` into a `Image`.
   - **Parameters:** `frame_packet` — Immutable frame packet containing `image_bytes`, `pixel_format`, `layout`, `num_color_channels`, `bits_per_channel`, `width`, `height`.
-  - **Return:** `BaseImage` ready for storage and subsequent transformations.
-  - **Semantics:** Deterministic; same packet input always yields the same `BaseImage` output. Does not modify `frame_packet`.
+  - **Return:** `Image` ready for storage and subsequent transformations.
+  - **Semantics:** Deterministic; same packet input always yields the same `Image` output. Does not modify `frame_packet`.
   - **Error:** Raises `InvalidFramePacketFormatError` if `FramePacket` does not satisfy the canonical input format.
 
 ---
 
-### Class: BaseImage
+### Class: Image
 
 **Responsibilities**
 
 - Represent the canonical internal image produced by `BaseImageBuilder`.
 - Serve as the sole input to all crop, resize, and conversion operations.
-- Stored `BaseImage` instances are immutable. No transformation is allowed to modify a stored `BaseImage` in place. All crop, resize, and conversion operations produce new derived `Image` objects.
+- Stored `Image` instances are immutable. No transformation is allowed to modify a stored `Image` in place. All crop, resize, and conversion operations produce new derived `Image` objects.
 
 **Attributes**
 
-- `data: bytes` — Raw image bytes in RGB/HWC order.
+- `data: np.ndarray` — Pixel buffer in HWC layout (RGB for stored full-frame images).
 - `color_format: string` — Always `RGB`.
 - `layout: string` — Always `HWC`.
 - `dtype: string` — Always `uint8`.
@@ -464,7 +467,7 @@ This section defines the minimal, language-agnostic public APIs and essential in
 
 **Responsibilities**
 
-- Wrap a full-frame `BaseImage` together with its identifying metadata for storage in `FrameStore`.
+- Wrap a full-frame `Image` together with its identifying metadata for storage in `FrameStore`.
 - Serve as the unit of CURRENT/PREVIOUS state in `CameraFrameState`.
 
 **Attributes**
@@ -536,20 +539,20 @@ Rules:
 
 **Responsibilities**
 
-- Crop a rectangular region from a full-frame `BaseImage`.
+- Crop a rectangular region from a full-frame `Image`.
 - Return the cropped image and `source_bbox_full_frame` in original full-frame coordinates.
-- Extracts a derived region from the full-frame `BaseImage` without modifying it. The returned cropped `Image` is a new derived object; the source `BaseImage` is unchanged.
+- Extracts a derived region from the full-frame `Image` without modifying it. The returned cropped `Image` is a new derived object; the source `Image` is unchanged.
 
 **Methods**
 
-- `crop(base_image: BaseImage, region_bbox: BoundingBox) -> (Image, BoundingBox)`
-  - **Purpose:** Extract the region defined by `region_bbox` from `base_image`.
-  - **Parameters:** `base_image` — Full canonical base image. `region_bbox` — Region to extract in full-frame coordinates.
-  - **Return:** Tuple of cropped `Image` and `source_bbox_full_frame` (equals `region_bbox`).
-  - **Semantics:** Deterministic; same inputs always produce the same output. `region_bbox` must be expressed in full-frame coordinates. `source_bbox_full_frame` always refers to full-frame coordinates. Does not modify `base_image`; returns a new derived `Image`.
+- `crop(image: Image, region_bbox: BoundingBox) -> (np.ndarray, BoundingBox)`
+  - **Purpose:** Extract the region defined by `region_bbox` from `image`.
+  - **Parameters:** `image` — Full canonical shared image. `region_bbox` — Region to extract in full-frame coordinates.
+  - **Return:** Tuple of cropped ndarray (`image["data"][y:y+h, x:x+w].copy()`) and `source_bbox_full_frame` (equals `region_bbox`).
+  - **Semantics:** Deterministic; same inputs always produce the same output. `region_bbox` must be expressed in full-frame coordinates. `source_bbox_full_frame` always refers to full-frame coordinates. Does not modify `image`; returns a new derived ndarray.
   - **Error:** Raises `InvalidCropBboxError` if `region_bbox` has invalid dimensions. Raises `CropOutOfBoundsError` if `region_bbox` extends outside the full frame boundaries.
 
-**Memory behavior:** `CropProcessor` may return either a copied image buffer or a view/slice depending on implementation. In both cases, the stored `BaseImage` must remain immutable and must never be modified in place.
+**Memory behavior:** `CropProcessor` may return either a copied image buffer or a view/slice depending on implementation. In both cases, the stored `Image` must remain immutable and must never be modified in place.
 
 ---
 
@@ -607,16 +610,16 @@ Note: `ImageConversionContract` does not contain module names. The mapping betwe
 - Apply an `ImageConversionContract` to an image: color format, layout, dtype, and value range.
 - Apply spatial transformation based on `GeometrySpec`: resize and padding.
 - Ensure conversion is deterministic.
-- Receives a derived `Image` and returns a new derived `Image`. Never writes back to `FrameStore`. Never mutates a stored `BaseImage`.
-- All transformations are pure derived operations. They must not mutate `FramePacket`, `BaseImage`, or `FrameStore` state. They may only return new derived `Image`, `SpatialTransform`, or `ProcessedFrame` outputs.
+- Receives a derived `Image` and returns a new derived `Image`. Never writes back to `FrameStore`. Never mutates a stored `Image`.
+- All transformations are pure derived operations. They must not mutate `FramePacket`, `Image`, or `FrameStore` state. They may only return new derived `Image`, `SpatialTransform`, or `ProcessedFrame` outputs.
 
 **Methods**
 
 - `convert(image: Image, contract: ImageConversionContract, geometry_spec: GeometrySpec) -> (Image, SpatialTransform)`
   - **Purpose:** Apply pixel format conversion from `contract` and spatial transformation from `geometry_spec`, and return the result with spatial metadata.
-  - **Parameters:** `image` — Source image. `contract` — Pixel format contract specifying `color_format`, `layout`, `dtype`, and `value_range`. `geometry_spec` — Spatial transformation spec specifying `policy`, `target_width`, `target_height`, and `padding_color` (`RGBColor`).
+  - **Parameters:** `image` — Source image ndarray payload and metadata. `contract` — Pixel format contract specifying `color_format`, `layout`, `dtype`, and `value_range`. `geometry_spec` — Spatial transformation spec specifying `resize_policy`, `width`, `height`, and `padding_color` (`RGBColor`).
   - **Return:** Tuple of converted `Image` and `SpatialTransform` carrying scale factors and padding offsets.
-  - **Semantics:** Deterministic; same `image`, same `contract`, and same `geometry_spec` always produce the same output and the same `SpatialTransform`. If `geometry_spec.policy = PRESERVE`: no resize, no padding, `spatial_transform = identity`. If `geometry_spec.policy = LETTERBOX`: resize with aspect ratio preserved, pad to `target_width × target_height`, compute `SpatialTransform` accordingly.
+  - **Semantics:** Deterministic; same `image`, same `contract`, and same `geometry_spec` always produce the same output and the same `SpatialTransform`. If `geometry_spec.resize_policy = NONE`: no resize, no padding, `spatial_transform = identity`. If `geometry_spec.resize_policy = LETTERBOX`: resize with aspect ratio preserved, pad to `width × height`, compute `SpatialTransform` accordingly.
   - **Error:** Raises `ConversionError` if the conversion fails.
 
 ---
@@ -632,15 +635,15 @@ Note: `ImageConversionContract` does not contain module names. The mapping betwe
 **Methods**
 
 - `ingest_frame(frame_packet: FramePacket) -> void`
-  - **Purpose:** Validate canonical format, build `BaseImage`, and store as the new CURRENT frame for the camera in `FrameStore`.
+  - **Purpose:** Validate canonical format, build `Image`, and store as the new CURRENT frame for the camera in `FrameStore`.
   - **Parameters:** `frame_packet` — Immutable canonical raw RGB frame.
   - **Semantics:** Orchestrates: validate → build full-frame `Image` via `BaseImageBuilder` → wrap as `StoredFrame(frame_id, camera_id, timestamp_ms, image)` → call `FrameStore.put_latest`. Old CURRENT becomes PREVIOUS; new frame becomes CURRENT. Does not return a value. `put_latest` is called only after successful validation and build.
   - **Error:** Raises `ValidationError` or `InvalidFramePacketFormatError`. Does not update the store on any error.
 
 - `get_frame(camera_id: str, temporal_selector: FrameTemporalSelector, region_bbox: BoundingBox, output_type: OutputImageType, geometry_spec: GeometrySpec) -> ProcessedFrame`
   - **Purpose:** Resolve the stored frame for `camera_id` and `temporal_selector`, crop the requested region, apply the hardcoded pixel-format contract for `output_type` and the spatial transformation for `geometry_spec`, and return a `ProcessedFrame`.
-  - **Parameters:** `camera_id` — Identifies the source camera. `temporal_selector` — CURRENT or PREVIOUS. `region_bbox` — Region to extract (full-frame coordinates required). `output_type` — Defines the pixel representation of the output image. `geometry_spec` — Defines the spatial transformation (PRESERVE or LETTERBOX).
-  - **Return:** `ProcessedFrame` containing the converted image, `source_bbox_full_frame`, and `SpatialTransform`.
+  - **Parameters:** `camera_id` — Identifies the source camera. `temporal_selector` — CURRENT or PREVIOUS. `region_bbox` — Region to extract (full-frame coordinates required). `output_type` — Defines the pixel representation of the output image. `geometry_spec` — Defines the spatial transformation (NONE or LETTERBOX).
+  - **Return:** `ProcessedFrame` containing `frame_id` (copied from the source `StoredFrame.frame_id`), `timestamp_ms` (copied from the source `StoredFrame.timestamp_ms`), the converted image, `source_bbox_full_frame`, and `SpatialTransform`.
   - **Semantics:** Orchestrates: resolve `StoredFrame` via `FrameStore.get(camera_id, temporal_selector)` → extract `image` → crop → resolve pixel-format contract → `convert(contract, geometry_spec)` → return. Deterministic.
   - **Error:** Raises `ValidationError` (invalid `GeometrySpec`), `FrameNotFoundError` (no CURRENT for camera), `PreviousFrameNotAvailableError` (PREVIOUS requested before two successful ingests), `InvalidCropBboxError`, `CropOutOfBoundsError`, `UnsupportedOutputImageTypeError`, or `ConversionError`.
 
@@ -698,15 +701,15 @@ Note: No crop, resize, letterbox, normalization, or output conversion is perform
 ### Get Frame Flow — `get_frame(camera_id, temporal_selector, region_bbox, output_type, geometry_spec) -> ProcessedFrame`
 
 1. Caller passes `camera_id`, `FrameTemporalSelector`, `region_bbox`, `OutputImageType`, and `GeometrySpec` to `get_frame`.
-2. FTL validates `GeometrySpec`. If `policy = LETTERBOX` and `target_width` or `target_height` is missing or `<= 0`, raises `ValidationError`.
+2. FTL validates `GeometrySpec`. If `resize_policy = LETTERBOX` and `width` or `height` is missing or `<= 0`, raises `ValidationError`.
 3. FTL calls `FrameStore.get(camera_id, temporal_selector)` to retrieve the stored `StoredFrame`.
 4. If no CURRENT exists for the camera, raises `FrameNotFoundError`. If `temporal_selector = PREVIOUS` and no PREVIOUS exists, raises `PreviousFrameNotAvailableError`.
 5. Extract `image = stored_frame.image`.
 6. `CropProcessor` crops the requested region from the full-frame `Image` using `region_bbox`.
-7. `CropProcessor` returns a new derived cropped `Image` and `source_bbox_full_frame` (full-frame coordinates). The stored full-frame `Image` is not modified.
+7. `CropProcessor` returns a new derived cropped ndarray and `source_bbox_full_frame` (full-frame coordinates). The stored full-frame `Image` is not modified.
 8. `OutputImageContractResolver.resolve(output_type)` returns the hardcoded pixel-format `ImageConversionContract`.
-9. `FrameConverter.convert(cropped_image, contract, geometry_spec)` produces a new derived converted `Image` and `SpatialTransform`. The stored full-frame `Image` is not modified.
-10. FTL returns `ProcessedFrame` containing the converted image, `source_bbox_full_frame`, and `SpatialTransform`.
+9. `FrameConverter.convert(cropped_data, cropped_width, cropped_height, contract, geometry_spec)` produces a new derived converted `Image` and `SpatialTransform`. The stored full-frame `Image` is not modified.
+10. FTL returns `ProcessedFrame` containing `frame_id` (copied from `stored_frame.frame_id`), `timestamp_ms` (copied from `stored_frame.timestamp_ms`), the converted image, `source_bbox_full_frame`, and `SpatialTransform`.
 
 Note: All intermediate and final outputs (`cropped_image`, `converted_image`, `ProcessedFrame`) are derived in-memory objects created on demand. None are stored in `FrameStore`. The stored full-frame `Image` is not modified.
 
@@ -744,19 +747,8 @@ classDiagram
     +previous: StoredFrame | None
   }
 
-  class BaseImage {
-    <<canonical RGB input>>
-    +data: bytes
-    +color_format: RGB
-    +layout: HWC
-    +dtype: uint8
-    +value_range: [0,255]
-    +width: integer
-    +height: integer
-  }
-
   class Image {
-    +data: bytes
+    +data: np.ndarray
     +width: int32
     +height: int32
     +color_format: string
@@ -782,6 +774,8 @@ classDiagram
   }
 
   class ProcessedFrame {
+    +frame_id: string
+    +timestamp_ms: uint64
     +image: Image
     +source_bbox_full_frame: BoundingBox
     +spatial_transform: SpatialTransform
@@ -791,19 +785,18 @@ classDiagram
     <<enum>>
     GRAYSCALE_UINT8_HWC
     RGB_UINT8_HWC
-    RGB_FLOAT32_HWC_NORMALIZED_MINUS1_TO_1
   }
 
-  class GeometryPolicy {
+  class ResizePolicy {
     <<enum>>
-    PRESERVE
+    NONE
     LETTERBOX
   }
 
   class GeometrySpec {
-    +policy: GeometryPolicy
-    +target_width: int32
-    +target_height: int32
+    +resize_policy: ResizePolicy
+    +width: int32
+    +height: int32
     +padding_color: RGBColor
   }
 
@@ -825,7 +818,7 @@ classDiagram
   }
 
   class BaseImageBuilder {
-    +build(frame_packet: FramePacket) BaseImage
+    +build(frame_packet: FramePacket) Image
   }
 
   class FrameStore {
@@ -834,7 +827,7 @@ classDiagram
   }
 
   class CropProcessor {
-    +crop(base_image: BaseImage, region_bbox: BoundingBox) tuple
+    +crop(image: Image, region_bbox: BoundingBox) tuple
   }
 
   class OutputImageContractResolver {
@@ -861,8 +854,8 @@ classDiagram
   FrameTransformationLayer ..> FrameTemporalSelector : receives
   FrameTransformationLayer ..> OutputImageType : receives
   FrameTransformationLayer ..> GeometrySpec : receives
-  BaseImageBuilder --> BaseImage : produces
-  StoredFrame --> BaseImage : wraps
+  BaseImageBuilder --> Image : produces
+  StoredFrame --> Image : wraps
   CameraFrameState --> StoredFrame : holds current / previous
   FrameStore --> CameraFrameState : stores per camera
   FrameStore ..> FrameTemporalSelector : resolves by
@@ -898,7 +891,7 @@ sequenceDiagram
       BLD-->>FTL: InvalidFramePacketFormatError
       FTL-->>Caller: InvalidFramePacketFormatError
     else Build succeeds
-      BLD-->>FTL: base_image BaseImage
+      BLD-->>FTL: image Image
       FTL->>STORE: put_latest(StoredFrame)
       Note over STORE: old current becomes previous
       Note over STORE: new StoredFrame becomes current
@@ -930,8 +923,8 @@ sequenceDiagram
     FTL-->>Caller: PreviousFrameNotAvailableError
   else StoredFrame found
     STORE-->>FTL: stored_frame StoredFrame
-    Note over FTL: extract base_image = stored_frame.base_image
-    FTL->>CROP: crop(base_image, region_bbox)
+    Note over FTL: extract image = stored_frame.image
+    FTL->>CROP: crop(image, region_bbox)
     alt Invalid bbox
       CROP-->>FTL: InvalidCropBboxError or CropOutOfBoundsError
       FTL-->>Caller: InvalidCropBboxError or CropOutOfBoundsError
@@ -967,7 +960,7 @@ flowchart TD
   subgraph Ingest_Flow["Ingest Flow: store CURRENT frame, rotate PREVIOUS"]
     A["Caller sends FramePacket<br/>canonical RGB / HWC / uint8 / [0,255]"]
     B["FramePacketValidator<br/>validate required fields<br/>validate canonical format<br/>validate byte size"]
-    C["BaseImageBuilder<br/>wrap image_bytes into full-frame BaseImage<br/>no decode, no crop, no resize"]
+    C["BaseImageBuilder<br/>wrap image_bytes into full-frame Image<br/>no decode, no crop, no resize"]
     D["FrameStore.put_latest(StoredFrame)<br/>old CURRENT becomes PREVIOUS<br/>new StoredFrame becomes CURRENT"]
 
     A --> B
@@ -981,11 +974,11 @@ flowchart TD
 
   subgraph Get_Frame_Flow["Get Frame Flow: derive output on demand"]
     E["Caller calls get_frame<br/>camera_id + temporal_selector + region_bbox + output_type + geometry_spec"]
-    F["FrameStore.get(camera_id, temporal_selector)<br/>resolve CURRENT or PREVIOUS StoredFrame<br/>extract base_image"]
+    F["FrameStore.get(camera_id, temporal_selector)<br/>resolve CURRENT or PREVIOUS StoredFrame<br/>extract image"]
     G["CropProcessor<br/>crop region_bbox from full frame<br/>returns derived cropped Image<br/>and source_bbox_full_frame"]
     H["OutputImageContractResolver<br/>resolve output_type<br/>to pixel-format ImageConversionContract"]
     I["FrameConverter<br/>apply ImageConversionContract<br/>apply GeometrySpec<br/>resize / letterbox if requested<br/>compute SpatialTransform"]
-    J["ProcessedFrame<br/>derived output only<br/>image + source_bbox_full_frame + SpatialTransform"]
+    J["ProcessedFrame<br/>derived output only<br/>frame_id + image + source_bbox_full_frame + SpatialTransform"]
 
     E --> F
     F --> G
@@ -1021,8 +1014,8 @@ Controlled error classes:
 
 GeometrySpec validation rules (raise `ValidationError`):
 
-- If `policy = LETTERBOX` and `target_width` or `target_height` is missing → `ValidationError`.
-- If `target_width <= 0` or `target_height <= 0` → `ValidationError`.
+- If `resize_policy = LETTERBOX` and `width` or `height` is missing → `ValidationError`.
+- If `width <= 0` or `height <= 0` → `ValidationError`.
 
 Error policy:
 
@@ -1034,9 +1027,9 @@ Error policy:
 ### Determinism Requirements
 
 - `BaseImageBuilder` output is determined solely by the canonical `image_bytes` and fields of `FramePacket`; no hidden heuristics are allowed.
-- Same `FramePacket` input always yields the same `BaseImage` output.
+- Same `FramePacket` input always yields the same `Image` output.
 - `FrameStore` maintains deterministic CURRENT/PREVIOUS state per camera — same sequence of successful `put_latest` calls with the same `StoredFrame` inputs always yields the same state.
-- Crop is deterministic — same `region_bbox` applied to the same `BaseImage` always produces the same cropped image and the same `source_bbox_full_frame`.
+- Crop is deterministic — same `region_bbox` applied to the same `Image` always produces the same cropped image and the same `source_bbox_full_frame`.
 - Contract resolution is deterministic — same `OutputImageType` always returns the same `ImageConversionContract`.
 - Conversion is deterministic — same image input with the same `ImageConversionContract` and same `GeometrySpec` always produces the same output and the same `SpatialTransform`.
 
@@ -1057,6 +1050,7 @@ Rules:
 - `region_bbox` is always required for `get_frame`. Full-frame retrieval must be expressed as a `BoundingBox` with `x=0, y=0, width=frame_width, height=frame_height`. There is no implicit full-frame shortcut.
 - Pixel-format conversions (color, layout, dtype, value range) do not affect spatial coordinates.
 - Resize and letterbox operations change spatial scale; `source_bbox_full_frame` is always returned to allow callers to project output coordinates back to full-frame space.
-- `FrameStore` always stores full `BaseImage` instances (inside `StoredFrame`). It never stores ROIs or derived outputs. Spatial integrity of the stored data is unconditional.
+- `FrameStore` always stores full `Image` instances (inside `StoredFrame`). It never stores ROIs or derived outputs. Spatial integrity of the stored data is unconditional.
+
 
 

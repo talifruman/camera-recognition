@@ -1,8 +1,0 @@
-{
-  "persons_found": 4,
-  "images_found": 57,
-  "face_detections_succeeded": 57,
-  "face_detections_failed": 0,
-  "embeddings_written": 57,
-  "images_skipped": 0
-}

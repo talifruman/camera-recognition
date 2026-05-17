@@ -84,17 +84,18 @@ from face_detection_stub_engine import StubFaceDetectorEngine  # type: ignore[im
 # Face Recognition module
 from image_processing.face_recognition import (  # type: ignore[import-not-found]
     ArcFaceEmbeddingEngine,
+    EnrolledIdentity,
     FaceRecognitionConfig,
     FaceRecognitionInput,
     FaceRecognitionModule,
     FaceRecognitionOutput,
-    GalleryEntry,
 )
 
 # Face Gallery Loader module
 from image_processing.face_gallery_loader import (  # type: ignore[import-not-found]
     FaceGalleryLoaderConfig,
     FaceGalleryLoaderModule,
+    LoadedGalleryEmbedding,
     NpyEmbeddingFileReader,
 )
 
@@ -241,11 +242,11 @@ def draw_recognition_output(
 # Gallery loading helper
 # ---------------------------------------------------------------------------
 
-def _load_real_gallery(gallery_root: Path) -> list[GalleryEntry]:
+def _load_real_gallery(gallery_root: Path) -> list[LoadedGalleryEmbedding]:
     """
     Load real .npy embeddings from *gallery_root* using NpyEmbeddingFileReader.
 
-    Returns a list of GalleryEntry items, one per embedding file found.
+    Returns a list of LoadedGalleryEmbedding items, one per embedding file found.
     Prints a summary of loaded persons to stdout.
 
     Raises GalleryPathValidationError or GalleryLoadError on failure.
@@ -306,10 +307,16 @@ def process_images(
 
     # ---- Load real gallery at startup -----------------------------------
     print("=== Loading real face gallery ===")
-    gallery_entries = _load_real_gallery(resolved_gallery_root)
+    loader_entries: list[LoadedGalleryEmbedding] = _load_real_gallery(resolved_gallery_root)
 
-    if not gallery_entries:
+    if not loader_entries:
         print("WARNING: No gallery entries loaded — recognition will return UNKNOWN for all faces.")
+
+    # Explicit startup mapping: LoadedGalleryEmbedding[] → EnrolledIdentity[]
+    gallery_entries: list[EnrolledIdentity] = [
+        EnrolledIdentity(person_id=e["person_id"], embedding=e["embedding"])
+        for e in loader_entries
+    ]
 
     # ---- Initialize recognition module (once, before frame loop) -------
     print("\n=== Initializing Face Recognition (ArcFace) ===")
