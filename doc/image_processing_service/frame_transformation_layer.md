@@ -10,12 +10,13 @@ The following types used by the FTL are defined in [shared_contracts.md](shared_
 - `OutputImageType` — the pixel representation enum (§4)
 - `PipelineStageInputContract` — the stage initialization contract (§5)
 - `Image` — the canonical shared public image struct (§6); carries `data`, `width`, `height`, `color_format`, `layout`, `dtype`, and `value_range`; pixel format is described by `OutputImageType`
+- `FramePacket` — the canonical raw ingestion-boundary frame container (§7)
 
 ---
 
 ## Purpose
 
-The Frame Transformation Layer (FTL) is an internal frame processing layer that ingests `FramePacket` objects containing canonical raw RGB pixel data in bytes, converts them to `np.ndarray` immediately during ingest, wraps them into full-frame shared `Image` structs, maintains exactly two frames per camera (CURRENT and PREVIOUS) in `FrameStore`, and returns prepared `ProcessedFrame` outputs on demand. Cropping, resizing, letterboxing, and pixel-format conversion are derived operations performed only during `get_frame`; they never mutate or replace the stored full-frame `Image`.
+The Frame Transformation Layer (FTL) is an internal frame processing layer that ingests `FramePacket` objects containing canonical raw RGB pixel data in bytes, converts them to `np.ndarray` immediately during ingest, wraps them into full-frame shared `Image` structs, maintains exactly two frames per camera (CURRENT and PREVIOUS) in `FrameStore`, and returns prepared `ProcessedFrame` outputs on demand. Cropping, resizing, letterboxing, and pixel-format conversion are derived operations performed only during `get_frame`; they never mutate or replace the stored full-frame `Image`. The FTL retains only CURRENT and PREVIOUS per camera; deeper frame history is prohibited.
 
 The FTL receives `FramePacket` objects provided by a caller. These packets must always contain raw, unencoded canonical RGB pixel bytes in HWC layout. The FTL converts bytes → `np.ndarray` exactly once during ingest, then operates exclusively on ndarray data from that point forward.
 
@@ -27,7 +28,7 @@ The layer has exactly three responsibilities:
 
 The FTL does not know why a frame is requested. It does not know which consumer will use the returned image. It receives an `OutputImageType` and a `GeometrySpec`, and returns one `ProcessedFrame` whose `image` field is a shared `Image` struct whose metadata fields (`color_format`, `layout`, `dtype`, `value_range`) match the hardcoded `ImageConversionContract` for that `OutputImageType` and whose spatial transformation is defined by `GeometrySpec`. `OutputImageType` defines pixel representation only. `GeometrySpec` defines spatial transformation.
 
-The layer does not perform inference and does not decode or convert pixel formats.
+The layer does not perform inference and does not decode or convert source camera formats.
 
 ## Architectural Role
 
@@ -41,6 +42,7 @@ Normative role:
 - Store `StoredFrame` (containing full-frame shared `Image` with ndarray data) in `FrameStore` as CURRENT for the camera; rotate old CURRENT to PREVIOUS.
 - On `get_frame`, resolve the `StoredFrame` for the given `camera_id` and `FrameTemporalSelector`, retrieve the stored full-frame shared `Image` (which contains ndarray data), crop the requested region (ndarray slicing), resolve the hardcoded pixel-format `ImageConversionContract` from `OutputImageType`, apply spatial transformation from `GeometrySpec`, and return `ProcessedFrame`.
 - Return `source_bbox_full_frame` and `SpatialTransform` as spatial references on every `ProcessedFrame`.
+- Avoid unnecessary deep-copy behavior on hot paths; only copies required for ingest correctness and derived output materialization are allowed.
 
 Non-goals:
 
@@ -132,6 +134,7 @@ Rules:
 - All on-demand transformations operate exclusively on the stored full-frame `Image` ndarray
 - `Image.width` and `Image.height` are set from `FramePacket.width` and `FramePacket.height` explicitly — they are not inferred from `Image.data.shape`
 - Full-frame `Image` is never modified in place; all cropping, resizing, and format conversion produce temporary derived images
+- Hot-path copy behavior should remain bounded to the copies required by the contract; avoid introducing extra deep copies for intermediate bookkeeping
 
 ## OutputImageType Enum
 
@@ -223,41 +226,34 @@ Rules:
 - The FTL does not batch frames or perform temporal aggregation beyond the two-frame CURRENT/PREVIOUS state per camera.
 - `FrameStore` maintains exactly two `StoredFrame` instances per camera: CURRENT and PREVIOUS.
 - Only the two most recent successfully ingested frames are accessible; earlier frames are not retained.
+- No deeper frame history is retained in memory.
 
 ## Input Contract
 
-The layer consumes:
-
-- `FramePacket` (immutable raw pixel container) — the only input for `ingest_frame`.
+The layer consumes only shared `FramePacket` objects as defined in [shared_contracts.md §7](shared_contracts.md).
 
 `FramePacket` is immutable. The FTL derives internal state from it but does not modify it.
 
-```text
-struct FramePacket {
-    string frame_id;
-    string camera_id;
-    uint64 timestamp_ms;
-    int32  width;
-    int32  height;
-    string pixel_format;        // must be RGB
-    string layout;              // must be HWC
-    int32  num_color_channels;  // must be 3
-    int32  bits_per_channel;    // must be 8
-    bytes  image_bytes;         // tightly packed raw RGB pixels in HWC order
-}
-```
+Accepted `FramePacket` canonical input requirements:
 
-Rules:
+| Field | Required value |
+|-------|----------------|
+| `pixel_format` | `RGB` |
+| `layout` | `HWC` |
+| `dtype` | `uint8` |
+| `value_range` | `[0,255]` |
+| `num_color_channels` | `3` |
+| `bits_per_channel` | `8` |
+| `packing` | tightly packed, no stride or row padding |
+| `image_bytes` | raw unencoded RGB pixels |
 
-- `FramePacket` is immutable.
-- `image_bytes` contains raw, unencoded canonical RGB pixel data only.
-- `pixel_format` must be `RGB`.
-- `layout` must be `HWC`.
-- `num_color_channels` must be `3`.
-- `bits_per_channel` must be `8`.
-- `image_bytes` must be tightly packed — stride, row padding, and alignment padding are not supported.
-- `len(image_bytes)` must equal `width × height × 3 × 1`.
-- Missing or inconsistent required fields must produce controlled validation errors.
+Additional ingest requirements:
+
+- `FramePacket` must include all required shared fields (`frame_id`, `camera_id`, `timestamp_ms`, `width`, `height`, canonical format fields, and `image_bytes`).
+- `len(image_bytes)` must equal `width × height × 3 × 1` for canonical RGB uint8 HWC input.
+- Any non-canonical `FramePacket` is rejected with `InvalidFramePacketFormatError`.
+- The FTL does not decode or convert source camera formats.
+- During ingest, the FTL converts `FramePacket.image_bytes` into its internal image representation (`np.ndarray`) exactly once.
 
 ## Output Contract
 
@@ -383,26 +379,11 @@ The result `(fx, fy)` is the corresponding point in the original full-frame coor
 
 This section defines the minimal, language-agnostic public APIs and essential internal methods for each class in the Frame Transformation Layer.
 
-### Class: FramePacket
+### Shared FramePacket Contract Reference
 
-**Responsibilities**
+FramePacket is defined only in shared_contracts.md Section 7.
 
-- Hold immutable canonical raw RGB pixel frame data and required fields.
-- Serve as a stable identity source via `frame_id` and `camera_id`.
-- Enable validation of required field consistency.
-
-**Attributes**
-
-- `frame_id: string` — Unique frame identifier.
-- `camera_id: string` — Source identifier.
-- `timestamp_ms: uint64` — Epoch millisecond timestamp.
-- `width: int32` — Frame width in pixels.
-- `height: int32` — Frame height in pixels.
-- `pixel_format: string` — Must be `RGB`.
-- `layout: string` — Must be `HWC`.
-- `num_color_channels: int32` — Must be `3`.
-- `bits_per_channel: int32` — Must be `8`.
-- `image_bytes: bytes` — Raw, tightly packed unencoded RGB pixel data in HWC order.
+FTL consumes that shared contract and does not define a local FramePacket schema.
 
 ---
 
@@ -717,19 +698,6 @@ Note: All intermediate and final outputs (`cropped_image`, `converted_image`, `P
 
 ```mermaid
 classDiagram
-  class FramePacket {
-    +frame_id: string
-    +camera_id: string
-    +timestamp_ms: uint64
-    +width: int32
-    +height: int32
-    +pixel_format: string
-    +layout: string
-    +num_color_channels: int32
-    +bits_per_channel: int32
-    +image_bytes: bytes
-  }
-
   class FrameTemporalSelector {
     <<enum>>
     CURRENT

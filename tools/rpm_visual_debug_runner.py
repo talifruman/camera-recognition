@@ -321,9 +321,17 @@ def _build_rpm_real(
     try:
         from image_processing.object_detection import ObjectDetectionModule
         object_det = ObjectDetectionModule()
+        _od_backend = object_det.get_backend_info()
+        print(
+            f"[init]   OD backend={_od_backend.get('backend', '?')}  "
+            f"device={_od_backend.get('inference_device', '?')}  "
+            f"cuda_available={_od_backend.get('cuda_available', '?')}  "
+            f"model={_od_backend.get('model_name', '?')}"
+            + (f"  why_unknown={_od_backend['why_unknown']}" if _od_backend.get("why_unknown") else "")
+        )
     except Exception as exc:
         print(f"[FATAL] ObjectDetectionModule failed: {exc}")
-        print("  → Ensure yolo11m.pt is present at project root.")
+        print("  → Ensure models/object_detection/yolo11m.pt exists.")
         print("    Configure via PersonDetectionConfig(model_path=...) if needed.")
         raise
 
@@ -518,6 +526,25 @@ def _build_rpm_fakes() -> RecognitionPipelineManager:
 # ---------------------------------------------------------------------------
 # Per-video processor
 # ---------------------------------------------------------------------------
+def _od_backend_info(rpm: RecognitionPipelineManager) -> dict[str, str]:
+    """Extract OD backend diagnostics from the RPM's orchestrator static debug info."""
+    try:
+        orchestrator = getattr(rpm, "_orchestrator", None)
+        if orchestrator is None:
+            return {}
+        static = getattr(orchestrator, "_stage_static_debug", {})
+        return {
+            "backend": str(static.get("object_detection_device_provider", "unknown")),
+            "inference_device": str(static.get("object_detection_inference_device", "unknown")),
+            "cuda_available": str(static.get("object_detection_cuda_available", "unknown")),
+            "why_unknown": str(static.get("object_detection_why_unknown", "")),
+            "model_name": str(static.get("object_detection_model_name", "unknown")),
+            "model_path": str(static.get("object_detection_model_path", "unknown")),
+        }
+    except Exception:  # pragma: no cover
+        return {}
+
+
 def process_video(
     video_path: Path,
     rpm: RecognitionPipelineManager,
@@ -679,6 +706,7 @@ def process_video(
         "error_frame_ids": stats.error_frame_ids,
         "avg_processing_ms": round(stats.avg_processing_ms, 2),
         "max_processing_ms": round(stats.max_processing_ms, 2),
+        "object_detection_backend": _od_backend_info(rpm),
     }
     with open(reports_dir / "summary.json", "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2)

@@ -54,6 +54,7 @@ from src.image_processing.face_recognition import (  # noqa: E402
 )
 from src.image_processing.shared.contracts import (  # noqa: E402
     BoundingBox as SharedBoundingBox,
+    FramePacket as SharedFramePacket,
     GeometrySpec as SharedGeometrySpec,
     OutputImageType as SharedOutputImageType,
     ResizePolicy as SharedResizePolicy,
@@ -73,8 +74,11 @@ def _make_packet(
     *,
     pixel_format: str = "RGB",
     layout: str = "HWC",
+    dtype: str = "uint8",
+    value_range: str = "[0,255]",
     num_color_channels: int = 3,
     bits_per_channel: int = 8,
+    packing: str = "tightly_packed",
     image_bytes: bytes | None = None,
     timestamp_ms: int = 1_700_000_000_000,
 ) -> FramePacket:
@@ -89,10 +93,17 @@ def _make_packet(
         height=height,
         pixel_format=pixel_format,
         layout=layout,
+        dtype=dtype,
+        value_range=value_range,
         num_color_channels=num_color_channels,
         bits_per_channel=bits_per_channel,
+        packing=packing,
         image_bytes=image_bytes,
     )
+
+
+def test_ftl_contract_frame_packet_is_shared_type():
+    assert FramePacket is SharedFramePacket
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +141,9 @@ def test_ingest_stores_full_frame_base_image():
     [
         ({"pixel_format": "BGR"}, InvalidFramePacketFormatError),
         ({"layout": "CHW"}, InvalidFramePacketFormatError),
+        ({"dtype": "float32"}, InvalidFramePacketFormatError),
+        ({"value_range": "[0,1]"}, InvalidFramePacketFormatError),
+        ({"packing": "with_stride"}, InvalidFramePacketFormatError),
         ({"num_color_channels": 4}, InvalidFramePacketFormatError),
         ({"bits_per_channel": 16}, InvalidFramePacketFormatError),
         # byte-size mismatch (4*3*3 = 36, supply 30 bytes)
@@ -707,8 +721,11 @@ def _make_real_packet() -> tuple[int, int, "FramePacket"]:
         height=orig_h,
         pixel_format="RGB",
         layout="HWC",
+        dtype="uint8",
+        value_range="[0,255]",
         num_color_channels=3,
         bits_per_channel=8,
+        packing="tightly_packed",
         image_bytes=raw,
     )
     return orig_w, orig_h, packet

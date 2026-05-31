@@ -168,6 +168,24 @@ class ArcFaceEmbeddingEngine:
         raw_embedding = self._run_inference(blob)
         return self._l2_normalize(raw_embedding)
 
+    def get_backend_info(self) -> dict[str, str]:
+        """Return ArcFace backend diagnostics for runtime and replay reporting."""
+        model_path = self._model_dir / _MODEL_ONNX_NAME
+        providers: list[str] = []
+        try:
+            providers = list(self._session.get_providers())
+        except Exception:
+            providers = []
+        return {
+            "backend": "onnxruntime",
+            "device_provider": providers[0] if providers else "unknown",
+            "providers": ",".join(providers) if providers else "unknown",
+            "model_path": str(model_path),
+            "model_name": _MODEL_ONNX_NAME,
+            "embedding_model": _MODEL_ONNX_NAME,
+            "embedding_dimension": str(_EMBEDDING_DIM),
+        }
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------

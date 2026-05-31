@@ -25,11 +25,13 @@ from enum import Enum
 try:
     from ..shared.contracts import (
         BoundingBox as SharedBoundingBox,
+        FramePacket,
         Image as SharedImage,
     )
 except ImportError:  # pragma: no cover — fallback when imported outside package
     from src.image_processing.shared.contracts import (  # type: ignore[no-redef]
         BoundingBox as SharedBoundingBox,
+        FramePacket,
         Image as SharedImage,
     )
 
@@ -61,27 +63,6 @@ class PreviousFrameNotAvailableError(Exception):
 
 class FrameNotFoundError(Exception):
     """``get_frame`` called for a camera with no CURRENT frame stored yet."""
-
-
-# ---------------------------------------------------------------------------
-# FramePacket — canonical input to ``ingest_frame``
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class FramePacket:
-    """Immutable canonical raw RGB pixel container — input to ``ingest_frame``."""
-
-    frame_id: str
-    camera_id: str
-    timestamp_ms: int
-    width: int
-    height: int
-    pixel_format: str  # must be "RGB"
-    layout: str        # must be "HWC"
-    num_color_channels: int  # must be 3
-    bits_per_channel: int    # must be 8
-    image_bytes: bytes
 
 
 # ---------------------------------------------------------------------------

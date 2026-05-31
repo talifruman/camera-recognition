@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
-from typing import TypedDict
+from typing import NotRequired, Protocol, TypedDict
 
 import numpy as np
 
@@ -107,3 +108,52 @@ class FaceLandmarks(TypedDict):
     nose: Point
     mouth_left: Point
     mouth_right: Point
+
+
+class EnqueueRejectReason(Enum):
+    """Canonical reject reasons for FramePacketSink enqueue decisions."""
+
+    STOPPING = "STOPPING"
+    QUEUE_FULL_DROP_NEWEST = "QUEUE_FULL_DROP_NEWEST"
+    QUEUE_FULL_REJECT = "QUEUE_FULL_REJECT"
+    GLOBAL_MEMORY_LIMIT = "GLOBAL_MEMORY_LIMIT"
+    SINK_UNAVAILABLE = "SINK_UNAVAILABLE"
+    UNKNOWN_CAMERA = "UNKNOWN_CAMERA"
+    BOUNDARY_VIOLATION = "BOUNDARY_VIOLATION"
+    INTERNAL_ERROR = "INTERNAL_ERROR"
+
+
+@dataclass(frozen=True)
+class FramePacket:
+    """Canonical immutable raw frame container shared across modules.
+
+    See shared_contracts.md §7 for required field semantics.
+    """
+
+    frame_id: str
+    camera_id: str
+    timestamp_ms: int
+    width: int
+    height: int
+    pixel_format: str
+    layout: str
+    dtype: str
+    value_range: str
+    num_color_channels: int
+    bits_per_channel: int
+    packing: str
+    image_bytes: bytes
+
+
+class EnqueueResult(TypedDict):
+    """Result returned by FramePacketSink.enqueue."""
+
+    accepted: bool
+    reason: NotRequired[EnqueueRejectReason | None]
+
+
+class FramePacketSink(Protocol):
+    """Shared publication boundary for accepted FramePacket objects."""
+
+    def enqueue(self, frame_packet: FramePacket) -> EnqueueResult:
+        """Publish a FramePacket to a service-owned sink."""

@@ -6,6 +6,11 @@ from typing import Any, Protocol, TypedDict, runtime_checkable
 import cv2
 import numpy as np
 
+try:
+    from src.shared.logger import logger
+except ImportError:
+    from shared.logger import logger
+
 from image_processing.shared.contracts import (
     BoundingBox,
     GeometrySpec,
@@ -75,6 +80,9 @@ class MotionDetectionConfig:
     min_persistence_frames: int = 2
     persistence_iou_threshold: float = 0.35
     max_history_frames: int = 8
+    camera_state_ttl_ms: int = 0
+    debug_capture_enabled: bool = False
+    debug_max_images: int = 2
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +116,7 @@ class _PersistentTrack:
 class _CameraMotionState:
     tracks: list[_PersistentTrack] = field(default_factory=list)
     history: list[list[BoundingBox]] = field(default_factory=list)
+    last_seen_timestamp_ms: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +235,8 @@ class FrameDifferencingMotionDetector:
         max_transform_shift: float = 25.0,
         global_motion_changed_ratio_threshold: float = 0.30,
         fallback_on_alignment_failure: bool = True,
+        debug_capture_enabled: bool = False,
+        debug_max_images: int = 2,
     ) -> None:
         self._motion_threshold = motion_threshold
         self._min_bbox_area = min_bbox_area
@@ -242,6 +253,9 @@ class FrameDifferencingMotionDetector:
         self._max_transform_shift = max(0.0, float(max_transform_shift))
         self._global_motion_changed_ratio_threshold = max(0.0, float(global_motion_changed_ratio_threshold))
         self._fallback_on_alignment_failure = bool(fallback_on_alignment_failure)
+        self._debug_capture_enabled = bool(debug_capture_enabled)
+        self._debug_max_images = max(0, int(debug_max_images))
+        self._morphology_kernel = np.ones((3, 3), dtype=np.uint8)
 
     def measure(
         self,
@@ -260,21 +274,21 @@ class FrameDifferencingMotionDetector:
             prev_work = cv2.GaussianBlur(prev_work, (self._blur_kernel_size, self._blur_kernel_size), 0)
             curr_work = cv2.GaussianBlur(curr_work, (self._blur_kernel_size, self._blur_kernel_size), 0)
 
-        debug_images: dict[str, np.ndarray] = {
-            "raw_previous_frame": prev2d.copy(),
-            "current_frame": curr2d.copy(),
-        }
+        debug_images: dict[str, np.ndarray] = {}
+        self._capture_debug_image(debug_images, "raw_previous_frame", prev2d)
+        self._capture_debug_image(debug_images, "current_frame", curr2d)
         debug_info = self._make_debug_info()
 
         diff_before = cv2.absdiff(prev_work, curr_work)
-        debug_images["diff_before_alignment"] = diff_before.copy()
-        changed_ratio_before, _ = self._compute_changed_ratio(diff_before)
-        debug_info["changed_pixel_ratio_before_alignment"] = changed_ratio_before
+        self._capture_debug_image(debug_images, "diff_before_alignment", diff_before)
+        changed_ratio_before = 0.0
 
         aligned_previous = prev_work
         suppress_motion = False
 
         if self._enable_global_motion_compensation:
+            _, changed_ratio_before = self._threshold_and_ratio(diff_before)
+            debug_info["changed_pixel_ratio_before_alignment"] = changed_ratio_before
             alignment = self._estimate_global_alignment(prev_work, curr_work)
             debug_info["detected_feature_count"] = alignment["detected_feature_count"]
             debug_info["feature_match_count"] = alignment["feature_match_count"]
@@ -285,7 +299,7 @@ class FrameDifferencingMotionDetector:
 
             if alignment["alignment_succeeded"]:
                 aligned_previous = alignment["aligned_previous"]
-                debug_images["aligned_previous_frame"] = aligned_previous.copy()
+                self._capture_debug_image(debug_images, "aligned_previous_frame", aligned_previous)
                 if alignment["estimated_global_shift"] > self._max_transform_shift:
                     debug_info["camera_shake_detected"] = True
                     if not self._fallback_on_alignment_failure:
@@ -302,9 +316,9 @@ class FrameDifferencingMotionDetector:
 
         if suppress_motion:
             zero_mask = np.zeros((h, w), dtype=np.uint8)
-            debug_images.setdefault("aligned_previous_frame", aligned_previous.copy())
-            debug_images["diff_after_alignment"] = diff_before.copy()
-            debug_images["final_cleaned_motion_mask"] = zero_mask
+            self._capture_debug_image(debug_images, "aligned_previous_frame", aligned_previous)
+            self._capture_debug_image(debug_images, "diff_after_alignment", diff_before)
+            self._capture_debug_image(debug_images, "final_cleaned_motion_mask", zero_mask)
             debug_info["changed_pixel_ratio_after_alignment"] = 0.0
             return MotionMeasurementResult(
                 motion_fraction=0.0,
@@ -314,30 +328,35 @@ class FrameDifferencingMotionDetector:
             )
 
         diff = cv2.absdiff(aligned_previous, curr_work)
-        debug_images.setdefault("aligned_previous_frame", aligned_previous.copy())
-        debug_images["diff_after_alignment"] = diff.copy()
-        changed_ratio_after, _ = self._compute_changed_ratio(diff)
+        self._capture_debug_image(debug_images, "aligned_previous_frame", aligned_previous)
+        self._capture_debug_image(debug_images, "diff_after_alignment", diff)
+        mask, changed_ratio_after = self._threshold_and_ratio(diff)
+        if not self._enable_global_motion_compensation:
+            debug_info["changed_pixel_ratio_before_alignment"] = changed_ratio_after
         debug_info["changed_pixel_ratio_after_alignment"] = changed_ratio_after
 
-        total_pixels = h * w
-
-        # Step B — binary threshold: pixel is "changed" if abs_diff >= motion_threshold.
-        # cv2.threshold marks values strictly greater than thresh, so subtract 1.
-        _, mask = cv2.threshold(diff, self._motion_threshold - 1, 255, cv2.THRESH_BINARY)
-
         # Step C — denoise / reconnect before contour extraction.
-        kernel = np.ones((3, 3), dtype=np.uint8)
         if self._morph_open_iterations > 0:
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=self._morph_open_iterations)
+            mask = cv2.morphologyEx(
+                mask,
+                cv2.MORPH_OPEN,
+                self._morphology_kernel,
+                iterations=self._morph_open_iterations,
+            )
         if self._morph_close_iterations > 0:
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=self._morph_close_iterations)
+            mask = cv2.morphologyEx(
+                mask,
+                cv2.MORPH_CLOSE,
+                self._morphology_kernel,
+                iterations=self._morph_close_iterations,
+            )
         if self._dilation_iterations > 0:
-            mask = cv2.dilate(mask, kernel, iterations=self._dilation_iterations)
-        debug_images["final_cleaned_motion_mask"] = mask.copy()
+            mask = cv2.dilate(mask, self._morphology_kernel, iterations=self._dilation_iterations)
+        self._capture_debug_image(debug_images, "final_cleaned_motion_mask", mask)
 
         # Step F — motion fraction (computed from full mask before bbox filtering)
         changed_pixel_count = int(np.count_nonzero(mask))
-        motion_fraction = changed_pixel_count / total_pixels
+        motion_fraction = changed_pixel_count / max(1, mask.size)
 
         # Step D — extract external contours from binary mask
         contours, _ = cv2.findContours(
@@ -460,11 +479,24 @@ class FrameDifferencingMotionDetector:
             "changed_pixel_ratio_after_alignment": 0.0,
         }
 
-    def _compute_changed_ratio(self, diff: np.ndarray) -> tuple[float, np.ndarray]:
-        total_pixels = diff.shape[0] * diff.shape[1]
+    def _capture_debug_image(
+        self,
+        debug_images: dict[str, np.ndarray],
+        key: str,
+        image: np.ndarray,
+    ) -> None:
+        if not self._debug_capture_enabled:
+            return
+        if key in debug_images:
+            return
+        if len(debug_images) >= self._debug_max_images:
+            return
+        debug_images[key] = image.copy()
+
+    def _threshold_and_ratio(self, diff: np.ndarray) -> tuple[np.ndarray, float]:
         _, mask = cv2.threshold(diff, self._motion_threshold - 1, 255, cv2.THRESH_BINARY)
-        changed_pixel_count = int(np.count_nonzero(mask))
-        return changed_pixel_count / max(1, total_pixels), mask
+        ratio = float(np.count_nonzero(mask)) / float(max(1, mask.size))
+        return mask, ratio
 
     @staticmethod
     def _normalize_kernel_size(value: int) -> int:
@@ -708,6 +740,8 @@ class MotionDetectionManager:
             max_transform_shift=self._config.max_transform_shift,
             global_motion_changed_ratio_threshold=self._config.global_motion_changed_ratio_threshold,
             fallback_on_alignment_failure=self._config.fallback_on_alignment_failure,
+            debug_capture_enabled=self._config.debug_capture_enabled,
+            debug_max_images=self._config.debug_max_images,
         )
 
         self._input_validator = InputValidator()
@@ -727,8 +761,32 @@ class MotionDetectionManager:
         """
         try:
             return self._process_internal(input)
-        except Exception:
-            self._last_debug_info = {}
+        except (ValueError, TypeError) as exc:
+            camera_id = self._safe_camera_id(input)
+            logger.warning(
+                "Motion detection validation failed for camera_id=%s: %s",
+                camera_id,
+                exc,
+            )
+            self._last_debug_info = {
+                "failure_type": "validation_error",
+                "error": str(exc),
+            }
+            self._last_debug_images = {}
+            return self._output_builder.build(
+                MotionDetectionResultInternal(detected=False, bboxes=[])
+            )
+        except Exception as exc:
+            camera_id = self._safe_camera_id(input)
+            logger.exception(
+                "Motion detection runtime failure for camera_id=%s",
+                camera_id,
+            )
+            self._last_debug_info = {
+                "failure_type": "runtime_error",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
             self._last_debug_images = {}
             # Spec §11: all unhandled exceptions → detected=False
             return self._output_builder.build(
@@ -752,6 +810,17 @@ class MotionDetectionManager:
             ),
         )
 
+    def get_backend_info(self) -> dict[str, str]:
+        """Return motion detection backend diagnostics for runtime reporting."""
+        algorithm_name = type(self._algorithm).__name__
+        implementation = "stub" if "Stub" in algorithm_name else "real"
+        return {
+            "backend": "cv2_frame_differencing" if implementation == "real" else algorithm_name,
+            "device_provider": "cpu",
+            "implementation": implementation,
+            "algorithm": algorithm_name,
+        }
+
     def get_last_debug_info(self) -> dict[str, Any]:
         return dict(self._last_debug_info)
 
@@ -770,12 +839,7 @@ class MotionDetectionManager:
         self, motion_input: MotionDetectionInput
     ) -> MotionResult:
         # Step 1: validate input
-        try:
-            self._input_validator.validate(motion_input)
-        except (ValueError, TypeError):
-            return self._output_builder.build(
-                MotionDetectionResultInternal(detected=False, bboxes=[])
-            )
+        self._input_validator.validate(motion_input)
 
         # Step 2: measure motion — extract raw numpy arrays from Image struct
         # (algorithm layer works with np.ndarray internally)
@@ -801,6 +865,7 @@ class MotionDetectionManager:
 
         persisted_bboxes = self._apply_temporal_persistence(
             camera_id=current_frame["camera_id"],
+            current_timestamp_ms=int(current_frame["timestamp_ms"]),
             current_bboxes=merged_bboxes,
         )
         debug_info["motion_bboxes_after_persistence_count"] = int(len(persisted_bboxes))
@@ -813,15 +878,38 @@ class MotionDetectionManager:
         )
 
         self._last_debug_info = debug_info
-        self._last_debug_images = {
-            key: value.copy() for key, value in measurement.debug_images.items()
-        }
+        self._last_debug_images = dict(measurement.debug_images)
 
         # Step 3: apply decision policy
         result_internal = self._decision_policy.decide(measurement)
 
         # Step 4: build and return MotionResult
         return self._output_builder.build(result_internal)
+
+    @staticmethod
+    def _safe_camera_id(motion_input: Any) -> str:
+        if not isinstance(motion_input, dict):
+            return "unknown"
+        current_frame = motion_input.get("current_frame")
+        if not isinstance(current_frame, dict):
+            return "unknown"
+        camera_id = current_frame.get("camera_id")
+        if not camera_id:
+            return "unknown"
+        return str(camera_id)
+
+    def _prune_temporal_state(self, current_timestamp_ms: int) -> None:
+        ttl_ms = max(0, int(self._config.camera_state_ttl_ms))
+        if ttl_ms <= 0:
+            return
+        expiration_threshold = current_timestamp_ms - ttl_ms
+        expired_camera_ids = [
+            camera_id
+            for camera_id, state in self._motion_history_by_camera_id.items()
+            if state.last_seen_timestamp_ms < expiration_threshold
+        ]
+        for camera_id in expired_camera_ids:
+            self._motion_history_by_camera_id.pop(camera_id, None)
 
     def _merge_bboxes_for_frame(
         self,
@@ -874,12 +962,15 @@ class MotionDetectionManager:
         self,
         *,
         camera_id: str,
+        current_timestamp_ms: int,
         current_bboxes: list[BoundingBox],
     ) -> list[BoundingBox]:
         if not self._config.enable_temporal_persistence:
             return list(current_bboxes)
 
+        self._prune_temporal_state(current_timestamp_ms)
         state = self._motion_history_by_camera_id.setdefault(camera_id, _CameraMotionState())
+        state.last_seen_timestamp_ms = current_timestamp_ms
         state.history.append(list(current_bboxes))
         max_history = max(1, int(self._config.max_history_frames))
         if len(state.history) > max_history:

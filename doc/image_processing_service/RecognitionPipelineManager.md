@@ -28,6 +28,10 @@ It receives a canonical `FramePacket`, orchestrates all interaction with the Fra
 
 RecognitionPipelineManager exposes a single synchronous per-frame API. It receives a `FramePacket` and orchestrates the recognition pipeline for that frame.
 
+RecognitionPipelineManager is a managed processing component inside the Image Processing Service runtime. In deployed runtime, Image Processing Service owns lifecycle management and runtime threads for RPM execution.
+In deployed runtime, Image Processing Service is the expected invoker: it dequeues `FramePacket` objects from service-managed queues and invokes `process_frame` per frame.
+IPS owns runtime health authority for RPM execution; RecognitionPipelineManager exposes local processing symptoms only.
+
 RecognitionPipelineManager orchestrates all interaction with the Frame Transformation Layer. It controls when frames are ingested and when processed frame data is requested for each pipeline stage. The Frame Transformation Layer is responsible for internal frame storage and processing, including maintaining the per-camera temporal frame state (CURRENT and PREVIOUS slots). RecognitionPipelineManager does not access or manage the Frame Transformation Layer's internal implementation.
 
 The Frame Transformation Layer owns per-camera temporal frame state. RecognitionPipelineManager only selects `CURRENT` or `PREVIOUS` when requesting processed frames via `FrameTemporalSelector`. RecognitionPipelineManager does not store or track frame references across invocations.
@@ -38,8 +42,12 @@ RecognitionPipelineManager is NOT responsible for:
 - gRPC
 - camera connections
 - external services
+- queue ownership
+- queue pulling ownership
 - system-level threading
 - lifecycle management outside the pipeline
+
+Image Processing Service owns queue lifecycle, queue pulling, thread lifecycle, and runtime scheduling for deployed RPM execution.
 
 ### In Scope
 
@@ -49,6 +57,7 @@ RecognitionPipelineManager is NOT responsible for:
 - Executing the pipeline stages in the defined deterministic order: motion detection → object detection → face detection → face recognition
 - Applying routing gate decisions at each pipeline stage boundary
 - Applying per-frame ROI guardrails before downstream fan-out (`max_motion_rois_per_frame`, `max_person_rois_per_frame`, `max_face_rois_per_frame`)
+- Dropping excess ROIs deterministically when per-frame fan-out budgets are exceeded
 - Requesting processed full-frame and ROI data from the Frame Transformation Layer at each pipeline stage using `FrameTemporalSelector` to select CURRENT or PREVIOUS
 - Using the returned processed frames to construct the exact stage input contracts: `MotionDetectionInput`, `ObjectDetectionInput`, `FaceDetectionInput`, `FaceRecognitionInput`
 - Projecting person detection bounding boxes from ROI-local coordinates to full-frame coordinates via `SpatialCoordinator`
@@ -84,7 +93,7 @@ The RecognitionPipelineManager Module does NOT:
 
 ### 2.1 Input Responsibility Boundary
 
-The module receives a `FramePacket` directly via `process_frame`. The caller supplies a complete `FramePacket`. `RecognitionPipelineManager` does not know who the caller is — the caller may be any external runtime component, test harness, or scheduler. `RecognitionPipelineManager` does not know or care how the `FramePacket` was produced — its origin is outside this module.
+The module receives a `FramePacket` directly via `process_frame`. The caller supplies a complete `FramePacket`. In deployed runtime, Image Processing Service is the expected caller and invokes `process_frame` for dequeued frames. `RecognitionPipelineManager` remains caller-agnostic at the contract level and does not know or care how the `FramePacket` was produced — its origin is outside this module.
 
 Only pipeline orchestration and coordinate projection are performed inside this module. No frame references, pixel data, or image objects are stored across invocations — per-camera temporal frame state is owned exclusively by the Frame Transformation Layer.
 
@@ -190,6 +199,7 @@ dict get_last_frame_metrics()
 - The caller supplies a complete `FramePacket`.
 - `RecognitionPipelineManager` processes exactly one `FramePacket` per invocation.
 - `get_last_frame_metrics()` returns instrumentation counters for the most recent invocation on this manager instance.
+- In deployed runtime, Image Processing Service is the expected caller for this API.
 - `RecognitionPipelineManager` does not know who the caller is. The caller may be any external runtime component, test harness, or scheduler, but this module must not name or depend on it.
 - No batching is allowed. One `FramePacket` per invocation.
 - The API must remain stable regardless of which pipeline stage implementations are configured. No threshold, image type, geometry spec, or configuration parameter is a parameter of this method — all such values are immutable internal configuration state loaded at initialization.
@@ -207,17 +217,23 @@ dict get_last_frame_metrics()
 - **Frame Transformation Layer manages per-camera temporal state** — the Frame Transformation Layer maintains CURRENT and PREVIOUS frame slots independently per `camera_id`; after each successful `ingest_frame`, the FTL advances its internal temporal state; `RecognitionPipelineManager` only selects CURRENT or PREVIOUS via `FrameTemporalSelector` when requesting processed frames
 - **Frame Transformation Layer manages frame storage** — the Frame Transformation Layer manages frame storage internally; `RecognitionPipelineManager` delegates all frame ingestion and retrieval to it via the public interface
 - **No thread ownership** — `RecognitionPipelineManager` does not create, own, stop, sleep, wake, or schedule execution threads; the execution model is entirely external to this module
+- **No queue ownership** — `RecognitionPipelineManager` does not own queues, queue lifecycle, or enqueue/dequeue runtime management
+- **No queue pulling ownership** — queue pull loops are external runtime concerns and are not owned by `RecognitionPipelineManager`
+- **IPS-managed execution lanes** — Image Processing Service owns the runtime execution lanes between Gateway ingestion and RPM processing (ingestion execution path + queue + RPM execution path)
 - **Parallel invocations targeting different `camera_id` values are safe** — parallel `process_frame` calls targeting **different** `camera_id` values are safe when the `FrameTransformationLayerInterface` implementation is concurrency-safe, because per-camera temporal state is isolated inside the FTL by `camera_id`; `RecognitionPipelineManager` owns one `PipelineOrchestrator` instance and holds no per-camera mutable state
 - **Same-camera sequential ordering** — frames from the same `camera_id` must be processed sequentially in FIFO order; this must be enforced externally by the caller; `RecognitionPipelineManager` does not reorder frames
 - **`FrameTransformationLayerInterface` concurrency** — its implementation must be safe for concurrent `ingest_frame` and `get_frame` calls if multiple cameras are processed in parallel; `RecognitionPipelineManager` only invokes its public interface and does not own its storage
 - **Real-time capable** — suitable for per-frame online processing
 - **Deterministic** — same `FramePacket` + same configuration + same Frame Transformation Layer state produce the same `RecognitionPipelineOutput`
 - **Bounded fan-out** — ROI guardrails cap downstream OD/FD/FR fan-out per frame
+- **Bounded per-frame work** — frame processing must remain bounded and excess ROIs must be dropped deterministically
 - **Model-agnostic API** — the public output schema is independent of the underlying pipeline stage implementations
 - **Strict isolation** — no internal AI data (detection scores, embeddings, raw tensors, landmarks) escapes the public API
 - **All outputs are full-frame coordinates** — no ROI-local coordinates appear in `RecognitionPipelineOutput`
 - **Per-camera execution isolation** — per-camera temporal frame state is isolated inside the Frame Transformation Layer by `camera_id`; processing of one `camera_id` must not corrupt the temporal state of another `camera_id`
 - **RecognitionPipelineManager is only invoked by an external caller** — the external execution model is outside this module; `RecognitionPipelineManager` does not know whether the caller is a scheduler, test harness, or any other component
+- **No force-kill in v1** — a frame already in flight may complete normally; mid-frame cancellation is not part of the v1 contract
+- **Observability is realtime-safe** — metrics emission is non-blocking and logging is rate-limited on the hot path
 
 ---
 
@@ -289,6 +305,12 @@ If multiple cameras are processed concurrently, the `FrameTransformationLayerInt
 
 `RecognitionPipelineManager` depends on `MotionDetectionInterface`, `ObjectDetectionInterface`, `FaceDetectionInterface`, `FaceRecognitionInterface`, and `FrameTransformationLayerInterface` — not on their concrete implementations directly. Any compliant implementation of any interface may be substituted without changing the public API or calling code. Replacing any pipeline stage implementation or the Frame Transformation Layer implementation does NOT affect the public API.
 
+Runtime integration note:
+
+- RecognitionPipelineManager execution is managed under Image Processing Service lifecycle ownership in deployed runtime.
+- RecognitionPipelineManager owns pipeline processing logic only.
+- RecognitionPipelineManager does not own runtime threads, queue pulling loops, queue ownership, or lifecycle coordination.
+
 ---
 
 ## 7. Acceptance / Filtering Logic
@@ -300,6 +322,7 @@ Pipeline routing is gate-based and exclusively managed by `PipelineOrchestrator`
 - `ObjectDetectionInterface` returns a `PersonDetectionResult` containing zero or more person bounding boxes in ROI-local coordinates relative to the motion-region ROI image. Object Detection runs only for motion-region crops — it never receives the full frame.
 - `PipelineOrchestrator` applies the person gate: if no person bounding boxes are returned across all motion-region crops, face detection and recognition are not invoked and an empty `PipelineResult` is returned.
 - `FaceDetectionInterface` returns a `FaceDetectionOutput` per person-region crop. Face Detection runs only for projected full-frame person bboxes — it receives only the person ROI image, never the full frame. If no face is detected for a given person crop (`detections` is empty), `PipelineOrchestrator` skips face recognition for that person and continues to the next.
+- If per-frame fan-out limits are exceeded, excess motion regions, person ROIs, or face ROIs are dropped deterministically before downstream fan-out continues and `over_budget_frame_total` is incremented.
 - No detection scores, similarity scores, or internal routing flags are returned to the caller.
 - `PipelineOrchestrator` is the only component inside the module that makes routing gate decisions.
 
@@ -341,6 +364,27 @@ Its responsibilities are:
 - verify `frame_packet.timestamp_ms` is present
 
 `RecognitionPipelineInputValidator` must not ingest frames, invoke pipeline stages, or make routing decisions.
+
+### 8.3 Runtime Budget, Freshness, and Failure Containment
+
+The module records per-frame runtime pressure and cold-start visibility using canonical metrics:
+
+- `frame_processing_duration_ms`
+- `roi_dropped_total`
+- `over_budget_frame_total`
+- `cold_start_frame_total`
+- `camera_warmup_state`
+- `warmup_completed_at_ms`
+
+Rules:
+
+- cold-start frames initialize temporal state and count as dequeued runtime work
+- cold-start frames do not count as completed detection processing
+- repeated failures remain lane-local first
+- local backoff and cooldown behavior is allowed
+- lane-local DEGRADED state is allowed
+- service-wide DEGRADED is emitted only when shared runtime stability is impacted
+- no force-kill or mid-frame cancellation is supported in v1
 
 ### 8.3 PipelineOrchestrator
 
@@ -738,6 +782,8 @@ Metrics are internal and operational. Not part of the public API.
 
 ## 13. Lifecycle
 
+Image Processing Service is the runtime lifecycle owner for deployed RecognitionPipelineManager execution.
+
 ### 13.1 Initialization
 
 All dependencies are injected during initialization. No configuration parameter, pipeline stage dependency, or Frame Transformation Layer implementation is resolved after initialization begins.
@@ -761,6 +807,7 @@ External caller invokes `process_frame(frame_packet)`. `RecognitionPipelineManag
 - Release resources held by all injected pipeline stage interface implementations
 - Release resources held by the Frame Transformation Layer implementation
 - Execution thread lifecycle is entirely outside this module; `RecognitionPipelineManager` has no thread shutdown responsibilities
+- Queue pulling and queue shutdown sequencing are entirely outside this module and are owned by the runtime orchestrator
 
 ---
 
@@ -1045,6 +1092,8 @@ flowchart TD
 - [ ] Same-camera sequential ordering is enforced externally by the caller
 - [ ] Different cameras may be processed in parallel by external callers when the `FrameTransformationLayerInterface` implementation is concurrency-safe
 - [ ] `RecognitionPipelineManager` does NOT own frame ingestion, transport, or camera connections
+- [ ] `RecognitionPipelineManager` owns pipeline logic only; runtime lifecycle ownership belongs to Image Processing Service
+- [ ] `RecognitionPipelineManager` does not own queues, queue pulling loops, or queue lifecycle
 - [ ] `RecognitionPipelineManager` owns one `PipelineOrchestrator` instance — no `camera_lanes` map, no `CameraProcessingLane` objects
 - [ ] `RecognitionPipelineManager` holds no per-camera mutable state — per-camera temporal frame state is owned exclusively by the Frame Transformation Layer
 - [ ] `RecognitionPipelineManager` does not create, own, stop, sleep, wake, or schedule execution threads — thread ownership and lifecycle are entirely outside this module

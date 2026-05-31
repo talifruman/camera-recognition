@@ -82,8 +82,11 @@ def _make_packet(
         height=height,
         pixel_format="RGB",
         layout="HWC",
+        dtype="uint8",
+        value_range="[0,255]",
         num_color_channels=3,
         bits_per_channel=8,
+        packing="tightly_packed",
         image_bytes=b"\x00" * (width * height * 3),
     )
 

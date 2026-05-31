@@ -22,6 +22,52 @@ Always use **Obra Superpowers: Brainstorming** in **Planning Mode**.
 - 2026-03-25: `PayloadDecoder` introduced as an explicit component for deterministic payload decode before transformation.
 - 2026-03-25: No backward compatibility mode retained for `BaseImage` in documentation contracts.
 
+## Runtime Ownership Model (Approved)
+
+- Image Processing Service is the only top-level runtime lifecycle owner.
+- Only Image Processing Service creates, owns, starts, stops, and supervises runtime threads.
+- Frame Ingestion Gateway owns ingestion logic only; it does not own runtime lifecycle or runtime threads.
+- RecognitionPipelineManager owns pipeline processing logic only; it does not own queues, queue pulling, runtime threads, or lifecycle management.
+- Image Processing Service is the sole owner of service-wide DEGRADED/ERROR escalation; Gateway and RPM expose local symptoms only.
+- Queues between ingestion and RPM processing are internal Image Processing Service runtime structures.
+- Per-camera lanes are Image Processing Service-owned execution lanes: ingestion execution path + queue + RPM processing execution path.
+- Shutdown is initiated and coordinated only by Image Processing Service in this order: atomically transition into STOPPING and close enqueue acceptance, stop ingestion execution, drain or drop queues by policy, then stop RPM processing workers.
+- `drain=false` drops queued frames immediately.
+- `drain=true` drains fresh queued frames until timeout while stale policy remains active.
+- frame_ingestion_gateway.md is the sole canonical Gateway specification source.
+- Duplicate Gateway spec artifact was intentionally removed to prevent documentation drift.
+
+### Runtime Ownership Diagram
+
+```mermaid
+%%{init: {'theme': 'neutral'}}%%
+flowchart TB
+	IPS[Image Processing Service\nTop-level runtime lifecycle owner]
+	GW[Frame Ingestion Gateway\nIngestion logic only]
+	RPM[RecognitionPipelineManager\nPipeline logic only]
+
+	subgraph LANE1[Camera Lane 1 - Service Owned]
+		I1[Ingestion execution path]
+		Q1[Queue]
+		P1[RPM processing execution path]
+		I1 --> Q1 --> P1
+	end
+
+	subgraph LANE2[Camera Lane 2 - Service Owned]
+		I2[Ingestion execution path]
+		Q2[Queue]
+		P2[RPM processing execution path]
+		I2 --> Q2 --> P2
+	end
+
+	IPS --> LANE1
+	IPS --> LANE2
+	GW -. logic only .-> I1
+	GW -. logic only .-> I2
+	RPM -. logic only .-> P1
+	RPM -. logic only .-> P2
+```
+
 ---
 
 ## Service Startup Sequence — Gallery-to-Recognition Wiring
@@ -181,6 +227,7 @@ Core design rules:
 
 ## Service Diagram (Smart Camera Monitoring System)
 ```mermaid
+%%{init: {'theme': 'neutral'}}%%
 flowchart TB
 	subgraph CameraService[Camera Service]
 		CA1[UsbCameraAdapter]
@@ -251,6 +298,7 @@ Note: In MVP, Frame Buffer is continuously fed by Camera Service to preserve rel
 
 ### Frame Capture & Real-Time Detection Flow
 ```mermaid
+%%{init: {'theme': 'neutral'}}%%
 sequenceDiagram
 	autonumber
 	participant CameraService as Camera Service<br/>(RTSP Ingest)
@@ -279,6 +327,7 @@ sequenceDiagram
 
 ### Event-Triggered Media Clip Flow
 ```mermaid
+%%{init: {'theme': 'neutral'}}%%
 sequenceDiagram
 	autonumber
 	participant EventService as Event Service<br/>(Redis Stream)
@@ -305,6 +354,7 @@ sequenceDiagram
 
 ### Multi-Camera Frame Distribution
 ```mermaid
+%%{init: {'theme': 'neutral'}}%%
 sequenceDiagram
 	autonumber
 	participant CameraService as Camera Service<br/>(Multi-Camera)

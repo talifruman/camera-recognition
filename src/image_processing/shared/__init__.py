@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from .contracts import (
     BoundingBox,
+    EnqueueRejectReason,
+    EnqueueResult,
     FaceLandmarks,
+    FramePacket,
+    FramePacketSink,
     GeometrySpec,
     Image,
     OutputImageType,
@@ -13,7 +17,11 @@ from .contracts import (
 
 __all__ = [
     "BoundingBox",
+    "EnqueueRejectReason",
+    "EnqueueResult",
     "FaceLandmarks",
+    "FramePacket",
+    "FramePacketSink",
     "GeometrySpec",
     "Image",
     "OutputImageType",

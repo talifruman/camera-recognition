@@ -556,6 +556,23 @@ class FaceRecognitionModule:
             ),
         )
 
+    def get_backend_info(self) -> dict[str, str]:
+        """Return embedding backend diagnostics for runtime trace reporting."""
+        engine_getter = getattr(self._embedding_engine, "get_backend_info", None)
+        engine_info = engine_getter() if callable(engine_getter) else {}
+        if not isinstance(engine_info, dict):
+            engine_info = {}
+        return {
+            "backend": str(engine_info.get("backend", "unknown")),
+            "device_provider": str(engine_info.get("device_provider", "unknown")),
+            "providers": str(engine_info.get("providers", "unknown")),
+            "model_path": str(engine_info.get("model_path", "unknown")),
+            "model_name": str(engine_info.get("model_name", "unknown")),
+            "embedding_model": str(engine_info.get("embedding_model", "unknown")),
+            "embedding_dimension": str(engine_info.get("embedding_dimension", "unknown")),
+            "recognition_threshold": str(self._config.recognition_threshold),
+        }
+
     # ---- internal pipeline (spec §8.9) -----------------------------------
 
     def _recognize_internal(

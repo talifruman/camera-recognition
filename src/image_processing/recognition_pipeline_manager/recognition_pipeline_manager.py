@@ -12,9 +12,10 @@ by the FTL implementation.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
-from image_processing.frame_transformation_layer.contracts import FramePacket
+from image_processing.shared.contracts import FramePacket
 
 from .input_validator import RecognitionPipelineInputValidator
 from .interfaces import (
@@ -77,9 +78,14 @@ class RecognitionPipelineManager:
             max_face_rois_per_frame=max_face_rois_per_frame,
         )
         self._builder = RecognitionPipelineOutputBuilder()
+        self._last_output_build_ms: float = 0.0
 
     def get_last_frame_metrics(self) -> dict[str, Any]:
         return self._orchestrator.get_last_frame_metrics()
+
+    def get_last_output_build_ms(self) -> float:
+        """Return the wall-clock ms spent in the output builder for the last frame."""
+        return self._last_output_build_ms
 
     def process_frame(self, frame_packet: FramePacket) -> RecognitionPipelineOutput:
         """Process one FramePacket through the recognition pipeline.
@@ -108,9 +114,12 @@ class RecognitionPipelineManager:
 
         pipeline_result = self._orchestrator.execute(frame_packet)
 
-        return self._builder.build(
+        _t0 = time.perf_counter()
+        output = self._builder.build(
             frame_id=frame_packet.frame_id,
             camera_id=frame_packet.camera_id,
             timestamp_ms=frame_packet.timestamp_ms,
             pipeline_result=pipeline_result,
         )
+        self._last_output_build_ms = (time.perf_counter() - _t0) * 1000.0
+        return output

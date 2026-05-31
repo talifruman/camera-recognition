@@ -38,6 +38,7 @@ Reference SCRFD inference: InsightFace detection/scrfd/tools/scrfd.py
 from __future__ import annotations
 
 import io
+import importlib.metadata
 import logging
 import urllib.request
 import zipfile
@@ -342,6 +343,55 @@ class SCRFDFaceDetector:
             _log.error("SCRFD inference failed: %s", exc, exc_info=True)
             return []
 
+    def get_backend_info(self) -> dict[str, str]:
+        """Return SCRFD backend diagnostics for runtime and replay reporting."""
+        model_path = self._model_dir / _MODEL_ONNX_NAME
+        selected_providers: list[str] = []
+        available_providers: list[str] = []
+        input_tensor_type = "unknown"
+        try:
+            selected_providers = list(self._session._session.get_providers())
+        except Exception:
+            selected_providers = []
+        try:
+            import onnxruntime as ort
+
+            available_providers = list(ort.get_available_providers())
+        except Exception:
+            available_providers = []
+        try:
+            input_tensor_type = str(self._session._session.get_inputs()[0].type)
+        except Exception:
+            input_tensor_type = "unknown"
+
+        selected_provider = selected_providers[0] if selected_providers else "unknown"
+        fallback_provider = selected_providers[1] if len(selected_providers) > 1 else "none"
+        cuda_available = "CUDAExecutionProvider" in available_providers
+        gpu_not_used_reason = ""
+        if cuda_available:
+            gpu_not_used_reason = (
+                "CPUExecutionProvider is explicitly requested by SCRFDFaceDetector "
+                "session configuration"
+            )
+        else:
+            gpu_not_used_reason = "CUDAExecutionProvider is not available in this onnxruntime build"
+        return {
+            "backend": "onnxruntime",
+            "device_provider": selected_provider,
+            "providers": ",".join(selected_providers) if selected_providers else "unknown",
+            "available_providers": ",".join(available_providers) if available_providers else "unknown",
+            "selected_provider": selected_provider,
+            "fallback_provider": fallback_provider,
+            "cuda_execution_provider_available": str(cuda_available),
+            "cpu_forced": "True",
+            "gpu_not_used_reason": gpu_not_used_reason,
+            "onnxruntime_package_variant": _detect_onnxruntime_package_variant(),
+            "model_path": str(model_path),
+            "model_name": _MODEL_ONNX_NAME,
+            "input_size": f"{int(self._input_size[0])}x{int(self._input_size[1])}",
+            "batch_mode": "single_frame",
+            "inference_precision": input_tensor_type,
+        }
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
@@ -474,3 +524,22 @@ class SCRFDFaceDetector:
             )
 
         return detections
+
+
+def _detect_onnxruntime_package_variant() -> str:
+    """Return installed ONNX Runtime package variant for diagnostics."""
+    candidates = [
+        "onnxruntime-gpu",
+        "onnxruntime-directml",
+        "onnxruntime-openvino",
+        "onnxruntime",
+    ]
+    for name in candidates:
+        try:
+            version = importlib.metadata.version(name)
+            return f"{name}=={version}"
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        except Exception:
+            continue
+    return "unknown"

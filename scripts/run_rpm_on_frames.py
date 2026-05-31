@@ -103,6 +103,12 @@ class LoggingMotionDetection:
     def get_input_contract(self) -> PipelineStageInputContract:
         return self._delegate.get_input_contract()
 
+    def get_backend_info(self) -> dict[str, Any]:
+        """Return backend diagnostics from the wrapped motion module."""
+        getter = getattr(self._delegate, "get_backend_info", None)
+        info = getter() if callable(getter) else {}
+        return info if isinstance(info, dict) else {}
+
     def flush_calls(self) -> list[dict[str, Any]]:
         items = list(self._last_calls)
         self._last_calls.clear()
@@ -126,6 +132,12 @@ class LoggingObjectDetection:
 
     def get_input_contract(self) -> PipelineStageInputContract:
         return self._delegate.get_input_contract()
+
+    def get_backend_info(self) -> dict[str, Any]:
+        """Return backend diagnostics from the wrapped object detector."""
+        getter = getattr(self._delegate, "get_backend_info", None)
+        info = getter() if callable(getter) else {}
+        return info if isinstance(info, dict) else {}
 
     def flush_calls(self) -> list[dict[str, Any]]:
         items = list(self._last_calls)
@@ -151,6 +163,12 @@ class LoggingFaceDetection:
     def get_input_contract(self) -> PipelineStageInputContract:
         return self._delegate.get_input_contract()
 
+    def get_backend_info(self) -> dict[str, Any]:
+        """Return backend diagnostics from the wrapped face detector."""
+        getter = getattr(self._delegate, "get_backend_info", None)
+        info = getter() if callable(getter) else {}
+        return info if isinstance(info, dict) else {}
+
     def flush_calls(self) -> list[dict[str, Any]]:
         items = list(self._last_calls)
         self._last_calls.clear()
@@ -174,6 +192,12 @@ class LoggingFaceRecognition:
 
     def get_input_contract(self) -> PipelineStageInputContract:
         return self._delegate.get_input_contract()
+
+    def get_backend_info(self) -> dict[str, Any]:
+        """Return backend diagnostics from the wrapped face recognizer."""
+        getter = getattr(self._delegate, "get_backend_info", None)
+        info = getter() if callable(getter) else {}
+        return info if isinstance(info, dict) else {}
 
     def flush_calls(self) -> list[dict[str, Any]]:
         items = list(self._last_calls)

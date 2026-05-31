@@ -1,0 +1,15 @@
+recognition_pipeline:
+  person_directory_json_path: "C:/Users/talif/Desktop/Camera-regogintion/data/person_directory.json"
+  max_motion_rois_per_frame: 2
+  max_person_rois_per_frame: 16
+  max_face_rois_per_frame: 32
+
+face_gallery:
+  gallery_root_path: "data/generated_face_gallery"
+
+models:
+  motion_detection_config: "config/image_processing_service/models/motion_detection.yaml"
+  object_detection_config: "config/image_processing_service/models/object_detection.yaml"
+  face_detection_config: "config/image_processing_service/models/face_detection.yaml"
+  face_recognition_config: "config/image_processing_service/models/face_recognition.yaml"
+  person_directory_config: "config/image_processing_service/models/person_directory.yaml"

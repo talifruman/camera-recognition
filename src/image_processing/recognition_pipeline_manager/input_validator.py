@@ -5,7 +5,7 @@ Spec: RecognitionPipelineManager §8.2
 
 from __future__ import annotations
 
-from image_processing.frame_transformation_layer.contracts import FramePacket
+from image_processing.shared.contracts import FramePacket
 
 
 class RecognitionPipelineInputValidator:

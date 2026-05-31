@@ -211,6 +211,17 @@ class FaceDetectionPostprocessor:
 
 _LANDMARK_KEYS = ("left_eye", "right_eye", "nose", "mouth_left", "mouth_right")
 
+# Landmark configuration constants
+EXPECTED_LANDMARK_COUNT = 5
+DEFAULT_LANDMARK_COORDINATE = 0
+
+# Landmark indices (matches SCRFD keypoint order)
+LANDMARK_LEFT_EYE_INDEX = 0
+LANDMARK_RIGHT_EYE_INDEX = 1
+LANDMARK_NOSE_INDEX = 2
+LANDMARK_MOUTH_LEFT_INDEX = 3
+LANDMARK_MOUTH_RIGHT_INDEX = 4
+
 
 class FaceDetectionOutputBuilder:
     def build(
@@ -238,17 +249,34 @@ class FaceDetectionOutputBuilder:
 
     @staticmethod
     def _build_landmarks(raw_landmarks: list[Point]) -> FaceLandmarks:
-        if len(raw_landmarks) < 5:
-            zero: Point = {"x": 0, "y": 0}
-            padded = list(raw_landmarks) + [zero] * (5 - len(raw_landmarks))
+        """Build canonical 5-point landmarks structure from raw detection.
+        
+        Pads with zero landmarks if fewer than expected landmarks are provided.
+        
+        Args:
+            raw_landmarks: List of detected landmark points
+        
+        Returns:
+            FaceLandmarks: Canonical 5-point landmark structure
+        """
+        if len(raw_landmarks) < EXPECTED_LANDMARK_COUNT:
+            # Pad with zero landmarks
+            zero: Point = {
+                "x": DEFAULT_LANDMARK_COORDINATE,
+                "y": DEFAULT_LANDMARK_COORDINATE,
+            }
+            padded = list(raw_landmarks) + [zero] * (
+                EXPECTED_LANDMARK_COUNT - len(raw_landmarks)
+            )
         else:
-            padded = raw_landmarks[:5]
+            padded = raw_landmarks[:EXPECTED_LANDMARK_COUNT]
+        
         return FaceLandmarks(
-            left_eye=padded[0],
-            right_eye=padded[1],
-            nose=padded[2],
-            mouth_left=padded[3],
-            mouth_right=padded[4],
+            left_eye=padded[LANDMARK_LEFT_EYE_INDEX],
+            right_eye=padded[LANDMARK_RIGHT_EYE_INDEX],
+            nose=padded[LANDMARK_NOSE_INDEX],
+            mouth_left=padded[LANDMARK_MOUTH_LEFT_INDEX],
+            mouth_right=padded[LANDMARK_MOUTH_RIGHT_INDEX],
         )
 
 
@@ -296,6 +324,41 @@ class FaceDetectionModule:
             output_image_type=OutputImageType.RGB_UINT8_HWC,
             geometry_spec=self._config.geometry_spec,
         )
+
+    def get_backend_info(self) -> dict[str, str]:
+        """Return detector backend diagnostics for runtime trace reporting."""
+        detector_getter = getattr(self._detector_engine, "get_backend_info", None)
+        detector_info = detector_getter() if callable(detector_getter) else {}
+        if not isinstance(detector_info, dict):
+            detector_info = {}
+        geometry_spec = self._config.geometry_spec
+        width = getattr(geometry_spec, "width", 0)
+        height = getattr(geometry_spec, "height", 0)
+        input_size = str(detector_info.get("input_size", "unknown"))
+        if width > 0 and height > 0:
+            input_size = f"{int(width)}x{int(height)}"
+        return {
+            "backend": str(detector_info.get("backend", "unknown")),
+            "device_provider": str(detector_info.get("device_provider", "unknown")),
+            "providers": str(detector_info.get("providers", "unknown")),
+            "available_providers": str(detector_info.get("available_providers", "unknown")),
+            "selected_provider": str(detector_info.get("selected_provider", "unknown")),
+            "fallback_provider": str(detector_info.get("fallback_provider", "none")),
+            "cuda_execution_provider_available": str(
+                detector_info.get("cuda_execution_provider_available", "unknown")
+            ),
+            "cpu_forced": str(detector_info.get("cpu_forced", "unknown")),
+            "gpu_not_used_reason": str(detector_info.get("gpu_not_used_reason", "")),
+            "onnxruntime_package_variant": str(
+                detector_info.get("onnxruntime_package_variant", "unknown")
+            ),
+            "model_path": str(detector_info.get("model_path", "unknown")),
+            "model_name": str(detector_info.get("model_name", "unknown")),
+            "input_size": input_size,
+            "batch_mode": str(detector_info.get("batch_mode", "unknown")),
+            "inference_precision": str(detector_info.get("inference_precision", "unknown")),
+            "confidence_threshold": str(self._config.confidence_threshold),
+        }
 
     def detect_faces(self, face_input: FaceDetectionInput) -> FaceDetectionOutput:
         try:

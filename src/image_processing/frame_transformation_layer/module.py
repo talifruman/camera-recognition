@@ -23,6 +23,7 @@ import numpy as np
 try:
     from ..shared.contracts import (
         BoundingBox as SharedBoundingBox,
+        FramePacket,
         GeometrySpec as SharedGeometrySpec,
         Image as SharedImage,
         OutputImageType,
@@ -30,7 +31,6 @@ try:
     )
     from .contracts import (
         FrameNotFoundError,
-        FramePacket,
         FrameTemporalSelector,
         PreviousFrameNotAvailableError,
         ProcessedFrame,
@@ -39,6 +39,7 @@ try:
 except ImportError:  # pragma: no cover - fallback when imported outside package
     from src.image_processing.shared.contracts import (  # type: ignore[no-redef]
         BoundingBox as SharedBoundingBox,
+        FramePacket,
         GeometrySpec as SharedGeometrySpec,
         Image as SharedImage,
         OutputImageType,
@@ -46,7 +47,6 @@ except ImportError:  # pragma: no cover - fallback when imported outside package
     )
     from src.image_processing.frame_transformation_layer.contracts import (  # type: ignore[no-redef]
         FrameNotFoundError,
-        FramePacket,
         FrameTemporalSelector,
         PreviousFrameNotAvailableError,
         ProcessedFrame,
@@ -217,6 +217,14 @@ class FramePacketValidator:
             raise InvalidFramePacketFormatError(
                 f"layout must be 'HWC' (got {frame_packet.layout!r})"
             )
+        if frame_packet.dtype != "uint8":
+            raise InvalidFramePacketFormatError(
+                f"dtype must be 'uint8' (got {frame_packet.dtype!r})"
+            )
+        if frame_packet.value_range != "[0,255]":
+            raise InvalidFramePacketFormatError(
+                f"value_range must be '[0,255]' (got {frame_packet.value_range!r})"
+            )
         if frame_packet.num_color_channels != 3:
             raise InvalidFramePacketFormatError(
                 f"num_color_channels must be 3 (got {frame_packet.num_color_channels})"
@@ -224,6 +232,11 @@ class FramePacketValidator:
         if frame_packet.bits_per_channel != 8:
             raise InvalidFramePacketFormatError(
                 f"bits_per_channel must be 8 (got {frame_packet.bits_per_channel})"
+            )
+        if frame_packet.packing != "tightly_packed":
+            raise InvalidFramePacketFormatError(
+                "packing must be 'tightly_packed' (no stride/row padding allowed) "
+                f"(got {frame_packet.packing!r})"
             )
 
         expected = frame_packet.width * frame_packet.height * 3
@@ -254,10 +267,16 @@ class BaseImageBuilder:
             raise InvalidFramePacketFormatError("pixel_format must be 'RGB'")
         if frame_packet.layout != "HWC":
             raise InvalidFramePacketFormatError("layout must be 'HWC'")
+        if frame_packet.dtype != "uint8":
+            raise InvalidFramePacketFormatError("dtype must be 'uint8'")
+        if frame_packet.value_range != "[0,255]":
+            raise InvalidFramePacketFormatError("value_range must be '[0,255]'")
         if frame_packet.num_color_channels != 3:
             raise InvalidFramePacketFormatError("num_color_channels must be 3")
         if frame_packet.bits_per_channel != 8:
             raise InvalidFramePacketFormatError("bits_per_channel must be 8")
+        if frame_packet.packing != "tightly_packed":
+            raise InvalidFramePacketFormatError("packing must be 'tightly_packed'")
         if frame_packet.width <= 0 or frame_packet.height <= 0:
             raise InvalidFramePacketFormatError("width/height must be > 0")
         if len(frame_packet.image_bytes) != frame_packet.width * frame_packet.height * 3:

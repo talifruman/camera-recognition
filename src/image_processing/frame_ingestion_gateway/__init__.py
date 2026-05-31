@@ -1,53 +1,58 @@
+"""Frame Ingestion Gateway public package exports."""
+
 from __future__ import annotations
 
-from .module import (
-    CameraSlotExhaustedError,
-    FrameDecodeError,
-    FrameIngestionGateway,
-    FrameIngestionGatewayConfig,
-    FrameIngestionInputValidator,
-    FrameIngressTransport,
-    FrameNormalizationError,
+from image_processing.shared.contracts import (
+    EnqueueRejectReason,
+    EnqueueResult,
     FramePacket,
-    FramePacketBuilder,
-    FramePayloadNormalizer,
-    FrameStore,
-    FrameStoreError,
-    FrameValidator,
-    GatewayHealth,
+    FramePacketSink,
+)
+
+from .config import FrameIngestionGatewayConfig
+from .contracts import IngressFrameMessage, NormalizedFrameBuffer
+from .errors import (
+    DependencyUnavailableError,
+    FrameDecodeError,
+    FrameNormalizationError,
     GatewayLifecycleError,
-    GrpcFrameIngressTransport,
-    IngressFrameMessage,
-    NormalizedFrameBuffer,
     PayloadSizeMismatchError,
-    StoreHealth,
-    StubFrameIngressTransport,
+    SinkBackpressureError,
+    SinkEnqueueRejectedError,
+    SinkUnavailableError,
     StructuralValidationError,
     UnsupportedSourceFormatError,
 )
+from .gateway import FrameIngestionGateway
+from .packet_builder import FramePacketBuilder
+from .transport import FrameIngressTransport, InMemoryFrameIngressTransport
+from .validators import FrameIngestionInputValidator, FrameValidator
+
+StubFrameIngressTransport = InMemoryFrameIngressTransport
 
 __all__ = [
-    "CameraSlotExhaustedError",
+    "DependencyUnavailableError",
+    "EnqueueRejectReason",
+    "EnqueueResult",
     "FrameDecodeError",
     "FrameIngestionGateway",
     "FrameIngestionGatewayConfig",
     "FrameIngestionInputValidator",
     "FrameIngressTransport",
-    "FrameNormalizationError",
     "FramePacket",
+    "FramePacketSink",
+    "FrameNormalizationError",
     "FramePacketBuilder",
-    "FramePayloadNormalizer",
-    "FrameStore",
-    "FrameStoreError",
+    "StubFrameIngressTransport",
     "FrameValidator",
-    "GatewayHealth",
     "GatewayLifecycleError",
-    "GrpcFrameIngressTransport",
+    "InMemoryFrameIngressTransport",
     "IngressFrameMessage",
     "NormalizedFrameBuffer",
     "PayloadSizeMismatchError",
-    "StoreHealth",
-    "StubFrameIngressTransport",
+    "SinkBackpressureError",
+    "SinkEnqueueRejectedError",
+    "SinkUnavailableError",
     "StructuralValidationError",
     "UnsupportedSourceFormatError",
 ]

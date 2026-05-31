@@ -42,7 +42,7 @@ class PersonDetectionResult(TypedDict):
 
 @dataclass(slots=True)
 class PersonDetectionConfig:
-    model_path: str = "yolo11m.pt"
+    model_path: str = "models/object_detection/yolo11m.pt"
     person_confidence_threshold: float = 0.35
     nms_iou_threshold: float = 0.35
     inference_backend: str = "ultralytics"
@@ -170,6 +170,55 @@ class UltralyticsInferenceEngine:
             )
         except Exception as exc:
             raise RuntimeError(f"Object detection inference failed: {exc}") from exc
+
+    def get_backend_info(self, config: PersonDetectionConfig) -> dict[str, str]:
+        """Return backend diagnostics for the configured Ultralytics model."""
+        model_path = str(config.model_path)
+        model_name = Path(model_path).name if model_path else "unknown"
+
+        # Detect CUDA availability without guessing.
+        cuda_available = "unknown"
+        try:
+            import torch  # type: ignore[import-untyped]
+            cuda_available = str(torch.cuda.is_available())
+        except ImportError:
+            cuda_available = "torch_not_installed"
+        except Exception as exc:  # pragma: no cover
+            cuda_available = f"error:{exc}"
+
+        inference_device = "unknown"
+        why_unknown = ""
+        if self._model is not None:
+            # Primary: model.device (standard Ultralytics attribute)
+            model_device = getattr(self._model, "device", None)
+            if model_device is not None:
+                inference_device = str(model_device)
+            else:
+                # Fallback: model.model.device (underlying PyTorch nn.Module)
+                inner_model = getattr(self._model, "model", None)
+                if inner_model is not None:
+                    inner_device = getattr(inner_model, "device", None)
+                    if inner_device is not None:
+                        inference_device = str(inner_device)
+            if inference_device == "unknown":
+                why_unknown = (
+                    "model.device and model.model.device both returned None "
+                    "— Ultralytics version may not expose .device before first inference"
+                )
+        else:
+            why_unknown = "model not yet loaded (inference has not been called yet)"
+
+        return {
+            "backend": str(config.inference_backend),
+            "device_provider": inference_device,
+            "inference_device": inference_device,
+            "cuda_available": cuda_available,
+            "why_unknown": why_unknown,
+            "model_path": model_path,
+            "model_name": model_name or "unknown",
+            "confidence_threshold": str(config.person_confidence_threshold),
+            "nms_threshold": str(config.nms_iou_threshold),
+        }
 
 
 class Postprocessor:
@@ -327,6 +376,38 @@ class ObjectDetectionModule:
                 "height": 640,
                 "resize_policy": ResizePolicy.LETTERBOX,
             },
+        }
+
+    def get_backend_info(self) -> dict[str, str]:
+        """Return backend diagnostics for object detection without guessing."""
+        engine_getter = getattr(self._inference_engine, "get_backend_info", None)
+        info = engine_getter(self._config) if callable(engine_getter) else {}
+        if not isinstance(info, dict):
+            info = {}
+        backend = str(info.get("backend", self._config.inference_backend))
+        device_provider = str(info.get("device_provider", "unknown"))
+        combined_provider = backend if device_provider == "unknown" else f"{backend}:{device_provider}"
+        geometry_spec = self.get_input_contract().get("geometry_spec", {})
+        width = geometry_spec.get("width")
+        height = geometry_spec.get("height")
+        input_size = "unknown"
+        if width and height:
+            input_size = f"{int(width)}x{int(height)}"
+        return {
+            "backend": backend,
+            "device_provider": combined_provider,
+            "inference_device": str(info.get("inference_device", "unknown")),
+            "cuda_available": str(info.get("cuda_available", "unknown")),
+            "why_unknown": str(info.get("why_unknown", "")),
+            "model_path": str(info.get("model_path", self._config.model_path)),
+            "model_name": str(
+                info.get("model_name", Path(str(self._config.model_path)).name or "unknown")
+            ),
+            "input_size": input_size,
+            "confidence_threshold": str(
+                info.get("confidence_threshold", self._config.person_confidence_threshold)
+            ),
+            "nms_threshold": str(info.get("nms_threshold", self._config.nms_iou_threshold)),
         }
 
     def process(self, model_ready_input: Any, metadata: FrameMetadata) -> PersonDetectionResult:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import cv2
 import numpy as np
@@ -174,11 +175,15 @@ def _make_input(
 def _make_manager(
     motion_fraction_threshold: float = 0.05,
     algorithm: MotionDetectionAlgorithm | None = None,
+    debug_capture_enabled: bool = False,
+    debug_max_images: int = 2,
 ) -> MotionDetectionManager:
     config = MotionDetectionConfig(
         motion_threshold=25,
         motion_fraction_threshold=motion_fraction_threshold,
         min_bbox_area=100,
+        debug_capture_enabled=debug_capture_enabled,
+        debug_max_images=debug_max_images,
     )
     return MotionDetectionManager(config=config, algorithm=algorithm)
 
@@ -534,6 +539,80 @@ class ManagerBehaviorTests(unittest.TestCase):
         self.assertFalse(result["detected"])
         self.assertEqual(result["bboxes"], [])
 
+    def test_non_mapping_input_falls_back_without_secondary_exception(self) -> None:
+        manager = _make_manager()
+        result = manager.detect(None)  # type: ignore[arg-type]
+        self.assertFalse(result["detected"])
+        self.assertEqual(result["bboxes"], [])
+        debug_info = manager.get_last_debug_info()
+        self.assertEqual(debug_info.get("failure_type"), "runtime_error")
+
+    def test_runtime_failure_populates_debug_info_and_clears_debug_images(self) -> None:
+        manager = _make_manager(debug_capture_enabled=True, debug_max_images=4)
+        manager.detect(_make_input())
+        self.assertGreater(len(manager.get_last_debug_images()), 0)
+
+        class ExplodingAlgorithm:
+            def measure(self, previous_image: np.ndarray, current_image: np.ndarray) -> MotionMeasurementResult:
+                raise RuntimeError("simulated runtime failure")
+
+        manager._algorithm = ExplodingAlgorithm()  # type: ignore[assignment]
+        result = manager.detect(_make_input())
+
+        self.assertFalse(result["detected"])
+        self.assertEqual(result["bboxes"], [])
+        self.assertEqual(manager.get_last_debug_images(), {})
+
+        debug_info = manager.get_last_debug_info()
+        self.assertEqual(debug_info.get("failure_type"), "runtime_error")
+        self.assertEqual(debug_info.get("error_type"), "RuntimeError")
+        self.assertIn("simulated runtime failure", debug_info.get("error", ""))
+
+    def test_validation_failure_populates_debug_info_and_clears_debug_images(self) -> None:
+        manager = _make_manager(debug_capture_enabled=True, debug_max_images=4)
+        manager.detect(_make_input())
+        self.assertGreater(len(manager.get_last_debug_images()), 0)
+
+        invalid_input = _make_input()
+        invalid_input["current_frame"]["camera_id"] = ""
+
+        result = manager.detect(invalid_input)
+
+        self.assertFalse(result["detected"])
+        self.assertEqual(result["bboxes"], [])
+        self.assertEqual(manager.get_last_debug_images(), {})
+
+        debug_info = manager.get_last_debug_info()
+        self.assertEqual(debug_info.get("failure_type"), "validation_error")
+        self.assertIn("camera_id", debug_info.get("error", ""))
+
+    def test_debug_images_disabled_by_default(self) -> None:
+        manager = _make_manager()
+        manager.detect(_make_input())
+        self.assertEqual(manager.get_last_debug_images(), {})
+
+    def test_debug_images_bounded_when_enabled(self) -> None:
+        manager = _make_manager(debug_capture_enabled=True, debug_max_images=2)
+        manager.detect(_make_input())
+        debug_images = manager.get_last_debug_images()
+        self.assertGreater(len(debug_images), 0)
+        self.assertLessEqual(len(debug_images), 2)
+
+    def test_manager_does_not_recopy_algorithm_debug_images(self) -> None:
+        debug_image = np.zeros((8, 8), dtype=np.uint8)
+
+        class StaticDebugAlgorithm:
+            def measure(self, previous_image: np.ndarray, current_image: np.ndarray) -> MotionMeasurementResult:
+                return MotionMeasurementResult(
+                    motion_fraction=0.2,
+                    bboxes=[BoundingBox(x=1, y=1, width=4, height=4)],
+                    debug_images={"k": debug_image},
+                )
+
+        manager = _make_manager(algorithm=StaticDebugAlgorithm())  # type: ignore[arg-type]
+        manager.detect(_make_input())
+        self.assertIs(manager._last_debug_images["k"], debug_image)
+
     def test_detected_is_bool(self) -> None:
         manager = _make_manager()
         result = manager.detect(_make_input())
@@ -809,6 +888,39 @@ class RealAlgorithmTests(unittest.TestCase):
         result = algo.measure(prev_img, curr_img)
         self.assertAlmostEqual(result.motion_fraction, 0.01, places=5)
 
+    def test_threshold_mask_is_reused_without_duplicate_thresholding(self) -> None:
+        prev_img = np.zeros((64, 64), dtype=np.uint8)
+        curr_img = np.zeros((64, 64), dtype=np.uint8)
+        curr_img[20:40, 20:40] = 255
+
+        detector = FrameDifferencingMotionDetector(
+            motion_threshold=25,
+            min_bbox_area=100,
+            enable_global_motion_compensation=False,
+        )
+
+        with mock.patch.object(cv2, "threshold", wraps=cv2.threshold) as threshold_mock:
+            detector.measure(prev_img, curr_img)
+
+        self.assertEqual(threshold_mock.call_count, 1)
+
+    def test_morphology_kernel_created_once_and_reused(self) -> None:
+        prev_img = np.zeros((64, 64), dtype=np.uint8)
+        curr_img = np.zeros((64, 64), dtype=np.uint8)
+        curr_img[20:40, 20:40] = 255
+
+        detector = FrameDifferencingMotionDetector(
+            motion_threshold=25,
+            min_bbox_area=100,
+            morph_open_iterations=1,
+        )
+
+        self.assertTrue(hasattr(detector, "_morphology_kernel"))
+        kernel_id = id(detector._morphology_kernel)
+        detector.measure(prev_img, curr_img)
+        detector.measure(prev_img, curr_img)
+        self.assertEqual(id(detector._morphology_kernel), kernel_id)
+
     # --- (H, W, 1) 3-D input -----------------------------------------------
 
     def test_single_channel_3d_input_handled(self) -> None:
@@ -1014,6 +1126,7 @@ class BboxMergingAndTemporalPersistenceTests(unittest.TestCase):
         min_persistence_frames: int = 2,
         persistence_iou_threshold: float = 0.3,
         max_history_frames: int = 4,
+        camera_state_ttl_ms: int = 0,
     ) -> MotionDetectionManager:
         cfg = MotionDetectionConfig(
             motion_threshold=25,
@@ -1026,6 +1139,7 @@ class BboxMergingAndTemporalPersistenceTests(unittest.TestCase):
             min_persistence_frames=min_persistence_frames,
             persistence_iou_threshold=persistence_iou_threshold,
             max_history_frames=max_history_frames,
+            camera_state_ttl_ms=camera_state_ttl_ms,
         )
         algo = _StaticMeasurementAlgorithm(bboxes=bboxes)
         return MotionDetectionManager(config=cfg, algorithm=algo)
@@ -1124,6 +1238,20 @@ class BboxMergingAndTemporalPersistenceTests(unittest.TestCase):
         self.assertFalse(cam_a_first["detected"])
         self.assertFalse(cam_b_first["detected"])
         self.assertTrue(cam_a_second["detected"])
+
+    def test_inactive_camera_state_is_pruned_by_ttl(self) -> None:
+        manager = self._manager_for_test(
+            bboxes=[BoundingBox(x=10, y=10, width=12, height=12)],
+            enable_temporal_persistence=True,
+            min_persistence_frames=2,
+            camera_state_ttl_ms=500,
+        )
+        manager.detect(_make_input(camera_id="cam-old", current_ts=1000, previous_ts=900))
+        self.assertIn("cam-old", manager._motion_history_by_camera_id)
+
+        manager.detect(_make_input(camera_id="cam-new", current_ts=2000, previous_ts=1900))
+        self.assertNotIn("cam-old", manager._motion_history_by_camera_id)
+        self.assertIn("cam-new", manager._motion_history_by_camera_id)
 
     def test_disappearing_motion_is_removed_from_history(self) -> None:
         persistent_manager = self._manager_for_test(

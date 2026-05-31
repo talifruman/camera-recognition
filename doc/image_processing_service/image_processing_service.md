@@ -4,183 +4,320 @@
 
 ### Purpose
 
-The Image Processing Service is responsible for owning the runtime machinery that connects frame ingestion to recognition. It owns all worker threads, all per-camera queues, all worker lifecycle, and all service state transitions. It configures and wires the `FrameIngestionGateway`, one `GatewayFramePacketSource` per camera, a `FramePacketSourceRegistry`, the `RecognitionPipelineManager`, one `RecognitionWorker` per camera, and the `ResultHandler`. It starts, coordinates, and stops all owned components in the defined order.
+The Image Processing Service is the only top-level runtime lifecycle owner. It owns runtime queueing and worker scheduling between ingress publication and downstream frame processing. It owns bounded per-camera FramePacket queues, queue overflow behavior, ingestion execution workers, RPM processing execution workers, and end-to-end dispatch. It provides a FramePacketSink implementation to the Frame Ingestion Gateway and treats the Gateway as a producer boundary. It also owns the authoritative STOPPING gate and service-level health escalation.
 
-The Image Processing Service does not implement detection, recognition, or image preprocessing. All pipeline execution is delegated to `RecognitionPipelineManager`.
+Only Image Processing Service creates, owns, starts, stops, and supervises runtime threads.
 
 ### In Scope
 
-- Loading and validating service configuration at startup
-- Configuring the `FrameIngestionGateway`
-- Creating one `GatewayFramePacketSource` per configured `camera_id`
-- Creating and owning the `FramePacketSourceRegistry`
-- Initializing `RecognitionPipelineManager` with pipeline stage engines
-- Creating and owning one `RecognitionWorker` per configured `camera_id`
-- Creating and owning the `ResultHandler`
-- Starting and stopping the `FrameIngestionGateway`
-- Starting and stopping all `RecognitionWorker` threads
-- Managing service state transitions: `CREATED → RUNNING → STOPPING → STOPPED`
-- Enforcing the per-camera `GatewayFramePacketSource` queue overflow policy
-- Exposing service health via `health()`
-- Reporting service-level metrics
+- Loading and validating service configuration
+- Creating bounded per-camera FramePacket queues
+- Creating and owning ServiceFramePacketSink
+- Routing incoming FramePacket objects to per-camera queues
+- Owning queue capacity and overflow policy
+- Owning ingestion execution worker scheduling and lifecycle
+- Owning processing worker scheduling and lifecycle
+- Owning frame consumption loops
+- Starting and stopping the Gateway as part of service lifecycle
+- Exposing service health and service metrics
+- Exposing lane-level and service-level health mappings
 
 ### Out of Scope
 
-The Image Processing Service does NOT:
+The service does not:
 
-- Implement motion detection, object detection, face detection, or face recognition — handled outside this module
-- Perform image preprocessing (color conversion, resize, normalization, dtype conversion) — handled outside this module
-- Execute the recognition pipeline — handled outside this module
-- Access raw pixel data or `BaseImage` contents — handled outside this module
-- Manage the `FrameIngestionGateway` ingestion thread — the Gateway owns and manages its own ingestion thread
-- Maintain frame identity state across calls — handled outside this module
-- Implement transport connections or camera protocols — handled outside this module
-- Manage identity enrollment or gallery updates — handled outside this module
-- Access the filesystem after initialization
+- Redefine shared FramePacket
+- Re-implement Gateway validation, decode, or normalization internals
+- Perform frame ingestion transport handling
+- Expose raw pixel data in service API
 
 ---
 
-## 2. Input
+## 2. Shared Contracts and Input Boundary
 
-### 2.1 Input Responsibility Boundary
+### 2.1 Shared FramePacket Contract
 
-The service does not receive frames through a public method. Frames are produced by the `FrameIngestionGateway` on its own ingestion thread. Each produced `FramePacket` is pushed into the `GatewayFramePacketSource` registered for that `camera_id`. The service does not call the Gateway to fetch frames — the Gateway pushes, and `RecognitionWorker` threads pull directly via the `FramePacketSource` interface.
+FramePacket is defined once in shared_contracts.md Section 7 and is the authoritative ingestion-boundary raw frame container.
 
-The following have already been applied before a `FramePacket` enters the service's internal queues:
+This service does not define or override FramePacket.
 
-- Frame capture at the originating camera source
-- Transport framing and delivery
-- Field validation by `FrameIngestionGateway`
-- Normalization to canonical RGB, HWC, uint8, [0,255] by `FrameIngestionGateway`
-- `FramePacket` construction by `FrameIngestionGateway`
+### 2.2 Sink Boundary
 
-The Image Processing Service does not perform any of the above. Only queue management, worker dispatch, and lifecycle coordination are performed inside this module.
-
-### 2.2 Input Structure
-
-The service receives `FramePacket` objects into its internal queues. `FramePacket` is defined by the `FrameIngestionGateway`:
+The service provides a sink implementation to the Gateway:
 
 ```text
-struct Image {
-    uint32 width;
-    uint32 height;
-    string color_format;   // always "RGB"
-    string layout;         // always "HWC"
-    string dtype;          // always "uint8"
-    bytes  pixels;
-}
-
-struct FramePacket {
-    string frame_id;
-    string camera_id;
-    uint64 timestamp_ms;
-    int32  width;
-    int32  height;
-    string pixel_format;   // always "RGB"
-    Image  image;
-}
+class ServiceFramePacketSink implements FramePacketSink
 ```
 
-`FramePacket` is opaque to the Image Processing Service. The service does not access, inspect, or modify pixel data. It routes `FramePacket` objects by `camera_id` into the corresponding `GatewayFramePacketSource` queue.
+Gateway publishes accepted frames via FramePacketSink.enqueue(frame_packet). The service consumes that callback and routes packets into service-owned queues.
 
-### 2.3 Input Contract
-
-A `FramePacket` pushed into a `GatewayFramePacketSource` must satisfy:
-
-- `frame_id` must be present and non-empty
-- `camera_id` must be present, non-empty, and correspond to a configured camera
-- `timestamp_ms` must be present
-- `image` must be present and non-null
-- `image.pixels` must be non-empty
-- `pixel_format` must be `"RGB"` (canonical normalized form from the Gateway)
-
-The Image Processing Service does not re-validate `FramePacket` fields. Field validation is the responsibility of the `FrameIngestionGateway`. The service enforces only that `camera_id` corresponds to a registered `GatewayFramePacketSource` before pushing.
-
-### 2.4 Validation Rules
-
-`ServiceConfigValidator` validates the service configuration at startup:
-
-- `camera_ids` must be non-empty
-- All entries in `camera_ids` must be non-empty strings
-- All entries in `camera_ids` must be unique
-- `max_queue_depth_per_camera` must be a positive integer (`> 0`)
-- `overflow_policy` must be a valid `OverflowPolicy` enum value
-- `drain_queues_on_shutdown` must be present (bool)
-
-`GatewayFramePacketSource` validates push operations at runtime:
-
-- `frame_packet.camera_id` must match the source's configured `camera_id`
-- If `camera_id` does not match, the frame is discarded and `PushResult.REJECTED` is returned
-
-### 2.5 Input Semantics
-
-- `frame_id` — unique identifier for the frame; not interpreted by the service; passed through unchanged to `RecognitionPipelineManager`
-- `camera_id` — identifies the source camera; used to route the frame to the correct `GatewayFramePacketSource` queue
-- `timestamp_ms` — capture timestamp; not interpreted by the service; passed through unchanged to `RecognitionPipelineManager`
-- `image` — the normalized frame image; not accessed by the service; passed through unchanged to `RecognitionPipelineManager`
-
----
-
-## 3. Output
-
-### 3.1 Output Structure
-
-The service does not return output to callers on a per-frame basis. Per-frame recognition results are handled by the `ResultHandler`. The service exposes only health state and lifecycle control via its public API.
+### 2.3 ServiceFramePacketSink Behavior
 
 ```text
-enum ServiceState {
-    CREATED,
-    RUNNING,
+enqueue(frame_packet: FramePacket) -> EnqueueResult
+```
+
+Behavior:
+
+- Validate frame_packet.camera_id is in configured camera_ids
+- Route packet to the matching bounded queue
+- Reject enqueue when service state is STOPPING or STOPPED using canonical STOPPING rejection
+- If queue has capacity, enqueue and return accepted=true
+- If queue is full, apply overflow_policy
+- Return EnqueueResult
+
+Unknown camera behavior:
+
+- Unknown camera_id at this boundary is treated as a canonical UNKNOWN_CAMERA / BOUNDARY_VIOLATION rejection
+- Frame Ingestion Gateway should reject unknown cameras before sink publication when possible; if one reaches this boundary, the service records the defensive rejection using the same canonical code family
+- defensive_unknown_camera_rejected_total is incremented
+- No dynamic queue creation in v1
+
+### 2.4 Shutdown, Drain, and Freshness Semantics
+
+STOPPING is the authoritative atomic enqueue gate.
+
+Rules:
+
+- Image Processing Service transitions atomically into STOPPING
+- enqueue_accepting=false is set immediately at the STOPPING transition
+- all new enqueue operations reject with canonical STOPPING
+- in-flight enqueue behavior is deterministic; a call either completes before STOPPING takes effect or returns STOPPING without partial queue or accounting mutation
+- no partial queue mutation or byte-accounting mutation is allowed during STOPPING
+
+`stop(drain: bool)` semantics:
+
+- `stop(drain=false)` drops all queued frames immediately
+- `stop(drain=true)` keeps processing remaining fresh queued frames until `max_drain_timeout_ms` expires
+- stale policy remains active during drain
+- stale queued frames are dropped and counted during drain
+- in-flight processing may complete normally during drain
+- when drain timeout expires, remaining queued frames are dropped and counted as `shutdown_dropped_frames_total`
+- `worker_shutdown_timeout_ms` bounds worker teardown after queue handling completes
+
+Freshness checkpoints:
+
+1. dequeue-time validation
+2. post-dequeue pre-processing validation
+3. shutdown-drain validation
+
+Freshness rules:
+
+- stale frames are dropped and counted at every freshness checkpoint
+- `stale_preprocessing_drop_total` counts frames that become stale after dequeue but before downstream processing begins
+- `stale_shutdown_drop_total` counts frames dropped during shutdown drain because they are stale at drain time
+- `stale_completed_processing_total` counts frames that complete normally after becoming stale while already in flight
+- cold-start frames initialize temporal state, count as dequeued runtime work, and do not count as completed detection processing
+
+### 2.5 Canonical Rejection Taxonomy
+
+All gateway and IPS enqueue/health/logging paths use the same canonical rejection taxonomy.
+
+```text
+enum EnqueueRejectReason {
     STOPPING,
-    STOPPED
-}
-
-enum WorkerState {
-    IDLE,
-    RUNNING,
-    STOPPED,
-    FAILED
-}
-
-struct PerCameraHealth {
-    string      camera_id;
-    WorkerState worker_state;
-    int32       queue_depth;
-    uint64      last_frame_timestamp_ms;
-}
-
-struct ImageProcessingServiceHealth {
-    ServiceState            service_state;
-    bool                    gateway_healthy;
-    vector<PerCameraHealth> cameras;
+    QUEUE_FULL_DROP_NEWEST,
+    QUEUE_FULL_REJECT,
+    GLOBAL_MEMORY_LIMIT,
+    SINK_UNAVAILABLE,
+    UNKNOWN_CAMERA,
+    BOUNDARY_VIOLATION,
+    INTERNAL_ERROR
 }
 ```
 
-Per-frame recognition output is defined by `RecognitionPipelineManager` and consumed exclusively by `ResultHandler`. It is not part of the Image Processing Service public API.
+Rules:
 
-### 3.2 Output Semantics
-
-- `service_state` — current lifecycle state of the service
-- `gateway_healthy` — `true` when the `FrameIngestionGateway` reports healthy status
-- `cameras` — one `PerCameraHealth` entry per configured `camera_id`
-- `PerCameraHealth.camera_id` — the camera identifier this entry covers
-- `PerCameraHealth.worker_state` — current state of the `RecognitionWorker` for this camera
-- `PerCameraHealth.queue_depth` — number of frames currently enqueued in the `GatewayFramePacketSource` for this camera
-- `PerCameraHealth.last_frame_timestamp_ms` — `timestamp_ms` of the most recently pushed `FramePacket` for this camera; `0` if no frame has been pushed yet
-
-### 3.3 Output Constraints
-
-The output must NOT expose:
-
-- Detection confidence scores, similarity scores, or face embeddings
-- Raw pixel data or any intermediate image representation
-- Internal queue implementation details
-- Pipeline routing decisions or skip flags
-- `RecognitionPipelineManager` internal state
+- `STOPPING` is the canonical rejection for shutdown gating
+- `QUEUE_FULL_DROP_NEWEST` and `QUEUE_FULL_REJECT` distinguish the configured queue overflow response
+- `GLOBAL_MEMORY_LIMIT` is used when global queue-memory pressure prevents acceptance even though the local camera queue is within its own limit
+- `SINK_UNAVAILABLE` is used when the downstream sink boundary cannot accept work
+- `UNKNOWN_CAMERA` is used when a frame arrives for an unconfigured camera_id
+- `BOUNDARY_VIOLATION` is used when an input violates an ownership or contract boundary other than unknown camera
+- `INTERNAL_ERROR` is used for unexpected runtime failures that are not boundary, capacity, or shutdown conditions
+- metrics, logs, and health summaries must use these canonical codes consistently
 
 ---
 
-## 4. Public API
+## 3. Queue Ownership and Policy
+
+### 3.1 Per-Camera Queue Model
+
+- Exactly one queue per configured camera_id
+- Queues are bounded
+- Queues are thread-safe
+- FIFO order is preserved per camera
+- Queue ownership belongs to Image Processing Service
+- Queues are internal runtime structures of Image Processing Service
+- Queues are not externally exposed
+- Queues are not directly owned, exposed, or manipulated by Frame Ingestion Gateway
+- Queues are not directly owned, exposed, or manipulated by RecognitionPipelineManager
+- Queues store FramePacket objects as immutable shared references
+- Queue enqueue and dequeue operations must not mutate FramePacket.image_bytes
+- Each camera queue must enforce an independent per-camera memory limit
+- Queue memory is officially bounded
+- Queue accounting includes queued FramePacket bytes only; it does not include derived processing buffers
+- FTL and RPM working memory are deployment-bounded outside queue accounting
+- Queue retention is bounded to CURRENT/PREVIOUS temporal needs only; deep frame history retention is prohibited
+
+Immutable-reference semantics:
+
+- FramePacket.image_bytes ownership is immutable after construction.
+- Workers must never mutate FramePacket contents.
+- Processing stages requiring derived buffers must allocate derived representations instead of mutating FramePacket.
+- Immutable FramePacket behavior applies across queue boundaries and worker boundaries.
+
+### 3.2 Realtime Queue Configuration
+
+```text
+struct QueuePolicyConfig {
+    int32 max_queue_size_per_camera;
+    int64 max_queue_bytes_per_camera;
+    int64 reserved_queue_bytes_per_camera;
+    int64 max_total_queued_bytes;
+    int32 max_frame_age_ms;
+    OverflowPolicy overflow_policy; // default DROP_OLDEST
+}
+
+struct ShutdownPolicyConfig {
+    int64 max_drain_timeout_ms;
+    int64 worker_shutdown_timeout_ms;
+}
+
+struct ProcessingBudgetConfig {
+    int32 max_motion_regions_per_frame;
+    int32 max_person_rois_per_frame;
+    int32 max_face_rois_per_frame;
+}
+
+enum OverflowPolicy {
+    DROP_OLDEST,
+    DROP_NEWEST,
+    REJECT
+}
+```
+
+### 3.3 Overflow Behavior
+
+DROP_OLDEST:
+
+- Remove oldest frame from that camera queue first
+- Enqueue incoming newest frame second
+- The remove-then-enqueue operation must occur atomically inside a single synchronized queue mutation
+- Queue byte accounting updates for remove-then-enqueue must be atomic and consistent with queue mutation state
+- If queue mutation or accounting fails, rollback must restore both queue state and byte counters before returning rejection
+- Increment frames_dropped_oldest_total
+
+DROP_NEWEST:
+
+- Reject incoming frame
+- Existing queue contents remain unchanged
+- Increment frames_dropped_newest_total
+
+REJECT:
+
+- Reject incoming frame
+- Reject enqueue without modifying queue state
+- Return EnqueueResult accepted=false
+
+Deterministic ordering rule:
+
+- Overflow handling must preserve per-camera FIFO semantics for retained frames.
+
+### 3.4 Queue Limit Precedence and Fairness
+
+Deterministic limit precedence on enqueue:
+
+1. Evaluate per-camera queue limits first.
+2. Preserve each camera's reserved queue bytes during global pressure.
+3. Evaluate global queued-byte limits second.
+
+Global fairness rule:
+
+- Global queued-byte limits must not allow one camera to starve other cameras.
+- `reserved_queue_bytes_per_camera` protects each lane from cross-camera starvation.
+- Shared downstream components must avoid coarse global locks that serialize cameras.
+
+Per-frame fairness rules:
+
+- excess ROI fan-out must be dropped deterministically when per-frame caps are reached
+- realtime freshness takes precedence over exhaustive completeness
+
+### 3.5 Realtime Freshness Priority
+
+- Realtime freshness takes precedence over frame completeness in realtime mode.
+- The service prioritizes recent frames over exhaustive retention.
+- Overflow policies, stale-frame dropping, bounded queues, and queue freshness limits are designed around realtime freshness guarantees.
+- Realtime mode intentionally permits frame dropping under pressure.
+- freshness checks apply at dequeue, post-dequeue pre-processing, and shutdown drain
+
+---
+
+## 4. Worker Model and Scheduling
+
+The service owns frame-consuming worker threads and dispatch policy.
+Only Image Processing Service creates, owns, starts, stops, and supervises runtime threads.
+
+Recommended v1 model:
+
+- One IPS-managed ingestion execution worker per configured camera_id
+- One IPS-managed RPM processing execution worker per configured camera_id
+- Each RPM processing worker consumes from its matching per-camera queue
+- Per-camera execution lanes preserve FIFO and avoid one camera blocking another
+
+Worker constraints:
+
+- Workers must not mutate FramePacket
+- Scheduling policy must preserve fairness across cameras at service level
+- Workers requiring transformed image memory must allocate derived buffers and leave FramePacket unchanged
+- Short queue synchronization, atomic counters, and bounded internal synchronization are allowed
+- Coarse global locks, cross-camera serialization, and long shared blocking hot-path operations are prohibited
+- One camera lane must not block unrelated lanes
+
+### 4.2 Per-Frame Budgeting
+
+- Per-frame processing must remain bounded
+- ROI fan-out is capped by `max_motion_regions_per_frame`, `max_person_rois_per_frame`, and `max_face_rois_per_frame`
+- Excess ROIs are dropped deterministically before downstream fan-out continues
+- Realtime freshness is prioritized over exhaustive completeness
+- `frame_processing_duration_ms`, `roi_dropped_total`, and `over_budget_frame_total` capture per-frame budget pressure
+- No force-kill or mid-frame cancellation is supported in v1
+
+### 4.3 Freshness Validation During Execution
+
+- Dequeue-time validation rejects stale frames before downstream work begins
+- Post-dequeue pre-processing validation rejects frames that become stale after dequeue but before processing starts
+- Shutdown-drain validation rejects frames that are stale when drain begins or when they age out during drain
+- Stale frames are dropped and counted, but in-flight processing may complete normally
+- `stale_preprocessing_drop_total`, `stale_shutdown_drop_total`, and `stale_completed_processing_total` are the canonical freshness counters
+
+### 4.4 Per-Camera Lane Model
+
+Each configured camera has one Image Processing Service-owned runtime lane containing:
+
+- ingestion execution path
+- queue
+- RPM processing execution path
+
+Frame Ingestion Gateway contributes ingestion logic in the lane but does not own runtime lifecycle. RecognitionPipelineManager contributes processing logic in the lane but does not own queue or runtime lifecycle.
+
+Reference lane structure:
+
+```text
+Image Processing Service
+ ├── Camera A Lane
+ │    ├── Ingestion Execution
+ │    ├── Queue
+ │    └── RPM Execution
+ └── Camera B Lane
+    ├── Ingestion Execution
+    ├── Queue
+    └── RPM Execution
+```
+
+---
+
+## 5. Public API
 
 ```text
 void                         configure(config: ImageProcessingServiceConfig)
@@ -189,539 +326,428 @@ void                         stop(drain: bool)
 ImageProcessingServiceHealth health()
 ```
 
-- `configure(config)` must be called before `start()`. Configuration is validated and stored. It must not be called after `start()`.
-- `start()` executes the full startup sequence and transitions service state to `RUNNING`. Calling `start()` more than once is an error.
-- `stop(drain)` initiates the shutdown sequence. `drain = true` is reserved for future use. In MVP, `drain_queues_on_shutdown` is always `false` — queues are discarded. Calling `stop()` before `start()` is a no-op.
-- `health()` returns the current `ImageProcessingServiceHealth` snapshot. It is safe to call at any service state.
-
-The API must remain stable regardless of which `RecognitionPipelineManager` implementation or `ResultHandler` implementation is configured.
+- configure() loads config and prepares queues/sink.
+- start() starts Gateway behavior and service-managed ingestion/RPM execution workers.
+- stop(drain) enforces shutdown policy.
 
 ---
 
-## 5. Non-Functional Requirements
+## 6. Internal Components
 
-- **Owns worker threads** — the service creates, starts, and stops one `RecognitionWorker` thread per camera; thread ownership is not shared with any downstream component
-- **Per-camera concurrency** — different cameras run concurrently on independent worker threads
-- **Per-camera sequential ordering** — frames from the same `camera_id` are processed in FIFO order; exactly one `RecognitionWorker` per camera enforces this invariant
-- **No pipeline implementation** — the service does not implement recognition, detection, or preprocessing; all pipeline execution is delegated to `RecognitionPipelineManager`
-- **No direct pixel access** — the service never accesses `image.pixels` or any pixel representation
-- **Queue-bounded** — each per-camera queue is bounded by `max_queue_depth_per_camera`; overflow is handled by the configured `overflow_policy`
-- **DROP_OLDEST in MVP** — when the queue is full, the oldest frame is removed before inserting the newest; no frames are silently lost without updating metrics
-- **Real-time capable** — the service is designed for continuous, live per-frame processing; it must not accumulate unbounded memory
-- **Service state is authoritative** — all components check `service_state` before acting; no component runs outside the `RUNNING` state
-- **ResultHandler failure must not crash the service** — errors in `ResultHandler.handle()` are caught per worker; the worker loop continues
-- **Model-agnostic service boundary** — the service is independent of which pipeline stage implementations are loaded into `RecognitionPipelineManager`
+### 6.1 ImageProcessingService
+
+Lifecycle owner and orchestrator for queues, sink, ingestion execution workers, RPM processing execution workers, and processing engine integration.
+
+### 6.2 ServiceConfigValidator
+
+Validates ImageProcessingServiceConfig and queue policy constraints.
+
+### 6.3 ServiceFramePacketSink
+
+Service-owned sink implementation of FramePacketSink that routes FramePacket to per-camera queues.
+
+### 6.4 PerCameraFrameQueue
+
+Bounded thread-safe FIFO queue for one configured camera_id.
+
+### 6.5 FrameQueueRegistry
+
+Read-mostly mapping camera_id -> PerCameraFrameQueue.
+
+### 6.6 ProcessingWorker
+
+Consumes from a single per-camera queue and dispatches frames to configured processing engine.
+
+### 6.7 Runtime Ownership Contract
+
+- Image Processing Service is the only top-level runtime lifecycle owner.
+- Only Image Processing Service creates, owns, starts, stops, and supervises runtime threads.
+- Frame Ingestion Gateway owns ingestion logic only.
+- RecognitionPipelineManager owns recognition pipeline logic only.
+- Frame Ingestion Gateway and RecognitionPipelineManager do not own runtime lifecycle or runtime threads.
+- RecognitionPipelineManager does not own queues, queue pulling, or queue lifecycle management.
+- RecognitionPipelineManager executes under Image Processing Service-managed lifecycle ownership.
+
+### 6.8 Runtime Health and Observability Contract
+
+IPS owns runtime DEGRADED and ERROR transitions.
+
+Rules:
+
+- Gateway and RPM expose local symptoms only
+- IPS maps local symptoms into lane-level health and service-level health
+- `lane_health_by_camera_id`, `degraded_reason_code`, and `degraded_reason_message` are the canonical health detail fields
+- `health()` must return service-level health with lane-level detail when available
+- repeated failures remain lane-local first
+- local backoff and cooldown behavior is allowed
+- lane-local DEGRADED state is allowed
+- service-wide DEGRADED is emitted only when shared runtime stability is impacted
+- metrics emission must be non-blocking
+- logging must be rate-limited
+- blocking metrics flushes, synchronous hot-path remote logging, and global logging serialization are prohibited
+- `cold_start_frame_total`, `camera_warmup_state`, and `warmup_completed_at_ms` provide cold-start observability
+- cold-start frames initialize temporal state, count as dequeued runtime work, and do not count as completed detection processing
+
+### 6.9 ResultHandler
+
+Handles processing outputs and updates processing-facing metrics.
 
 ---
 
-## 6. Processing Engine
+## 7. Lifecycle
 
-### 6.1 Engine Abstraction Interfaces
+### 7.0 Lifecycle States
 
-`RecognitionPipelineManager` is the processing engine of the Image Processing Service. It is abstracted behind an interface:
+- INITIALIZING
+- RUNNING
+- STOPPING
+- STOPPED
+- DEGRADED
+
+State transitions are owned by Image Processing Service.
+
+### 7.0.1 Worker Timeout and DEGRADED Behavior
+
+- Long processing duration in a service-managed worker marks service state DEGRADED.
+- Worker timeout transitions increment worker_timeout_total.
+- DEGRADED state includes structured reason fields in health for operational diagnostics.
+- This specification does not define force-kill thread behavior.
+
+### 7.1 Initialization (configure)
+
+1. Validate ImageProcessingServiceConfig.
+2. Create one bounded PerCameraFrameQueue per camera_id.
+3. Build FrameQueueRegistry.
+4. Create ServiceFramePacketSink bound to registry and overflow policy.
+5. Configure Gateway with:
+   - sink = ServiceFramePacketSink
+   - configured camera set derived from service camera_ids
+6. Create service-managed ingestion execution workers.
+7. Create service-managed RPM execution workers and bind each worker to its queue.
+
+### 7.2 Startup (start)
+
+1. Transition state to INITIALIZING.
+2. Start Gateway behavior under Image Processing Service lifecycle authority.
+3. Start service-managed ingestion execution workers.
+4. Start service-managed RPM processing workers.
+5. Transition state to RUNNING.
+
+### 7.3 Steady State
+
+1. Gateway publishes FramePacket to ServiceFramePacketSink.enqueue.
+2. ServiceFramePacketSink routes to per-camera queue.
+3. RPM processing worker dequeues frame.
+4. Validate stale-frame policy before processing:
+    - frame_age_ms = current_time_ms - frame.timestamp_ms
+    - If frame_age_ms > max_frame_age_ms, drop frame and increment stale_frames_dropped_total.
+5. Process non-stale frame.
+6. ResultHandler handles output.
+
+### 7.4 Shutdown (stop)
+
+Shutdown is fully initiated and coordinated by Image Processing Service.
+
+Required shutdown order:
+
+1. Stop ingestion execution.
+2. Close enqueue acceptance.
+3. Drain/drop queues according to policy.
+4. Stop RPM processing workers.
+5. Release queue resources.
+6. Transition state to STOPPED.
+
+Enqueue shutdown gate:
+
+- Once service state becomes STOPPING, new enqueue requests must be rejected.
+
+---
+
+## 8. Health
 
 ```text
-interface RecognitionPipelineManagerInterface {
-    process_frame(frame_packet: FramePacket) -> RecognitionPipelineOutput
+struct ImageProcessingServiceHealth {
+    string state; // INITIALIZING | RUNNING | STOPPING | STOPPED | DEGRADED
+    int32  configured_camera_count;
+    int32  active_processing_workers;
+
+    int64  total_queued_frames;
+    int64  total_queued_bytes;
+    map<string,int32> queue_depth_per_camera;
+    map<string,int64> queue_bytes_per_camera;
+
+    uint64 frames_dropped_oldest_total;
+    uint64 frames_dropped_newest_total;
+    uint64 defensive_unknown_camera_rejected_total;
+    uint64 stale_frames_dropped_total;
+    uint64 worker_error_total;
+    uint64 worker_timeout_total;
+
+    float average_queue_wait_ms;
+    float max_queue_wait_ms;
+    map<string,float> queue_age_p95_per_camera;
+    map<string,int64> oldest_frame_age_ms_per_camera;
+
+    map<string,uint64> accepted_per_camera;
+    map<string,uint64> dropped_per_camera;
+    map<string,uint64> dequeued_per_camera;
+    map<string,uint64> processed_per_camera;
+
+    map<string,bool> worker_alive;
+    map<string,uint64> last_frame_started_at_ms;
+    map<string,uint64> last_frame_completed_at_ms;
+    map<string,string> last_error_code;
+
+    string degraded_reason_code;
+    string degraded_reason_message;
 }
 ```
 
-`GatewayFramePacketSource` is abstracted behind the `FramePacketSource` interface, which is defined and consumed by `RecognitionPipelineManager`:
-
-```text
-interface FramePacketSource {
-    push(frame_packet: FramePacket) -> PushResult
-    get_next_frame()               -> FramePacket | None
-}
-```
-
-`push` is called by the `FrameIngestionGateway` on its ingestion thread. `get_next_frame` is called by `RecognitionWorker` threads.
-
-`ResultHandler` is abstracted behind an interface:
-
-```text
-interface ResultHandlerInterface {
-    handle(output: RecognitionPipelineOutput) -> void
-}
-```
-
-### 6.2 Current Default Implementations
-
-```text
-class RecognitionPipelineManager implements RecognitionPipelineManagerInterface
-class GatewayFramePacketSource    implements FramePacketSource
-class LoggingResultHandler        implements ResultHandlerInterface
-```
-
-`RecognitionPipelineManager` is an orchestration engine. It executes the motion detection → object detection → face detection → face recognition pipeline for one `FramePacket` per call. It is not AI-based — it delegates AI execution to downstream pipeline stage implementations.
-
-`GatewayFramePacketSource` is an algorithmic component. It implements a bounded FIFO queue with the configured `overflow_policy`. It is thread-safe for concurrent `push` (ingestion thread) and `get_next_frame` (worker thread) access.
-
-`LoggingResultHandler` is the MVP implementation. It logs every `RecognitionPipelineOutput` and updates metrics. It does not publish to external systems.
-
-### 6.3 Replaceability
-
-The Image Processing Service depends on `RecognitionPipelineManagerInterface`, `FramePacketSource`, and `ResultHandlerInterface` — not on their concrete implementations. Any compliant implementation of any interface may be substituted without changing the public API or calling code. Replacing `RecognitionPipelineManager`, the queue implementation, or the result handler does NOT affect the service's public API.
-
-### 6.4 Architecture Decision
-
-The system uses RecognitionPipelineManager` is intentionally kept as a pure frame processor.
-
-- `RecognitionPipelineManager` public API is `process_frame(frame_packet: FramePacket) -> RecognitionPipelineOutput`. It always receives a valid `FramePacket` and always returns `RecognitionPipelineOutput`. It never returns `None`.
-- Queue polling, empty-queue handling, sleep/backoff, and all threading belong exclusively to `RecognitionWorker`.
-- `RecognitionPipelineManager` must not know about queues, `FramePacketSourceRegistry`, `GatewayFramePacketSource`, threading, or sleep/retry behavior.
-- This keeps queue and threading concerns inside the Image Processing Service and avoids coupling `RecognitionPipelineManager` to ingestion infrastructure.
+Service health includes queue and worker state. It does not expose Gateway ingestion internals.
 
 ---
 
-## 7. Acceptance / Filtering Logic
+## 9. Service Metrics
 
-Queue admission and overflow are exclusively managed by `GatewayFramePacketSource`.
+- queue_enqueue_latency_ms
+- queue_dequeue_latency_ms
+- queue_wait_ms (queue_wait_ms = dequeue_time - enqueue_time; processing time excluded)
+- frames_enqueued_total
+- frames_dequeued_total
+- frames_dropped_total
+- frames_dropped_oldest_total
+- frames_dropped_newest_total
+- stale_frames_dropped_total
+- processing_worker_latency_ms
+- queue_age_p95_per_camera
+- worker_timeout_total
+- degraded_reason_code
+- degraded_reason_message
+- accepted_per_camera
+- dropped_per_camera
+- dequeued_per_camera
+- processed_per_camera
 
-- `FrameIngestionGateway` pushes each constructed `FramePacket` via `FramePacketSource.push(frame_packet)`. The `GatewayFramePacketSource` inspects the current queue depth before admission.
-- If `queue_depth < max_queue_depth_per_camera`, the frame is enqueued unconditionally and `PushResult.ACCEPTED` is returned.
-- If `queue_depth == max_queue_depth_per_camera`, the configured `overflow_policy` is applied.
-- In MVP, `overflow_policy = DROP_OLDEST`. The oldest frame is removed from the head of the queue, the new frame is appended to the tail, and `PushResult.OVERFLOW_DROP_OLDEST` is returned. The `frames_dropped_total` metric for that `camera_id` is incremented.
-- No overflow signal is propagated outside `GatewayFramePacketSource`. The `FrameIngestionGateway` receives only a `PushResult` enum value and does not know the queue state.
-- `GatewayFramePacketSource` is the ONLY component that applies overflow decisions. No other component evaluates queue depth for admission control.
+Observability performance requirements:
 
----
-
-## 8. Internal Pipeline
-
-### 8.1 ImageProcessingService
-
-`ImageProcessingService` is the service lifecycle manager only. It owns no recognition logic, image processing logic, or queue contents.
-
-Its responsibilities are:
-
-- Load and validate `ImageProcessingServiceConfig` via `ServiceConfigValidator` during `configure()`
-- Wire all owned components: configure `FrameIngestionGateway`, create one `GatewayFramePacketSource` per `camera_id`, populate `FramePacketSourceRegistry`, initialize `RecognitionPipelineManager`, create one `RecognitionWorker` per `camera_id` each wired to its per-camera `FramePacketSource`, create `ResultHandler`
-- Execute the startup sequence during `start()` in the defined order (see §13.2)
-- Execute the shutdown sequence during `stop()` in the defined order (see §13.4)
-- Transition service state: `CREATED → RUNNING → STOPPING → STOPPED`
-- Return `ImageProcessingServiceHealth` snapshots via `health()`
-- Update service-level metrics
-
-`ImageProcessingService` must not invoke pipeline stages directly, access pixel data, or manage the `FrameIngestionGateway` ingestion thread.
-
-### 8.2 ServiceConfigValidator
-
-`ServiceConfigValidator` is responsible only for validating the `ImageProcessingServiceConfig` at startup.
-
-Its responsibilities are:
-
-- Verify all required configuration fields are present and valid (see §2.4)
-- Raise `ServiceConfigurationError` if any required field is invalid or missing
-
-`ServiceConfigValidator` must not create components, start threads, or modify service state.
-
-### 8.3 GatewayFramePacketSource
-
-`GatewayFramePacketSource` is responsible for owning the per-camera bounded queue and enforcing the configured overflow policy.
-
-Its responsibilities are:
-
-- Maintain a bounded FIFO queue of `FramePacket` objects for exactly one `camera_id`
-- Accept `FramePacket` push calls from the `FrameIngestionGateway` ingestion thread
-- Enforce `max_queue_depth_per_camera` and `overflow_policy` on every push
-- When `overflow_policy = DROP_OLDEST` and the queue is full: remove the oldest frame from the head, insert the new frame at the tail, return `PushResult.OVERFLOW_DROP_OLDEST`, and increment `frames_dropped_total`
-- Expose `get_next_frame()` for the `RecognitionWorker` thread to pull the next available frame
-- Wake the registered worker condition variable when a frame is pushed into a previously empty queue
-- Be thread-safe for concurrent `push` and `get_next_frame` access
-
-`GatewayFramePacketSource` must not invoke pipeline stages, manage worker thread lifecycle, or access pixel data beyond routing the `FramePacket` struct.
-
-### 8.4 FramePacketSourceRegistry
-
-`FramePacketSourceRegistry` is responsible for maintaining the mapping from `camera_id` to `FramePacketSource`.
-
-Its responsibilities are:
-
-- Store one `FramePacketSource` per configured `camera_id`, populated at initialization
-- Expose `get(camera_id: string) -> FramePacketSource | None` for lookup
-- Be read-only after initialization; the registry is immutable once populated
-
-`FramePacketSourceRegistry` must not create, start, or manage sources, threads, or service state.
-
-### 8.5 RecognitionWorker
-
-`RecognitionWorker` is responsible for the per-camera worker loop only.
-
-Its responsibilities are:
-
-- Run the worker loop for exactly one `camera_id`
-- Repeatedly call `source.get_next_frame()` via the `FramePacketSource` interface to pull the next available `FramePacket` while the service is in `RUNNING` state
-- Sleep on its condition variable when `get_next_frame()` returns `None` (no frame available); wake when `GatewayFramePacketSource` signals a new frame arrival
-- Pass the pulled `FramePacket` to `recognition_manager.process_frame(frame_packet)` → `RecognitionPipelineOutput`
-- Pass the returned `RecognitionPipelineOutput` to `result_handler.handle(output)`
-- Catch and log exceptions from `source.get_next_frame`, from `recognition_manager.process_frame`, and from `result_handler.handle` without crashing the worker loop
-- Increment `worker_error_count` on each caught exception
-- Set its `WorkerState` to `FAILED` on unrecoverable errors and notify `ImageProcessingService`
-- Set its `WorkerState` to `STOPPED` when the service transitions to `STOPPING` and the loop exits normally
-
-`RecognitionWorker` must not know pipeline internals, access queue internals directly (bypassing the `FramePacketSource` interface), modify `FramePacket` contents, or manage the `FrameIngestionGateway`.
-
-### 8.6 ResultHandler
-
-`ResultHandler` is responsible for handling every `RecognitionPipelineOutput` produced by a `RecognitionWorker`.
-
-Its responsibilities are:
-
-- Receive one `RecognitionPipelineOutput` per call
-- In MVP: log the output (frame identity, camera, timestamp, persons detected, faces recognized)
-- Increment `frames_processed_total` for the `camera_id`
-- Update `pipeline_latency_ms` using the output's `timestamp_ms` and current wall-clock time
-
-`ResultHandler` must not invoke pipeline stages, manage worker lifecycle, or modify `RecognitionPipelineOutput`.
-
-### 8.7 End-to-End Processing Flow
-
-**frame push → queue admission → worker wake → pipeline execution → result handling**
-
-1. `FrameIngestionGateway` constructs a `FramePacket` and calls `FramePacketSourceRegistry.get(camera_id)` to retrieve the `GatewayFramePacketSource` for that camera.
-2. `FrameIngestionGateway` calls `GatewayFramePacketSource.push(frame_packet)` → `PushResult`. If `PushResult == OVERFLOW_DROP_OLDEST`, `frames_dropped_total` is incremented.
-3. `GatewayFramePacketSource` wakes the `RecognitionWorker` condition variable if the queue was empty before the push.
-4. `RecognitionWorker` wakes and calls `GatewayFramePacketSource.get_next_frame()` via the `FramePacketSource` interface → `FramePacket | None`. If `None`, the worker returns to sleep on its condition variable.
-5. `RecognitionWorker` calls `RecognitionPipelineManager.process_frame(frame_packet)`, which executes the recognition pipeline and returns `RecognitionPipelineOutput`.
-6. `RecognitionWorker` calls `ResultHandler.handle(output)`.
-7. `ResultHandler` logs the result and updates metrics.
-8. `RecognitionWorker` loops and calls `source.get_next_frame()` again.
-
-All intermediate pipeline data (embeddings, ROI images, detection scores, motion regions) remain strictly internal to `RecognitionPipelineManager`. The Image Processing Service never accesses them.
+- Metrics emission must be non-blocking.
+- Burst logging must be rate-limited.
 
 ---
 
-## 9. Configuration
+## 10. Error Handling
 
-### 9.1 Configuration Parameters
-
-```text
-struct ImageProcessingServiceConfig {
-    vector<string>  camera_ids;                      // configured camera identifiers; must be non-empty and unique
-    int32           max_queue_depth_per_camera;       // maximum number of FramePackets buffered per camera queue
-    OverflowPolicy  overflow_policy;                  // action taken when a camera queue is full (MVP: DROP_OLDEST)
-    bool            drain_queues_on_shutdown;         // if true, workers process remaining frames before stopping (MVP: always false)
-}
-
-enum OverflowPolicy {
-    DROP_OLDEST,      // remove oldest frame from queue head, insert new frame at tail
-    DROP_NEWEST,      // discard the incoming frame; queue contents unchanged (reserved)
-    BLOCK_INGESTION   // block the push call until space is available (reserved)
-}
-```
-
-### 9.2 Loading Behavior
-
-Configuration is loaded exactly once during `configure()`. It is immutable after `configure()` returns and is reused unchanged across the entire service lifetime. No configuration parameter is part of the `start()`, `stop()`, or `health()` call signatures.
-
-Injection at construction time:
-
-- `camera_ids` → used by `ImageProcessingService` to create one `GatewayFramePacketSource` and one `RecognitionWorker` per identifier
-- `max_queue_depth_per_camera` → injected into each `GatewayFramePacketSource` as the queue capacity bound
-- `overflow_policy` → injected into each `GatewayFramePacketSource` as the admitted overflow strategy
-- `drain_queues_on_shutdown` → stored by `ImageProcessingService`; governs queue flushing behavior during `stop()`
-- `RecognitionPipelineManagerInterface` implementation → injected into `ImageProcessingService` at construction; passed to each `RecognitionWorker`
-- `ResultHandlerInterface` implementation → injected into `ImageProcessingService` at construction; passed to each `RecognitionWorker`
-- `FrameIngestionGateway` instance → injected into `ImageProcessingService` at construction; configured during `configure()`
+| Error | Trigger | Behavior |
+|-------|---------|----------|
+| ServiceConfigurationError | Invalid service config | Fail configure() |
+| EnqueueRejectedServiceStopping | enqueue while service state is STOPPING or STOPPED | Return EnqueueResult accepted=false |
+| UnknownCameraBoundaryViolation | enqueue for unknown camera_id at service sink boundary | Return EnqueueResult accepted=false, increment defensive_unknown_camera_rejected_total |
+| QueueOverflowDropOldest | Queue full and overflow policy DROP_OLDEST | Drop oldest, enqueue new frame, increment frames_dropped_oldest_total |
+| QueueMutationRollback | Queue mutation or accounting operation fails during enqueue | Rollback queue mutation and accounting atomically, return EnqueueResult accepted=false |
+| QueueOverflowDropNewest | Queue full and overflow policy DROP_NEWEST | Reject incoming frame, increment frames_dropped_newest_total |
+| QueueOverflowReject | Queue full and overflow policy REJECT | Return EnqueueResult accepted=false |
+| StaleFrameDropped | frame_age_ms > max_frame_age_ms at dequeue | Drop frame, increment stale_frames_dropped_total |
+| WorkerProcessingTimeout | Long processing duration exceeds watchdog threshold | Mark service DEGRADED, increment worker_timeout_total, continue per policy |
+| WorkerProcessingError | Processing worker exception | Increment worker_error_total, continue worker loop per policy |
 
 ---
 
-## 10. Internal Data Structures
+## 11. Diagrams
 
-- **`FramePacket`** — canonical frame container produced by the `FrameIngestionGateway`; queued in `GatewayFramePacketSource`; pulled by `RecognitionWorker`; the service does not access pixel data; lifecycle: per-frame, from push to `RecognitionPipelineManager` consumption
-- **`GatewayFramePacketSource`** — bounded FIFO queue with `push` / `get_next_frame` interface; one instance per `camera_id`; owns overflow enforcement; thread-safe; lifecycle: persistent across service lifetime
-- **`FramePacketSourceRegistry`** — immutable `map<string, FramePacketSource>`; populated during `configure()`; read-only at runtime; lifecycle: persistent
-- **`RecognitionPipelineOutput`** — structured recognition result for one frame; returned by `RecognitionPipelineManager.process_frame`; passed to `ResultHandler.handle`; not stored by the service; lifecycle: per-frame
-- **`PushResult`** — enum returned by `GatewayFramePacketSource.push`; values: `ACCEPTED`, `OVERFLOW_DROP_OLDEST`, `REJECTED`; used only to update metrics; lifecycle: per push call
-- **`ImageProcessingServiceConfig`** — validated service configuration struct; stored immutably after `configure()`; lifecycle: persistent
-- **`ImageProcessingServiceHealth`** — health snapshot assembled on demand by `health()`; contains `service_state`, `gateway_healthy`, and one `PerCameraHealth` per camera; lifecycle: per `health()` call
-- **`PerCameraHealth`** — per-camera health sub-struct; contains `camera_id`, `worker_state`, `queue_depth`, `last_frame_timestamp_ms`; lifecycle: per `health()` call
-- **`WorkerState`** — enum per `RecognitionWorker`; values: `IDLE`, `RUNNING`, `STOPPED`, `FAILED`; updated by each worker; read by `health()`; lifecycle: persistent per worker
+Note: Mermaid blocks below include an explicit neutral theme init to keep text and edges readable in VS Code Markdown Preview on light themes.
 
----
-
-## 11. Error Handling
-
-- **`ServiceConfigurationError` during `configure()`** → `ServiceConfigValidator` raises the error; `configure()` propagates it to the caller; service state remains `CREATED`; `start()` must not be called
-- **`FrameIngestionGateway` failure after `start()`** → `ImageProcessingService` records `gateway_healthy = false` in `ImageProcessingServiceHealth`; workers continue draining existing queue contents; service does not self-stop
-- **`GatewayFramePacketSource.push()` returns `OVERFLOW_DROP_OLDEST`** → oldest frame discarded; new frame enqueued; `frames_dropped_total[camera_id]` incremented; no error propagated to the Gateway
-- **`RecognitionPipelineManager.process_frame()` raises runtime exception** → `RecognitionWorker` catches the exception; logs the error; increments `worker_error_count[camera_id]`; worker loop continues on the next iteration; service state is not changed
-- **`ResultHandler.handle()` raises exception** → `RecognitionWorker` catches the exception; logs the error; increments `worker_error_count[camera_id]`; worker loop continues; service state is not changed
-- **Unknown `camera_id` at push time** → `GatewayFramePacketSource` returns `PushResult.REJECTED`; frame is discarded; `frames_dropped_total` is incremented; no exception is raised
-- **`RecognitionWorker` unrecoverable failure** → worker sets `WorkerState = FAILED`; notifies `ImageProcessingService`; `ImageProcessingService` records the failure in health state; remaining workers continue; service does not self-stop in MVP
-
-Workers must never crash the service process. All failure paths in `RecognitionWorker` are caught within the worker loop and resolve to a safe continue or a `FAILED` state notification.
-
----
-
-## 12. Metrics / Observability
-
-All per-camera metrics are scoped by `camera_id`. Service-level metrics cover all cameras combined.
-
-- `frames_ingested_total` — total `FramePacket` objects pushed into `GatewayFramePacketSource.push()`, per `camera_id`; incremented on every push call regardless of `PushResult`
-- `frames_processed_total` — total `RecognitionPipelineOutput` objects delivered to `ResultHandler.handle()`, per `camera_id`; incremented by `ResultHandler` on each successful handle call
-- `frames_dropped_total` — total frames discarded due to queue overflow, per `camera_id`; incremented by `GatewayFramePacketSource` on `OVERFLOW_DROP_OLDEST`
-- `queue_depth_per_camera` — current number of frames in the `GatewayFramePacketSource` queue, per `camera_id`; sampled on `health()` and updated in real time within the source
-- `worker_idle_count` — number of times a `RecognitionWorker` entered the sleep/wait state due to an empty queue, per `camera_id`
-- `worker_error_count` — number of exceptions caught by a `RecognitionWorker` during `source.get_next_frame`, `recognition_manager.process_frame`, or `result_handler.handle`, per `camera_id`
-- `pipeline_latency_ms` — elapsed time from `FramePacket.timestamp_ms` to `ResultHandler.handle()` completion, per `camera_id`; updated by `ResultHandler` on each call
-
-Metrics are internal and operational. Not part of the public API.
-
----
-
-## 13. Lifecycle
-
-### 13.1 Initialization (configure())
-
-- Receive `ImageProcessingServiceConfig`
-- `ServiceConfigValidator` validates all fields; raises `ServiceConfigurationError` on failure
-- `FrameIngestionGateway` is configured with the supplied camera list and transport settings
-- One `GatewayFramePacketSource` is created per `camera_id` with `max_queue_depth_per_camera` and `overflow_policy`
-- `FramePacketSourceRegistry` is populated with all per-camera sources
-- `RecognitionPipelineManager` is initialized with pipeline stage engines; it has no dependency on queues or the registry
-- `ResultHandler` is created
-- One `RecognitionWorker` is created per `camera_id`, each holding a reference to its per-camera `FramePacketSource`, `RecognitionPipelineManager`, and `ResultHandler`
-- No threads are started during `configure()`; service state remains `CREATED`
-
-### 13.2 Startup (start())
-
-1. Validate service state is `CREATED`
-2. Validate all `camera_ids` have corresponding entries in `FramePacketSourceRegistry`
-3. Apply final `FrameIngestionGateway` configuration
-4. Confirm all `GatewayFramePacketSource` instances are ready
-5. Confirm `FramePacketSourceRegistry` is complete
-6. Initialize `RecognitionPipelineManager` (load pipeline stage engines)
-7. Initialize `ResultHandler`
-8. Create and start one `RecognitionWorker` thread per `camera_id`, each wired to its per-camera `FramePacketSource`, `RecognitionPipelineManager`, and `ResultHandler`
-9. Start `FrameIngestionGateway` (begins ingestion thread)
-10. Set `service_state = RUNNING`
-
-### 13.3 Per-Frame Execution
-
-**frame push → queue admission → worker wake → pipeline execution → result handling**
-
-The `FrameIngestionGateway` pushes `FramePacket` objects into per-camera `GatewayFramePacketSource` queues. Each `RecognitionWorker` pulls frames directly via `FramePacketSource.get_next_frame()` and passes each `FramePacket` to `RecognitionPipelineManager.process_frame(frame_packet)`, receives a `RecognitionPipelineOutput`, and passes it to `ResultHandler.handle()`. Workers sleep when no frames are available and wake when `GatewayFramePacketSource` signals a new frame. Frames from the same `camera_id` are processed sequentially in FIFO order. Frames from different cameras are processed concurrently on independent worker threads.
-
-### 13.4 Shutdown (stop())
-
-1. Set `service_state = STOPPING`
-2. Stop `FrameIngestionGateway` ingestion thread (no new frames are pushed after this point)
-3. If `drain_queues_on_shutdown = false` (MVP): discard all pending frames in all per-camera queues
-4. Wake all sleeping `RecognitionWorker` threads via their condition variables
-5. Join all `RecognitionWorker` threads (workers exit their loops on `service_state != RUNNING` check)
-6. Shut down `RecognitionPipelineManager` and release pipeline stage engine resources
-7. Shut down `FrameIngestionGateway` and release transport resources
-8. Set `service_state = STOPPED`
-
----
-
-## 14. Class Diagram
+### 11.0 Runtime Ownership Diagram
 
 ```mermaid
+%%{init: {'theme': 'neutral'}}%%
+flowchart TB
+    IPS[Image Processing Service\nOnly top-level runtime lifecycle owner]
+    GW[Frame Ingestion Gateway\nIngestion logic only]
+    RPM[RecognitionPipelineManager\nPipeline logic only]
+
+    subgraph L1[Camera Lane A - Service Owned]
+        I1[Ingestion execution path]
+        Q1[Per-camera queue]
+        P1[RPM processing execution path]
+        I1 --> Q1 --> P1
+    end
+
+    subgraph L2[Camera Lane B - Service Owned]
+        I2[Ingestion execution path]
+        Q2[Per-camera queue]
+        P2[RPM processing execution path]
+        I2 --> Q2 --> P2
+    end
+
+    IPS --> L1
+    IPS --> L2
+    GW -. logic only .-> I1
+    GW -. logic only .-> I2
+    RPM -. logic only .-> P1
+    RPM -. logic only .-> P2
+```
+
+### 11.1 Class Diagram
+
+```mermaid
+%%{init: {'theme': 'neutral'}}%%
 classDiagram
     class ImageProcessingService {
-        -service_state: ServiceState
-        -config: ImageProcessingServiceConfig
-        -gateway: FrameIngestionGateway
-        -registry: FramePacketSourceRegistry
-        -recognition_manager: RecognitionPipelineManagerInterface
-        -workers: map~string, RecognitionWorker~
-        -result_handler: ResultHandlerInterface
         +configure(config: ImageProcessingServiceConfig) void
         +start() void
         +stop(drain: bool) void
         +health() ImageProcessingServiceHealth
     }
 
-    class ServiceConfigValidator {
-        +validate(config: ImageProcessingServiceConfig) void
-    }
-
     class FrameIngestionGateway {
-        +configure(camera_ids: vector~string~) void
+        +configure(config) void
         +start() void
         +stop() void
-        +health() bool
     }
 
-    class FramePacketSourceRegistry {
-        -sources: map~string, FramePacketSource~
-        +register(camera_id: string, source: FramePacketSource) void
-        +get(camera_id: string) FramePacketSource | None
-    }
-
-    class FramePacketSource {
+    class FramePacketSink {
         <<interface>>
-        +push(frame_packet: FramePacket) PushResult
-        +get_next_frame() FramePacket | None
+        +enqueue(frame_packet: FramePacket) EnqueueResult
     }
 
-    class GatewayFramePacketSource {
+    class ServiceFramePacketSink {
+        +enqueue(frame_packet: FramePacket) EnqueueResult
+    }
+
+    class PerCameraFrameQueue {
+        +enqueue(frame_packet: FramePacket) EnqueueResult
+        +dequeue() FramePacket | None
+    }
+
+    class ProcessingWorker {
         -camera_id: string
-        -queue: bounded_fifo~FramePacket~
-        -max_depth: int32
-        -overflow_policy: OverflowPolicy
-        +push(frame_packet: FramePacket) PushResult
-        +get_next_frame() FramePacket | None
-    }
-
-    class RecognitionPipelineManagerInterface {
-        <<interface>>
-        +process_frame(frame_packet: FramePacket) RecognitionPipelineOutput
-    }
-
-    class RecognitionPipelineManager {
-        +process_frame(frame_packet: FramePacket) RecognitionPipelineOutput
-    }
-
-    class RecognitionWorker {
-        -camera_id: string
-        -worker_state: WorkerState
         +run() void
     }
 
-    class ResultHandlerInterface {
-        <<interface>>
-        +handle(output: RecognitionPipelineOutput) void
-    }
-
-    class LoggingResultHandler {
-        +handle(output: RecognitionPipelineOutput) void
-    }
-
-    class ImageProcessingServiceHealth {
-        +service_state: ServiceState
-        +gateway_healthy: bool
-        +cameras: vector~PerCameraHealth~
-    }
-
-    class PerCameraHealth {
-        +camera_id: string
-        +worker_state: WorkerState
-        +queue_depth: int32
-        +last_frame_timestamp_ms: uint64
-    }
-
-    class ImageProcessingServiceConfig {
-        +camera_ids: vector~string~
-        +max_queue_depth_per_camera: int32
-        +overflow_policy: OverflowPolicy
-        +drain_queues_on_shutdown: bool
-    }
-
-    ImageProcessingService --> ServiceConfigValidator : validates config via
-    ImageProcessingService --> FrameIngestionGateway : configures and owns
-    ImageProcessingService --> FramePacketSourceRegistry : owns
-    ImageProcessingService --> RecognitionPipelineManagerInterface : delegates pipeline via
-    ImageProcessingService "1" --> "many" RecognitionWorker : owns one per camera_id
-    ImageProcessingService --> ResultHandlerInterface : wires into workers
-    FramePacketSourceRegistry "1" --> "many" FramePacketSource : maps camera_id to
-    GatewayFramePacketSource ..|> FramePacketSource : implements
-    RecognitionPipelineManager ..|> RecognitionPipelineManagerInterface : implements
-    LoggingResultHandler ..|> ResultHandlerInterface : implements
-    RecognitionWorker --> FramePacketSource : pulls frames via
-    RecognitionWorker --> RecognitionPipelineManagerInterface : submits frames via
-    RecognitionWorker --> ResultHandlerInterface : delivers output via
-    ImageProcessingService --> ImageProcessingServiceHealth : returns from health()
-    ImageProcessingServiceHealth --> PerCameraHealth : contains
+    ImageProcessingService --> FrameIngestionGateway : configures and controls
+    ImageProcessingService --> ServiceFramePacketSink : owns
+    ServiceFramePacketSink ..|> FramePacketSink : implements
+    ServiceFramePacketSink --> PerCameraFrameQueue : routes to
+    ImageProcessingService --> PerCameraFrameQueue : owns many
+    ImageProcessingService --> ProcessingWorker : owns many
+    ProcessingWorker --> PerCameraFrameQueue : consumes from
 ```
 
----
-
-## 15. Sequence Diagram
+### 11.2 Sequence Diagram
 
 ```mermaid
+%%{init: {'theme': 'neutral'}}%%
 sequenceDiagram
     autonumber
     participant GW as FrameIngestionGateway
-    participant SRC as GatewayFramePacketSource(camera_id)
-    participant WORKER as RecognitionWorker(camera_id)
-    participant RPM as RecognitionPipelineManager
+    participant SINK as ServiceFramePacketSink
+    participant Q as PerCameraFrameQueue
+    participant W as ProcessingWorker
     participant RH as ResultHandler
 
-    GW->>SRC: push(frame_packet)
-    SRC-->>GW: PushResult.ACCEPTED
+    GW->>SINK: enqueue(frame_packet)
+    SINK->>Q: enqueue(frame_packet by camera_id)
+    Q-->>SINK: EnqueueResult
+    SINK-->>GW: EnqueueResult
 
-    Note over SRC,WORKER: Queue was empty — signal worker
-    SRC->>WORKER: signal condition variable
-
-    WORKER->>SRC: get_next_frame()
-    SRC-->>WORKER: FramePacket
-    WORKER->>RPM: process_frame(frame_packet)
-    RPM->>RPM: execute recognition pipeline
-    RPM-->>WORKER: RecognitionPipelineOutput
-
-    WORKER->>RH: handle(output)
-    RH->>RH: log output, update metrics
-    RH-->>WORKER: void
-
-    Note over WORKER: Queue empty — sleep
-    WORKER->>SRC: get_next_frame()
-    SRC-->>WORKER: None
-    WORKER->>WORKER: wait on condition variable
+    W->>Q: dequeue()
+    Q-->>W: FramePacket
+    W->>RH: handle(processed_output)
 ```
 
----
-
-## 16. Data Flow Diagram
+### 11.3 Data Flow Diagram
 
 ```mermaid
-flowchart TD
-    A["Camera Source\n(external)"]
-    B["FrameIngestionGateway\nProduces: FramePacket\n(frame_id, camera_id, timestamp_ms, image)"]
-    C["GatewayFramePacketSource\nQueues: FramePacket per camera_id\nEnforces: max_queue_depth, overflow_policy"]
-    D["RecognitionWorker\nPulls: FramePacket via get_next_frame()\nSleeps when queue empty; wakes on signal"]
-    E["RecognitionPipelineManager\nReceives: FramePacket via process_frame()\nProduces: RecognitionPipelineOutput\n(frame_id, camera_id, persons, faces)"]
-    F["ResultHandler\nConsumes: RecognitionPipelineOutput\nLogs result, updates metrics"]
-    G["ImageProcessingServiceHealth\n(service_state, gateway_healthy,\nqueue_depth_per_camera, worker_state_per_camera)"]
-
-    A --> B
-    B -->|"push(FramePacket)"| C
-    C -->|"get_next_frame() → FramePacket | None"| D
-    D -->|"process_frame(frame_packet)"| E
-    E -->|"RecognitionPipelineOutput"| F
-    F -->|"frames_processed_total, pipeline_latency_ms"| G
-    C -->|"queue_depth_per_camera, frames_dropped_total"| G
+%%{init: {'theme': 'neutral'}}%%
+flowchart LR
+    A[Frame Ingestion Gateway producer] --> B[ServiceFramePacketSink]
+    B --> C[Per-camera bounded queues]
+    C --> D[Per-camera processing workers]
+    D --> E[Result handling]
 ```
 
 ---
 
-## 17. Extensibility
+## 12. Configuration
 
-**What can change without breaking the public API:**
+```text
+struct ImageProcessingServiceConfig {
+    vector<string> camera_ids;
+    int32          max_queue_size_per_camera;
+    int64          max_total_queued_bytes;
+    int32          max_frame_age_ms;
+    OverflowPolicy overflow_policy;     // default DROP_OLDEST
+    bool           drain_on_shutdown;
+}
+```
 
-- `RecognitionPipelineManager` may be replaced with any implementation satisfying `RecognitionPipelineManagerInterface`; no change to `ImageProcessingService` public API or worker logic is required
-- `ResultHandler` may be replaced with any implementation satisfying `ResultHandlerInterface` (e.g., event bus publisher, gRPC emitter, metrics sink); no change to worker logic is required
-- `GatewayFramePacketSource` may be replaced with any `FramePacketSource` implementation (e.g., ring buffer, lock-free queue); no change to `RecognitionWorker` or `RecognitionPipelineManager` is required
-- `overflow_policy` may be changed from `DROP_OLDEST` to `DROP_NEWEST` or `BLOCK_INGESTION` without changing the public API; only `GatewayFramePacketSource` behavior changes
-- The number of cameras may be changed via configuration; the worker count and source count scale accordingly without changing any component interface
-- `drain_queues_on_shutdown` may be enabled in a future version without changing the public API; only shutdown sequencing changes
+Rules:
 
-**What must remain stable:**
-
-- Public API function signatures: `configure(config)`, `start()`, `stop(drain)`, `health() -> ImageProcessingServiceHealth`
-- `ImageProcessingServiceHealth` output schema: `service_state`, `gateway_healthy`, `cameras` with typed `PerCameraHealth` fields
-- `FramePacketSource` interface: `push(frame_packet) -> PushResult`, `get_next_frame() -> FramePacket | None`
-- `RecognitionPipelineManagerInterface`: `process_frame(frame_packet: FramePacket) -> RecognitionPipelineOutput`
-- `ResultHandlerInterface`: `handle(output: RecognitionPipelineOutput) -> void`
-- Per-camera FIFO ordering guarantee: exactly one `RecognitionWorker` per camera
-- Ownership boundaries: `ImageProcessingService` owns threads, workers, queues, and lifecycle; `FrameIngestionGateway` owns its ingestion thread
+- camera_ids must be non-empty, unique, and fixed in v1.
+- Dynamic camera registration is not supported in v1.
 
 ---
 
-## 18. Module Compliance Checklist
+## 13. Boundary Rules
 
-- [ ] One `RecognitionWorker` per `camera_id` — enforces sequential, FIFO per-camera processing
-- [ ] Queue overflow threshold (`max_queue_depth_per_camera`) is applied internally only — not exposed in any public API call signature
-- [ ] No internal pipeline data (embeddings, scores, raw detections, ROI images) is accessible through the public API
-- [ ] `RecognitionPipelineManagerInterface` is respected — the service depends on the interface, not the concrete `RecognitionPipelineManager` class
-- [ ] `FrameIngestionGateway` ingestion thread is owned exclusively by the Gateway — the service does not manage it
-- [ ] `FramePacket` pixel data is never accessed by `ImageProcessingService`, `GatewayFramePacketSource`, `FramePacketSourceRegistry`, or `RecognitionWorker`
-- [ ] `PushResult` enum is used for overflow signaling — no exception is raised on queue overflow
-- [ ] Service state transitions are strictly ordered: `CREATED → RUNNING → STOPPING → STOPPED`
-- [ ] Worker exceptions are caught within each `RecognitionWorker` loop — they must not terminate the service process
-- [ ] `drain_queues_on_shutdown = false` in MVP — queues are discarded at shutdown without waiting
-- [ ] `ImageProcessingServiceHealth` is always constructable — `health()` must not throw at any service state
-- [ ] Configuration is loaded exactly once during `configure()` and is immutable thereafter
+- This module references shared FramePacket and FramePacketSink contracts from shared_contracts.md.
+- This module does not redefine Gateway internals.
+- frame_ingestion_gateway.md is the sole canonical Gateway specification source.
+- Duplicate Gateway spec artifact was intentionally removed to prevent documentation drift.
+- Gateway is treated as an external producer through FramePacketSink only.
+- Frame Ingestion Gateway owns unknown-camera rejection policy and unknown_camera_rejected_total metrics in normal operation.
+- Service-side unknown camera handling is defensive boundary-violation handling only.
+- Queue ownership, overflow policy, and worker scheduling belong exclusively to this service.
+
+---
+
+## 14. Test Plan Recommendations
+
+Service-focused test plan recommendations for future implementation:
+
+- Validate ServiceFramePacketSink routes each frame to the matching camera queue.
+- Validate STOPPING enqueue gate rejects new enqueue requests.
+- Validate service defensive unknown camera rejection path increments defensive_unknown_camera_rejected_total.
+- Validate bounded queue behavior at capacity for each overflow policy.
+- Validate DROP_OLDEST removes oldest then accepts newest.
+- Validate DROP_OLDEST replacement occurs inside one synchronized queue mutation.
+- Validate DROP_NEWEST rejects incoming frame and preserves existing queue.
+- Validate REJECT returns accepted=false without queue mutation.
+- Validate queue limit precedence applies per-camera limits before global queued-byte limits.
+- Validate per-camera memory isolation and global fairness under contention.
+- Validate per-camera FIFO ordering is preserved.
+- Validate one worker consumes only from its matching camera queue.
+- Validate workers treat FramePacket as immutable.
+- Validate stale frame dropping occurs at dequeue using frame_age_ms formula.
+- Validate enqueue during STOPPING state-transition race rejects new enqueues.
+- Validate queue byte accounting remains consistent under DROP_OLDEST with concurrent load.
+- Validate rollback semantics restore queue and accounting state on failed queue mutation.
+- Validate worker timeout transitions service health to DEGRADED and increments timeout metrics.
+
+---
+
+## 15. Module Compliance Checklist
+
+- [ ] Shared FramePacket is referenced from shared_contracts.md only
+- [ ] No local divergent FramePacket struct exists
+- [ ] ServiceFramePacketSink implements FramePacketSink and returns EnqueueResult
+- [ ] Service owns bounded per-camera queues and queue capacities
+- [ ] Unknown camera policy ownership is Gateway-owned in normal path
+- [ ] Service unknown camera handling is defensive boundary handling only
+- [ ] No dynamic queue creation for unknown cameras in v1
+- [ ] Overflow policy is explicit and bounded (default DROP_OLDEST)
+- [ ] Queue limit precedence is deterministic: per-camera first, global second
+- [ ] Per-camera queue memory limits are isolated and independent
+- [ ] Global queued-byte fairness prevents one camera starving others
+- [ ] Worker scheduling and lifecycle are service-owned
+- [ ] Only Image Processing Service creates, owns, starts, stops, and supervises runtime threads
+- [ ] Lifecycle states include INITIALIZING, RUNNING, STOPPING, STOPPED, DEGRADED
+- [ ] Shutdown order is: stop ingestion execution, close enqueue acceptance, drain/drop queues, stop RPM processing workers
+- [ ] Enqueue is rejected once service state is STOPPING
+- [ ] Stale-frame validation occurs at dequeue before processing
+- [ ] frame_age_ms = current_time_ms - frame.timestamp_ms
+- [ ] Service health contains queue/worker metrics only, not Gateway ingestion internals
+- [ ] DROP_OLDEST replacement and queue byte accounting updates are atomic and rollback-safe
+- [ ] Metrics emission is non-blocking and burst logging is rate-limited
+- [ ] Worker timeout can mark service DEGRADED without force-kill behavior requirements
+- [ ] frame_ingestion_gateway.md is treated as sole canonical Gateway specification source

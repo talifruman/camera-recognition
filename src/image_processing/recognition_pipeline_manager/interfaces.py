@@ -29,7 +29,6 @@ from image_processing.face_recognition.module import (
     FaceRecognitionInterface,  # noqa: F401 — re-exported for callers
 )
 from image_processing.frame_transformation_layer.contracts import (
-    FramePacket,
     FrameTemporalSelector,
     ProcessedFrame,
 )
@@ -45,6 +44,7 @@ from image_processing.object_detection.module import (
 from image_processing.person_directory.module import PersonDirectoryOutput
 from image_processing.shared.contracts import (
     BoundingBox,
+    FramePacket,
     GeometrySpec,
     OutputImageType,
     PipelineStageInputContract,
