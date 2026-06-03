@@ -7,4 +7,6 @@ debug_outputs/
 debug_inputs/
 tests/recognition_pipeline_manager/assets/
 logs/
+.venv/
 *.log
+data/generated_face_gallery_real/
