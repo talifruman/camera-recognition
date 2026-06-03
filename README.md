@@ -1,21 +1,114 @@
-# Camera-regogintion
+# Camera Recognition System
 
-## Current Architecture Snapshot
+### Real-Time Multi-Camera Person & Face Recognition Platform
 
-The system currently follows an event-driven pipeline for camera monitoring on a single-host MVP baseline.
+A modular computer vision system that processes multiple camera streams concurrently, detects motion, identifies people, recognizes faces, and generates identity-aware recognition events.
 
-- Camera Service publishes normalized frames.
-- Image processing service performs motion, object, face detection, and recognition.
-- Frame Buffer Service maintains pre/post-roll frame history.
-- Event Service creates canonical events and drives downstream actions.
-- Media Service (merged Clip Recording + Storage boundary) fetches frame ranges, builds MP4 clips, and persists media artifacts.
-- Telegram Notification Service sends event alerts after clip readiness.
+Designed using a **Spec-Driven Development** approach with a focus on **real-time processing**, **scalability**, **system architecture**.
 
-## Event-Triggered Clip Flow
+---
 
-1. Image processing service emits person or motion-derived event signals.
-2. Event Service publishes event.created.
-3. Media Service reads event.created, requests frame window from Frame Buffer Service, muxes MP4, persists clip, and emits event.clip.ready.
-4. Telegram Notification Service consumes event.clip.ready and sends rich notification payloads.
+## Architecture
 
-See [doc/system.md](doc/system.md) for the full architecture, sequence diagrams, and API surface.
+```mermaid
+flowchart TB
+
+    Cameras["Multiple Cameras"]
+
+    Gateway["Frame Ingestion Gateway"]
+
+    IPS["Image Processing Service"]
+
+    subgraph LaneA["Camera Processing Lane A"]
+        QueueA["Queue"]
+        RPMA["Recognition Pipeline"]
+        QueueA --> RPMA
+    end
+
+    subgraph LaneB["Camera Processing Lane B"]
+        QueueB["Queue"]
+        RPMB["Recognition Pipeline"]
+        QueueB --> RPMB
+    end
+
+    subgraph LaneN["Camera Processing Lane N"]
+        QueueN["Queue"]
+        RPMN["Recognition Pipeline"]
+        QueueN --> RPMN
+    end
+
+    Cameras --> Gateway
+    Gateway --> IPS
+
+    IPS --> QueueA
+    IPS --> QueueB
+    IPS --> QueueN
+```
+
+---
+
+## Recognition Pipeline
+
+```mermaid
+flowchart LR
+
+    Frame["Frame"]
+    Motion["Motion Detection"]
+    Person["Person Detection"]
+    Face["Face Detection"]
+    Recognition["Face Recognition"]
+    Identity["Identity Matching"]
+
+    Frame --> Motion
+    Motion --> Person
+    Person --> Face
+    Face --> Recognition
+    Recognition --> Identity
+```
+
+---
+
+## Engineering Highlights
+
+* Multi-Camera Processing
+* Per-Camera Isolation
+* Real-Time First Design
+* Multi-Threaded Architecture
+* Bounded Queue Architecture
+* Queue-Based Backpressure Management
+* Motion-Gated Processing
+* Runtime Metrics & Diagnostics
+* Replay Framework
+* Config-Driven Runtime Behavior
+* Spec-Driven Development
+* 500+ Automated Tests
+
+---
+
+## Technologies
+
+**Python • OpenCV • YOLO • ONNX Runtime • NumPy • Docker • Linux • Pytest • YAML • Git**
+
+---
+
+## Design Documentation
+
+Detailed design specifications covering system architecture, runtime processing flow, recognition pipeline orchestration, and shared contracts.
+
+* [Image Processing Service](doc/image_processing_service/image_processing_service.md)
+* [Recognition Pipeline Manager](doc/image_processing_service/RecognitionPipelineManager.md)
+* [Frame Ingestion Gateway](doc/image_processing_service/frame_ingestion_gateway.md)
+
+---
+
+## Demo
+
+*Demo GIF / Video coming soon*
+
+---
+
+## Author
+
+**Tali Fruman**
+B.Sc. Information Systems (AI Specialization)
+University of Haifa
