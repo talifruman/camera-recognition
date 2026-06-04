@@ -10,7 +10,7 @@ No embeddings are modified, moved, or rewritten.
 Usage (from project root):
     python tests/face_gallery_loader/gallery_consistency_check.py
     python tests/face_gallery_loader/gallery_consistency_check.py \\
-        --gallery-root "C:\\...\\data\\generated_face_gallery_real" \\
+        --gallery-root "C:\\...\\data\\generated_face_gallery" \\
         --similarity-threshold 0.40
 """
 
@@ -306,7 +306,7 @@ def write_json_report(
 # ---------------------------------------------------------------------------
 
 DEFAULT_GALLERY_ROOT = (
-    r"C:\Users\talif\Desktop\Camera-regogintion\data\generated_face_gallery_real"
+    r"C:\Users\talif\Desktop\Camera-regogintion\data\generated_face_gallery"
 )
 DEFAULT_THRESHOLD = 0.35
 

@@ -4,7 +4,7 @@ Validate the REAL face gallery used by Face Recognition.
 Usage:
     python scripts/validate_face_gallery.py
     python scripts/validate_face_gallery.py --gallery-dir data/gallery --person-json data/person_directory.json
-    python scripts/validate_face_gallery.py --gallery-dir data/generated_face_gallery_real --norm-tolerance 1e-3
+    python scripts/validate_face_gallery.py --gallery-dir data/generated_face_gallery --norm-tolerance 1e-3
 
 Exit codes:
     0  — validation passed (no errors)
@@ -30,8 +30,11 @@ def parse_args():
     parser.add_argument(
         "--gallery-dir",
         type=Path,
-        default=Path("data/gallery"),
-        help="Root directory of the face gallery (default: data/gallery)",
+        default=Path("data/generated_face_gallery"),
+        help=(
+            "Root directory of the face gallery "
+            "(default: data/generated_face_gallery)"
+        ),
     )
     parser.add_argument(
         "--person-json",

@@ -1,6 +1,6 @@
 """
 Tests for NpyEmbeddingFileReader using the real gallery at
-data/generated_face_gallery_real/.
+data/generated_face_gallery/.
 
 Covers:
   - valid .npy file loads correctly (shape, dtype, normalization)
@@ -40,7 +40,7 @@ from image_processing.face_gallery_loader import (  # type: ignore[import-not-fo
 # ------------------------------------------------------------------ constants
 
 REAL_GALLERY_PATH = os.path.join(
-    _REPO_ROOT, "data", "generated_face_gallery_real"
+    _REPO_ROOT, "data", "generated_face_gallery"
 )
 
 _FIRST_PERSON_ID = "1f007fe2-6eaf-5148-a240-a449664cb6eb"

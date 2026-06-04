@@ -61,7 +61,7 @@ from image_processing.shared.contracts import (  # type: ignore[import-not-found
 # ------------------------------------------------------------------ constants
 
 REAL_GALLERY_PATH = os.path.join(
-    _REPO_ROOT, "data", "generated_face_gallery_real"
+    _REPO_ROOT, "data", "generated_face_gallery"
 )
 
 _ROI_W = 112

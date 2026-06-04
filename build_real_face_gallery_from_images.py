@@ -82,7 +82,7 @@ _HEBREW_IMAGE_WORD = "תמונה"
 # Default paths
 _DEFAULT_SOURCE = r"C:\Users\talif\Desktop\photos"
 _DEFAULT_OUTPUT = (
-    r"C:\Users\talif\Desktop\Camera-regogintion\data\generated_face_gallery_real"
+    r"C:\Users\talif\Desktop\Camera-regogintion\data\generated_face_gallery"
 )
 
 

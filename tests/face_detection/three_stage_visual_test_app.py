@@ -9,7 +9,7 @@ by real ArcFace embeddings loaded from a pre-built gallery on disk.
 Gallery loading
 ---------------
 At startup, FaceGalleryLoaderModule reads real .npy embeddings from
-``data/generated_face_gallery_real/`` (built by
+``data/generated_face_gallery/`` (built by
 ``build_real_face_gallery_from_images.py``).  The gallery is loaded once and
 held in memory for the entire run.
 
@@ -34,7 +34,7 @@ Faces detected: <N>
     person_found: <True/False>
     person_id: <value or empty>
 
-Gallery is loaded from ``data/generated_face_gallery_real/`` by default.
+Gallery is loaded from ``data/generated_face_gallery/`` by default.
 An alternative gallery root may be passed as the 5th CLI argument.
 """
 
@@ -118,7 +118,7 @@ _FONT_SCALE       = 0.7
 _FONT_THICKNESS   = 2
 
 _VALID_FD_MODES = ("stub", "real")
-_REAL_GALLERY_ROOT = _PROJECT_ROOT / "data" / "generated_face_gallery_real"
+_REAL_GALLERY_ROOT = _PROJECT_ROOT / "data" / "generated_face_gallery"
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +295,7 @@ def process_images(
         Defaults to *od_detector_mode* when ``None``.
     gallery_root:
         Path to the real gallery directory.  Defaults to
-        ``data/generated_face_gallery_real/`` when ``None``.
+        ``data/generated_face_gallery/`` when ``None``.
     """
     resolved_fd_mode = fd_detector_mode if fd_detector_mode is not None else od_detector_mode
     resolved_gallery_root = Path(gallery_root) if gallery_root is not None else _REAL_GALLERY_ROOT

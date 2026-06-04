@@ -5,9 +5,16 @@ numpy>=1.21.0
 
 # Image processing
 opencv-python>=4.5.0
+Pillow>=10.0.0
 
 # Deep learning inference (required by face detection and recognition models)
 onnxruntime>=1.14.0
 
 # Type hints and runtime checking
 typing-extensions>=4.0.0
+
+# YAML configuration loading
+PyYAML>=6.0.0
+
+# Test runner (used by Docker CMD)
+pytest>=8.0.0

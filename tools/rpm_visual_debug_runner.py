@@ -833,9 +833,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gallery-dir",
         type=Path,
-        default=_PROJECT_ROOT / "data" / "generated_face_gallery_real",
+        default=_PROJECT_ROOT / "data" / "generated_face_gallery",
         metavar="PATH",
-        help="Path to face gallery used by FaceRecognitionModule (default: generated_face_gallery_real)",
+        help="Path to face gallery used by FaceRecognitionModule (default: generated_face_gallery)",
     )
     parser.add_argument(
         "--person-json",
