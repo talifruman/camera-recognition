@@ -23,6 +23,7 @@ from image_processing_service.visual_replay_single_camera import (  # type: igno
     ReplayFrameRecord,
     RUNTIME_TRACE_PER_FRAME_NAME,
     VisualReplayError,
+    _resolve_object_detection_is_real,
     _build_runtime_trace_per_frame_payload,
     _build_runtime_trace_summary,
     run_visual_replay,
@@ -30,6 +31,50 @@ from image_processing_service.visual_replay_single_camera import (  # type: igno
 
 _FPS = 5.0
 _FRAME_COUNT = 2
+
+
+def test_object_detection_mode_uses_real_implementation_type(tmp_path: Path) -> None:
+    """Resolve object detection mode as real when YAML implementation_type is real."""
+    od_config_path = tmp_path / "object_detection_real.yaml"
+    od_config_path.write_text(
+        '\n'.join(
+            [
+                'implementation_type: "real"',
+                'model_path: "models/object_detection/yolo11s.pt"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    rpm_config = {
+        "models": {
+            "object_detection_config": str(od_config_path),
+        }
+    }
+
+    assert _resolve_object_detection_is_real(rpm_config) is True
+
+
+def test_object_detection_mode_uses_stub_implementation_type(tmp_path: Path) -> None:
+    """Resolve object detection mode as stub when YAML implementation_type is stub."""
+    od_config_path = tmp_path / "object_detection_stub.yaml"
+    od_config_path.write_text(
+        '\n'.join(
+            [
+                'implementation_type: "stub"',
+                'model_path: "models/object_detection/yolo11s.pt"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    rpm_config = {
+        "models": {
+            "object_detection_config": str(od_config_path),
+        }
+    }
+
+    assert _resolve_object_detection_is_real(rpm_config) is False
 
 
 def _write_temp_video(video_path: Path) -> None:
@@ -438,7 +483,7 @@ def test_visual_replay_warmup_frames_are_reported_separately(tmp_path: Path) -> 
     assert trace_summary["warmup_frames_submitted"] == 1
     assert trace_summary["total_frames_submitted"] == 1
     assert "warmup_section" in trace_summary
-    assert trace_summary["backend_diagnostics"]["object_detection"]["backend"] == "ultralytics"
+    assert trace_summary["backend_diagnostics"]["object_detection"]["backend"] == "unknown"
     assert trace_summary["backend_diagnostics"]["face_detection"]["backend"] == "onnxruntime"
     assert trace_summary["backend_diagnostics"]["face_recognition"]["backend"] == "onnxruntime"
     assert trace_summary["backend_diagnostics"]["motion_detection"]["backend"] == "cv2_frame_differencing"

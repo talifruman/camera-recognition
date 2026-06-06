@@ -8,4 +8,5 @@ debug_inputs/
 tests/recognition_pipeline_manager/assets/
 logs/
 .venv/
-*.log
+*.logmodels/object_detection/*.pt
+models/object_detection/*.pt

@@ -882,17 +882,40 @@ def _read_video_frames(
     return frames, effective_fps
 
 
+def _resolve_repo_path(config_path: str | Path) -> Path:
+    """Resolve an absolute or repository-relative config path."""
+    candidate = Path(config_path)
+    if candidate.is_absolute():
+        return candidate
+    return _PROJECT_ROOT / candidate
+
+
+def _resolve_object_detection_is_real(rpm_config: dict[str, Any]) -> bool:
+    """Resolve object detection implementation mode from the configured YAML."""
+    models_config = rpm_config.get("models")
+    if not isinstance(models_config, dict):
+        raise VisualReplayError("RPM config is missing models section")
+    od_config_raw = models_config.get("object_detection_config")
+    if not isinstance(od_config_raw, str) or not od_config_raw.strip():
+        raise VisualReplayError("RPM config is missing models.object_detection_config")
+    od_config_path = _resolve_repo_path(od_config_raw.strip())
+    od_yaml = load_yaml_config(od_config_path)
+    implementation_type = str(od_yaml.get("implementation_type", "stub")).strip().lower()
+    return implementation_type == "real"
+
+
 def _load_runtime_components(frame: np.ndarray, rpm_config_path: Path) -> Any:
-    """Build real runtime components using the first decoded frame size."""
+    """Build runtime components using frame size and YAML-driven OD mode."""
     frame_height, frame_width = frame.shape[:2]
     rpm_config = load_yaml_config(rpm_config_path)
+    real_object_detection = _resolve_object_detection_is_real(rpm_config)
     return build_runtime_components(
         rpm_config=rpm_config,
         person_json=DEFAULT_PERSON_JSON_PATH,
         frame_width=frame_width,
         frame_height=frame_height,
         real_motion_detection=True,
-        real_object_detection=True,
+        real_object_detection=real_object_detection,
         real_face_detection=True,
         real_face_recognition=True,
     )
