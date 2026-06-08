@@ -1,0 +1,8 @@
+implementation_type: "real"
+
+model_path: "models/object_detection/yolo11s.pt"
+
+confidence_threshold: 0.25
+nms_threshold: 0.45
+
+person_class_id: 0

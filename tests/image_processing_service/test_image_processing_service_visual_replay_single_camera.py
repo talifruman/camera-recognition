@@ -177,6 +177,7 @@ def test_visual_replay_generates_artifacts_and_runtime_metrics(
     assert "object_detection_total_ms" in trace_rows[0]
     assert "face_detection_total_ms" in trace_rows[0]
     assert "face_recognition_total_ms" in trace_rows[0]
+    assert "demo_bypass_motion_gate" in trace_rows[0]
 
     with open(runtime_trace_per_frame_path, encoding="utf-8") as handle:
         per_frame_payload = json.load(handle)
@@ -188,6 +189,48 @@ def test_visual_replay_generates_artifacts_and_runtime_metrics(
     assert "face_detection" in first_frame
     assert "face_recognition" in first_frame
     assert "totals_for_frame" in first_frame
+
+
+@pytest.mark.integration
+def test_visual_replay_demo_renderer_writes_summary_screen_and_console_totals(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Render the polished demo video and verify the summary screen and console totals."""
+    video_path = tmp_path / "demo.mp4"
+    output_dir = tmp_path / "demo_output"
+    _write_temp_video(video_path)
+
+    result = run_visual_replay(
+        input_video_path=video_path,
+        output_dir=output_dir,
+        replay_fps=_FPS,
+        demo_mode=True,
+        summary_screen_seconds=0.8,
+    )
+
+    captured = capsys.readouterr().out
+    assert result.output_overlay_path.name == "demo_annotated.mp4"
+    assert result.output_overlay_path.exists()
+    assert result.summary_path.exists()
+    assert result.total_motion_regions_detected >= 0
+    assert result.total_recognized_faces >= 0
+    assert "Total frames processed:" in captured
+    assert "Average FPS:" in captured
+    assert "Total motion regions detected:" in captured
+    assert "demo_bypass_motion_gate=" in captured
+    assert "Output overlay path:" in captured
+    assert "Total object detections:" in captured
+    assert "Total persons detected:" in captured
+    assert "Total faces detected:" in captured
+    assert "Total recognized faces:" in captured
+
+    capture = cv2.VideoCapture(str(result.output_overlay_path))
+    try:
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    finally:
+        capture.release()
+    assert frame_count == _FRAME_COUNT + 4
 
 
 @pytest.mark.integration

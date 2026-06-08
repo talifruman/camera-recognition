@@ -9,7 +9,7 @@ import shutil
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -101,10 +101,32 @@ HUD_ORIGIN_X = 8
 HUD_ORIGIN_Y = 22
 HUD_TEXT_COLOR = (235, 235, 235)
 STATUS_TEXT_COLOR = (20, 20, 255)
+MOTION_ROI_COLOR = (0, 255, 255)  # yellow — motion region bounding boxes
 PERSON_COLOR = (0, 255, 0)
 FACE_COLOR = (255, 255, 0)
 PANEL_LABEL_COLOR = (255, 255, 255)
 BORDER_THICKNESS = 2
+DEMO_OVERLAY_VIDEO_NAME = "demo_annotated.mp4"
+DEMO_CAMERA_LABEL = "CAM_01"
+DEMO_SUMMARY_SCREEN_SECONDS = 0.8
+DEMO_FRAME_FONT_SCALE = 0.78
+DEMO_FRAME_FONT_THICKNESS = 2
+DEMO_HUD_FONT_SCALE = 0.72
+DEMO_HUD_TITLE_FONT_SCALE = 0.88
+DEMO_HUD_THICKNESS = 2
+SUMMARY_TITLE_FONT_SCALE = 0.94
+SUMMARY_SECTION_FONT_SCALE = 0.72
+SUMMARY_DETAIL_FONT_SCALE = 0.62
+SUMMARY_CARD_ALPHA = 0.84
+SUMMARY_BACKGROUND_COLOR = (12, 12, 12)
+SUMMARY_CARD_COLOR = (28, 28, 28)
+SUMMARY_TEXT_COLOR = (240, 240, 240)
+SUMMARY_ACCENT_COLOR = (180, 180, 180)
+SUMMARY_SUCCESS_COLOR = (0, 220, 0)
+MOTION_BBOX_THICKNESS = 3
+PERSON_BBOX_THICKNESS = 4
+FACE_BBOX_THICKNESS = 3
+RECOGNITION_LABEL_THICKNESS = 2
 SAMPLE_FRAME_STEM = "frame"
 OVERLAY_VIDEO_NAME = "output_overlay.mp4"
 SIDE_BY_SIDE_VIDEO_NAME = "output_side_by_side.mp4"
@@ -218,6 +240,8 @@ class ReplayFrameRecord:
     face_rois_dropped_by_cap: int = 0
     gate_violations: str = ""
     slowest_stage: str = ""
+    motion_roi_bboxes: list[dict[str, Any]] = field(default_factory=list)
+    demo_bypass_motion_gate: bool = False
     total_end_to_end_ms: float | None = None
     pipeline_error: bool = False
     is_warmup: bool = False
@@ -245,6 +269,9 @@ class VisualReplayRunResult:
     max_processing_latency_ms: float
     total_person_detections: int
     total_face_detections: int
+    total_motion_regions_detected: int
+    total_recognized_faces: int
+    average_fps: float
     gateway_frames_in_total: int
     gateway_frames_published_total: int
     ips_processed_total: int
@@ -311,6 +338,7 @@ class RuntimeTraceCollector:
         self._thread_local = threading.local()
         self._by_frame: dict[str, dict[str, Any]] = {}
         self._rpm_ref: Any = None
+        self._motion_module: Any = None
         # per-frame timestamps for queue wait calculation
         self._enqueued_at_ms: dict[str, int] = {}
         self._rpm_started_at_ms: dict[str, int] = {}
@@ -365,6 +393,10 @@ class RuntimeTraceCollector:
             return original(frame_packet)
 
         sink.enqueue = _hooked
+
+    def install_motion_capture(self, motion_module: Any) -> None:
+        """Register the logging motion module to capture per-frame motion bboxes."""
+        self._motion_module = motion_module
 
     def get_queue_wait_ms(self, frame_id: str) -> float | None:
         """Return queue_wait_ms for a frame if both timestamps are available."""
@@ -443,6 +475,15 @@ class RuntimeTraceCollector:
             orch_stop_reason = str(metrics.get("stop_reason", ""))
             slowest = _slowest_stage_from_metrics(metrics)
             queue_wait_ms = self.get_queue_wait_ms(frame_id)
+            # collect motion region bboxes from the logging motion wrapper
+            captured_motion_bboxes: list[dict[str, Any]] = []
+            if self._motion_module is not None:
+                flush = getattr(self._motion_module, "flush_calls", None)
+                if callable(flush):
+                    for call in flush():
+                        for bbox in call.get("output", {}).get("bboxes", []):
+                            if isinstance(bbox, dict):
+                                captured_motion_bboxes.append(bbox)
             # also try to read output_build_ms from rpm directly
             build_ms_getter = getattr(self._rpm_ref, "get_last_output_build_ms", None)
             output_build_ms = 0.0
@@ -584,6 +625,10 @@ class RuntimeTraceCollector:
                     "gate_violations": "|".join(gate_violations) if gate_violations else "",
                     "stop_reason_from_orchestrator": orch_stop_reason,
                     "slowest_stage": slowest,
+                    "motion_roi_bboxes": captured_motion_bboxes,
+                    "demo_bypass_motion_gate": bool(
+                        metrics.get("demo_bypass_motion_gate", False)
+                    ),
                 },
             )
             return result
@@ -718,6 +763,8 @@ def _new_trace_row() -> dict[str, Any]:
         "slowest_stage": "",
         "stop_reason_from_orchestrator": "",
         "pipeline_error": False,
+        "motion_roi_bboxes": [],
+        "demo_bypass_motion_gate": False,
     }
 
 
@@ -795,6 +842,25 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_IPS_CONFIG_PATH,
         help="IPS YAML config path used to configure the service.",
+    )
+    parser.add_argument(
+        "--demo-render",
+        action="store_true",
+        help="Write the polished demo video with the summary screen.",
+    )
+    parser.add_argument(
+        "--demo-summary-seconds",
+        type=float,
+        default=DEMO_SUMMARY_SCREEN_SECONDS,
+        help="Duration of the appended summary screen when --demo-render is enabled.",
+    )
+    parser.add_argument(
+        "--demo-bypass-motion-gate",
+        action="store_true",
+        help=(
+            "Demo-only fallback: if motion returns zero regions, run object detection on a "
+            "full-frame ROI instead of stopping at no_motion. Disabled by default."
+        ),
     )
     return parser.parse_args()
 
@@ -901,10 +967,18 @@ def _resolve_object_detection_is_real(rpm_config: dict[str, Any]) -> bool:
     od_config_path = _resolve_repo_path(od_config_raw.strip())
     od_yaml = load_yaml_config(od_config_path)
     implementation_type = str(od_yaml.get("implementation_type", "stub")).strip().lower()
-    return implementation_type == "real"
+    is_real = implementation_type == "real"
+    print(f"[OD Resolution] Config path: {od_config_path}")
+    print(f"[OD Resolution] implementation_type: {implementation_type}")
+    print(f"[OD Resolution] mode: {'REAL' if is_real else 'STUB'}")
+    return is_real
 
 
-def _load_runtime_components(frame: np.ndarray, rpm_config_path: Path) -> Any:
+def _load_runtime_components(
+    frame: np.ndarray,
+    rpm_config_path: Path,
+    demo_bypass_motion_gate: bool,
+) -> Any:
     """Build runtime components using frame size and YAML-driven OD mode."""
     frame_height, frame_width = frame.shape[:2]
     rpm_config = load_yaml_config(rpm_config_path)
@@ -918,6 +992,7 @@ def _load_runtime_components(frame: np.ndarray, rpm_config_path: Path) -> Any:
         real_object_detection=real_object_detection,
         real_face_detection=True,
         real_face_recognition=True,
+        demo_bypass_motion_gate=demo_bypass_motion_gate,
     )
 
 
@@ -927,9 +1002,10 @@ def _build_service_for_frames(
     quality_mode: bool,
     rpm_config_path: Path,
     ips_config_path: Path,
+    demo_bypass_motion_gate: bool,
 ) -> tuple[ImageProcessingService, InMemoryFrameIngressTransport, Any]:
     """Create and configure the replay service using actual frame size."""
-    components = _load_runtime_components(frames[0], rpm_config_path)
+    components = _load_runtime_components(frames[0], rpm_config_path, demo_bypass_motion_gate)
     transport = InMemoryFrameIngressTransport()
     service = ImageProcessingService(
         rpm=components.rpm,
@@ -1274,6 +1350,10 @@ def _apply_trace_defaults(record: ReplayFrameRecord, trace_row: dict[str, Any]) 
     record.face_rois_dropped_by_cap = int(trace_row.get("face_rois_dropped_by_cap", 0))
     record.gate_violations = str(trace_row.get("gate_violations", ""))
     record.slowest_stage = str(trace_row.get("slowest_stage", ""))
+    motion_roi_bboxes = trace_row.get("motion_roi_bboxes", [])
+    if isinstance(motion_roi_bboxes, list):
+        record.motion_roi_bboxes = [bbox for bbox in motion_roi_bboxes if isinstance(bbox, dict)]
+    record.demo_bypass_motion_gate = bool(trace_row.get("demo_bypass_motion_gate", False))
 
 
 def _apply_rpm_metrics_to_record(record: ReplayFrameRecord, rpm_frame_metrics: dict[str, Any]) -> None:
@@ -1355,6 +1435,9 @@ def _apply_rpm_metrics_to_record(record: ReplayFrameRecord, rpm_frame_metrics: d
     )
     if not record.stop_reason_from_orchestrator:
         record.stop_reason_from_orchestrator = str(rpm_frame_metrics.get("stop_reason", ""))
+    record.demo_bypass_motion_gate = bool(
+        record.demo_bypass_motion_gate or rpm_frame_metrics.get("demo_bypass_motion_gate", False)
+    )
 
 
 def _optional_float(value: Any) -> float | None:
@@ -1498,53 +1581,99 @@ def _apply_cumulative_drop_totals(records: list[ReplayFrameRecord]) -> None:
         record.dropped_frames_total = dropped_total
 
 
-def _build_overlay_frame(record: ReplayFrameRecord, debug_trace_hud: bool) -> np.ndarray:
+def _build_overlay_frame(
+    record: ReplayFrameRecord,
+    debug_trace_hud: bool,
+    demo_mode: bool = False,
+    effective_fps: float | None = None,
+) -> np.ndarray:
     """Render detections and runtime HUD for one replayed frame."""
     overlay = record.original_frame.copy()
-    _draw_person_and_face_overlays(overlay, record.output or {})
-    _draw_runtime_hud(overlay, record, debug_trace_hud)
+    _draw_person_and_face_overlays(overlay, record, demo_mode)
+    _draw_runtime_hud(overlay, record, debug_trace_hud, demo_mode, effective_fps)
     return overlay
 
 
 def _draw_person_and_face_overlays(
     overlay: np.ndarray,
-    output: dict[str, Any],
+    record: ReplayFrameRecord,
+    demo_mode: bool = False,
 ) -> None:
     """Draw person, face, and label overlays from one RPM output."""
     frame_height, frame_width = overlay.shape[:2]
+    output = record.output or {}
+    if demo_mode:
+        for motion_bbox in record.motion_roi_bboxes:
+            _draw_labeled_bbox(
+                overlay,
+                motion_bbox,
+                frame_width,
+                frame_height,
+                color=MOTION_ROI_COLOR,
+                thickness=MOTION_BBOX_THICKNESS,
+                label="Motion ROI",
+                label_color=MOTION_ROI_COLOR,
+                label_scale=DEMO_FRAME_FONT_SCALE,
+                label_thickness=DEMO_FRAME_FONT_THICKNESS,
+                label_position="above",
+            )
+        if record.demo_bypass_motion_gate and not record.motion_roi_bboxes:
+            _draw_labeled_bbox(
+                overlay,
+                {"x": 1, "y": 1, "width": frame_width - 2, "height": frame_height - 2},
+                frame_width,
+                frame_height,
+                color=MOTION_ROI_COLOR,
+                thickness=2,
+                label="Demo Full Frame ROI",
+                label_color=MOTION_ROI_COLOR,
+                label_scale=DEMO_FRAME_FONT_SCALE,
+                label_thickness=DEMO_FRAME_FONT_THICKNESS,
+                label_position="above",
+            )
     for person in output.get("persons", []):
         person_bbox = person.get("person_bbox")
         if person_bbox:
-            x1, y1, x2, y2 = _clamp_bbox(person_bbox, frame_width, frame_height)
-            cv2.rectangle(
+            _draw_labeled_bbox(
                 overlay,
-                (x1, y1),
-                (x2, y2),
-                PERSON_COLOR,
-                BORDER_THICKNESS,
+                person_bbox,
+                frame_width,
+                frame_height,
+                color=PERSON_COLOR,
+                thickness=PERSON_BBOX_THICKNESS if demo_mode else BORDER_THICKNESS,
+                label="Person",
+                label_color=PERSON_COLOR,
+                label_scale=DEMO_FRAME_FONT_SCALE if demo_mode else FONT_SCALE,
+                label_thickness=DEMO_FRAME_FONT_THICKNESS if demo_mode else 1,
+                label_position="above",
             )
         for face in person.get("recognized_faces", []):
             face_bbox = face.get("face_bbox")
             if not face_bbox:
                 continue
-            x1, y1, x2, y2 = _clamp_bbox(face_bbox, frame_width, frame_height)
-            cv2.rectangle(
+            _draw_labeled_bbox(
                 overlay,
-                (x1, y1),
-                (x2, y2),
-                FACE_COLOR,
-                BORDER_THICKNESS,
+                face_bbox,
+                frame_width,
+                frame_height,
+                color=FACE_COLOR,
+                thickness=FACE_BBOX_THICKNESS if demo_mode else BORDER_THICKNESS,
+                label="Face",
+                label_color=FACE_COLOR,
+                label_scale=DEMO_FRAME_FONT_SCALE if demo_mode else FONT_SCALE,
+                label_thickness=DEMO_FRAME_FONT_THICKNESS if demo_mode else 1,
+                label_position="below",
             )
             label = _resolve_face_label(face)
-            cv2.putText(
+            x1, y1, x2, y2 = _clamp_bbox(face_bbox, frame_width, frame_height)
+            _draw_text_with_background(
                 overlay,
                 label,
-                (x1, max(HUD_ORIGIN_Y, y1 - 6)),
-                FONT,
-                FONT_SCALE,
+                (x1, y1),
                 FACE_COLOR,
-                1,
-                cv2.LINE_AA,
+                DEMO_FRAME_FONT_SCALE if demo_mode else FONT_SCALE,
+                RECOGNITION_LABEL_THICKNESS,
+                anchor="above",
             )
 
 
@@ -1572,12 +1701,87 @@ def _clamp_bbox(
     return x1, y1, x2, y2
 
 
+def _draw_labeled_bbox(
+    overlay: np.ndarray,
+    bbox: dict[str, Any],
+    frame_width: int,
+    frame_height: int,
+    color: tuple[int, int, int],
+    thickness: int,
+    label: str,
+    label_color: tuple[int, int, int],
+    label_scale: float,
+    label_thickness: int,
+    label_position: str,
+) -> None:
+    """Draw one labeled bbox and place the label where it remains readable."""
+    x1, y1, x2, y2 = _clamp_bbox(bbox, frame_width, frame_height)
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, thickness)
+    if label:
+        anchor_point = (x1, y1) if label_position == "above" else (x1, y2)
+        _draw_text_with_background(
+            overlay,
+            label,
+            anchor_point,
+            label_color,
+            label_scale,
+            label_thickness,
+            anchor=label_position,
+        )
+
+
+def _draw_text_with_background(
+    overlay: np.ndarray,
+    text: str,
+    anchor_point: tuple[int, int],
+    text_color: tuple[int, int, int],
+    font_scale: float,
+    thickness: int,
+    anchor: str = "above",
+    background_color: tuple[int, int, int] = (0, 0, 0),
+    padding: int = 4,
+) -> None:
+    """Draw anti-aliased text with a solid backing box for readability."""
+    if not text:
+        return
+    (text_width, text_height), baseline = cv2.getTextSize(text, FONT, font_scale, thickness)
+    x, y = anchor_point
+    if anchor == "above":
+        text_x = max(0, x)
+        text_y = max(text_height + padding, y - padding)
+        top_left = (max(0, text_x - padding), max(0, text_y - text_height - baseline - padding))
+    else:
+        text_x = max(0, x)
+        text_y = min(overlay.shape[0] - baseline - padding, y + text_height + padding)
+        top_left = (max(0, text_x - padding), max(0, text_y - text_height - baseline - padding))
+    bottom_right = (
+        min(overlay.shape[1] - 1, top_left[0] + text_width + (padding * 2)),
+        min(overlay.shape[0] - 1, top_left[1] + text_height + baseline + (padding * 2)),
+    )
+    cv2.rectangle(overlay, top_left, bottom_right, background_color, -1)
+    cv2.putText(
+        overlay,
+        text,
+        (top_left[0] + padding, bottom_right[1] - baseline - padding),
+        FONT,
+        font_scale,
+        text_color,
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
 def _draw_runtime_hud(
     overlay: np.ndarray,
     record: ReplayFrameRecord,
     debug_trace_hud: bool,
+    demo_mode: bool = False,
+    effective_fps: float | None = None,
 ) -> None:
     """Draw the runtime HUD and explicit status text for one frame."""
+    if demo_mode:
+        _draw_demo_hud(overlay, record, effective_fps)
+        return
     hud_lines = _build_hud_lines(record, debug_trace_hud)
     for index, line in enumerate(hud_lines):
         cv2.putText(
@@ -1600,6 +1804,238 @@ def _draw_runtime_hud(
         1,
         cv2.LINE_AA,
     )
+
+
+def _draw_demo_hud(
+    overlay: np.ndarray,
+    record: ReplayFrameRecord,
+    effective_fps: float | None,
+) -> None:
+    """Draw the demo HUD blocks in the upper corners."""
+    frame_height, frame_width = overlay.shape[:2]
+    left_lines = [
+        f"Camera: {DEMO_CAMERA_LABEL}",
+        f"Frame: {record.frame_index}",
+        f"FPS: {effective_fps:.2f}" if effective_fps is not None else "FPS: n/a",
+    ]
+    right_lines = [
+        f"Motion Regions: {record.motion_regions_count}",
+        f"Persons: {record.persons_count}",
+        f"Faces: {record.faces_count}",
+        f"Recognized: {record.recognized_faces_count}",
+    ]
+    _draw_text_panel(overlay, left_lines, (12, 12), align_right=False)
+    _draw_text_panel(overlay, right_lines, (frame_width - 12, 12), align_right=True)
+
+
+def _draw_text_panel(
+    overlay: np.ndarray,
+    lines: list[str],
+    origin: tuple[int, int],
+    align_right: bool,
+) -> None:
+    """Draw a semi-transparent panel with stacked demo text."""
+    if not lines:
+        return
+    font_scale = DEMO_HUD_FONT_SCALE
+    thickness = DEMO_HUD_THICKNESS
+    line_gap = 8
+    text_sizes = [cv2.getTextSize(line, FONT, font_scale, thickness) for line in lines]
+    widths = [size[0][0] for size in text_sizes]
+    heights = [size[0][1] for size in text_sizes]
+    baselines = [size[1] for size in text_sizes]
+    panel_width = max(widths) + 28
+    panel_height = sum(heights) + sum(baselines) + (line_gap * (len(lines) - 1)) + 20
+    if align_right:
+        x2 = origin[0]
+        x1 = max(0, x2 - panel_width)
+    else:
+        x1 = origin[0]
+        x2 = min(overlay.shape[1] - 1, x1 + panel_width)
+    y1 = origin[1]
+    y2 = min(overlay.shape[0] - 1, y1 + panel_height)
+    _draw_translucent_panel(overlay, (x1, y1), (x2, y2), SUMMARY_BACKGROUND_COLOR, 0.58)
+    cursor_y = y1 + 16
+    for index, line in enumerate(lines):
+        text_width = widths[index]
+        text_height = heights[index]
+        baseline = baselines[index]
+        text_x = x2 - text_width - 14 if align_right else x1 + 14
+        cv2.putText(
+            overlay,
+            line,
+            (text_x, cursor_y + text_height),
+            FONT,
+            font_scale,
+            SUMMARY_TEXT_COLOR,
+            thickness,
+            cv2.LINE_AA,
+        )
+        cursor_y += text_height + baseline + line_gap
+
+
+def _draw_translucent_panel(
+    overlay: np.ndarray,
+    top_left: tuple[int, int],
+    bottom_right: tuple[int, int],
+    color: tuple[int, int, int],
+    alpha: float,
+) -> None:
+    """Draw a semi-transparent rectangle overlay in place."""
+    x1, y1 = top_left
+    x2, y2 = bottom_right
+    x1 = max(0, min(x1, overlay.shape[1] - 1))
+    y1 = max(0, min(y1, overlay.shape[0] - 1))
+    x2 = max(x1 + 1, min(x2, overlay.shape[1] - 1))
+    y2 = max(y1 + 1, min(y2, overlay.shape[0] - 1))
+    roi = overlay[y1:y2, x1:x2]
+    fill = np.full_like(roi, color)
+    cv2.addWeighted(fill, alpha, roi, 1.0 - alpha, 0.0, roi)
+
+
+def _build_summary_screen_frame(
+    frame_size: tuple[int, int],
+    summary: dict[str, Any],
+    frame_index: int,
+    summary_frame_count: int,
+) -> np.ndarray:
+    """Create one frame for the final summary screen."""
+    frame_width, frame_height = frame_size
+    frame = np.full((frame_height, frame_width, 3), SUMMARY_BACKGROUND_COLOR, dtype=np.uint8)
+    _draw_translucent_panel(
+        frame,
+        (0, 0),
+        (frame_width - 1, frame_height - 1),
+        SUMMARY_BACKGROUND_COLOR,
+        SUMMARY_CARD_ALPHA,
+    )
+    card_margin_x = max(36, frame_width // 12)
+    card_margin_y = max(28, frame_height // 10)
+    card_top = card_margin_y
+    card_bottom = frame_height - card_margin_y
+    card_left = card_margin_x
+    card_right = frame_width - card_margin_x
+    _draw_translucent_panel(
+        frame,
+        (card_left, card_top),
+        (card_right, card_bottom),
+        SUMMARY_CARD_COLOR,
+        0.90,
+    )
+    _draw_centered_text(
+        frame,
+        "Camera Recognition Pipeline Demo",
+        (frame_width // 2, card_top + 54),
+        SUMMARY_TEXT_COLOR,
+        SUMMARY_TITLE_FONT_SCALE,
+        2,
+    )
+    checklist_lines = [
+        ("\u2713 Motion Detection", SUMMARY_SUCCESS_COLOR),
+        ("\u2713 Object Detection", SUMMARY_SUCCESS_COLOR),
+        ("\u2713 Face Detection", SUMMARY_SUCCESS_COLOR),
+        ("\u2713 Face Recognition", SUMMARY_SUCCESS_COLOR),
+    ]
+    checklist_y = card_top + 108
+    for text, color in checklist_lines:
+        _draw_centered_text(
+            frame,
+            text,
+            (frame_width // 2, checklist_y),
+            color,
+            SUMMARY_SECTION_FONT_SCALE,
+            2,
+        )
+        checklist_y += 34
+    stats_lines = [
+        f"Processed Frames: {summary.get('frames_processed', 0)}",
+        f"Motion Regions Detected: {summary.get('total_motion_regions_detected', 0)}",
+        f"Persons Detected: {summary.get('total_person_detections', 0)}",
+        f"Faces Detected: {summary.get('total_face_detections', 0)}",
+        f"Recognized Faces: {summary.get('total_recognized_faces', 0)}",
+    ]
+    stats_y = checklist_y + 22
+    _draw_centered_text(
+        frame,
+        "Statistics:",
+        (frame_width // 2, stats_y),
+        SUMMARY_ACCENT_COLOR,
+        SUMMARY_SECTION_FONT_SCALE,
+        2,
+    )
+    stats_y += 34
+    for text in stats_lines:
+        _draw_centered_text(
+            frame,
+            text,
+            (frame_width // 2, stats_y),
+            SUMMARY_TEXT_COLOR,
+            SUMMARY_DETAIL_FONT_SCALE,
+            1,
+        )
+        stats_y += 28
+    diagram_top = card_bottom - 145
+    _draw_centered_text(
+        frame,
+        "Motion Detection",
+        (frame_width // 2, diagram_top),
+        SUMMARY_TEXT_COLOR,
+        SUMMARY_DETAIL_FONT_SCALE,
+        1,
+    )
+    _draw_centered_text(frame, "\u2193", (frame_width // 2, diagram_top + 22), SUMMARY_ACCENT_COLOR, 0.7, 1)
+    _draw_centered_text(
+        frame,
+        "Object Detection",
+        (frame_width // 2, diagram_top + 48),
+        SUMMARY_TEXT_COLOR,
+        SUMMARY_DETAIL_FONT_SCALE,
+        1,
+    )
+    _draw_centered_text(frame, "\u2193", (frame_width // 2, diagram_top + 70), SUMMARY_ACCENT_COLOR, 0.7, 1)
+    _draw_centered_text(
+        frame,
+        "Face Detection",
+        (frame_width // 2, diagram_top + 96),
+        SUMMARY_TEXT_COLOR,
+        SUMMARY_DETAIL_FONT_SCALE,
+        1,
+    )
+    _draw_centered_text(frame, "\u2193", (frame_width // 2, diagram_top + 118), SUMMARY_ACCENT_COLOR, 0.7, 1)
+    _draw_centered_text(
+        frame,
+        "Face Recognition",
+        (frame_width // 2, diagram_top + 144),
+        SUMMARY_TEXT_COLOR,
+        SUMMARY_DETAIL_FONT_SCALE,
+        1,
+    )
+    _draw_text_with_background(
+        frame,
+        f"Summary {frame_index + 1}/{summary_frame_count}",
+        (card_left + 18, card_bottom - 18),
+        SUMMARY_ACCENT_COLOR,
+        0.52,
+        1,
+        anchor="above",
+    )
+    return frame
+
+
+def _draw_centered_text(
+    frame: np.ndarray,
+    text: str,
+    center_point: tuple[int, int],
+    color: tuple[int, int, int],
+    font_scale: float,
+    thickness: int,
+) -> None:
+    """Draw centered anti-aliased text."""
+    (text_width, text_height), baseline = cv2.getTextSize(text, FONT, font_scale, thickness)
+    center_x, center_y = center_point
+    x = max(0, center_x - (text_width // 2))
+    y = max(text_height + baseline, center_y)
+    cv2.putText(frame, text, (x, y), FONT, font_scale, color, thickness, cv2.LINE_AA)
 
 
 def _build_hud_lines(record: ReplayFrameRecord, debug_trace_hud: bool) -> list[str]:
@@ -1712,9 +2148,12 @@ def _render_videos(
     enable_side_by_side: bool,
     sample_frame_interval: int,
     debug_trace_hud: bool,
-) -> tuple[Path, Path | None, Path | None]:
+    demo_mode: bool = False,
+    summary_screen_seconds: float = 0.0,
+    overlay_video_name: str = OVERLAY_VIDEO_NAME,
+) -> tuple[Path, Path | None, Path | None, int]:
     """Render overlay and side-by-side videos from merged frame records."""
-    overlay_path = output_dir / OVERLAY_VIDEO_NAME
+    overlay_path = output_dir / overlay_video_name
     side_by_side_path = output_dir / SIDE_BY_SIDE_VIDEO_NAME
     sample_frames_dir: Path | None = None
     height, width = records[0].original_frame.shape[:2]
@@ -1725,9 +2164,10 @@ def _render_videos(
     if sample_frame_interval > 0:
         sample_frames_dir = output_dir / SAMPLE_FRAMES_DIR_NAME
         sample_frames_dir.mkdir(parents=True, exist_ok=True)
+    summary_frame_count = 0
     try:
         for record in records:
-            overlay_frame = _build_overlay_frame(record, debug_trace_hud)
+            overlay_frame = _build_overlay_frame(record, debug_trace_hud, demo_mode, fps)
             overlay_writer.write(overlay_frame)
             record.rendered_at_ms = int(time.monotonic() * 1000)
             end_to_end_ms = _delta_ms(record.submitted_at_ms, record.rendered_at_ms)
@@ -1738,11 +2178,29 @@ def _render_videos(
                     _compose_side_by_side(record.original_frame, overlay_frame)
                 )
             _write_sample_frame(sample_frames_dir, sample_frame_interval, record, overlay_frame)
+        if demo_mode and summary_screen_seconds > 0.0:
+            summary_frame_count = max(1, int(round(summary_screen_seconds * fps)))
+            summary_payload = _build_demo_summary_payload(records, fps)
+            for index in range(summary_frame_count):
+                summary_frame = _build_summary_screen_frame(
+                    (width, height),
+                    summary_payload,
+                    index,
+                    summary_frame_count,
+                )
+                overlay_writer.write(summary_frame)
+                if side_by_side_writer is not None:
+                    side_by_side_writer.write(_compose_side_by_side(summary_frame, summary_frame))
     finally:
         overlay_writer.release()
         if side_by_side_writer is not None:
             side_by_side_writer.release()
-    return overlay_path, side_by_side_path if enable_side_by_side else None, sample_frames_dir
+    return (
+        overlay_path,
+        side_by_side_path if enable_side_by_side else None,
+        sample_frames_dir,
+        summary_frame_count,
+    )
 
 
 def _write_sample_frame(
@@ -1758,6 +2216,20 @@ def _write_sample_frame(
         return
     target_path = sample_frames_dir / f"{SAMPLE_FRAME_STEM}_{record.frame_index:06d}.png"
     cv2.imwrite(str(target_path), overlay_frame)
+
+
+def _build_demo_summary_payload(records: list[ReplayFrameRecord], fps: float) -> dict[str, Any]:
+    """Build the counts needed for the final demo summary card."""
+    return {
+        "frames_processed": sum(1 for record in records if record.output is not None),
+        "total_motion_regions_detected": sum(
+            max(len(record.motion_roi_bboxes), record.motion_regions_count) for record in records
+        ),
+        "total_person_detections": sum(record.persons_count for record in records),
+        "total_face_detections": sum(record.faces_count for record in records),
+        "total_recognized_faces": sum(record.recognized_faces_count for record in records),
+        "average_fps": float(fps),
+    }
 
 
 def _write_metrics_csv(output_dir: Path, records: list[ReplayFrameRecord]) -> Path:
@@ -1842,6 +2314,7 @@ def _runtime_trace_fieldnames() -> list[str]:
         "status",
         "motion_stage_ran",
         "motion_detected",
+        "demo_bypass_motion_gate",
         "motion_regions_count",
         "motion_regions_dropped_by_cap",
         "raw_motion_regions_count",
@@ -1932,6 +2405,7 @@ def _record_to_runtime_trace_row(record: ReplayFrameRecord) -> dict[str, Any]:
         "status": record.trace_status,
         "motion_stage_ran": record.motion_stage_ran,
         "motion_detected": record.motion_detected,
+        "demo_bypass_motion_gate": record.demo_bypass_motion_gate,
         "motion_regions_count": record.motion_regions_count,
         "motion_regions_dropped_by_cap": record.motion_regions_dropped_by_cap,
         "raw_motion_regions_count": record.raw_motion_regions_count,
@@ -2186,6 +2660,9 @@ def _build_runtime_trace_summary(records: list[ReplayFrameRecord]) -> dict[str, 
         ),
         "total_motion_stage_ran": sum(1 for r in records_for_summary if r.motion_stage_ran),
         "total_motion_detected": sum(1 for r in records_for_summary if r.motion_detected),
+        "total_demo_bypass_frames": sum(
+            1 for r in records_for_summary if r.demo_bypass_motion_gate
+        ),
         "total_object_detection_stage_ran": sum(
             1 for r in records_for_summary if r.object_detection_stage_ran
         ),
@@ -2594,6 +3071,7 @@ def _build_summary(
     components: Any,
     warmup_records: list[ReplayFrameRecord],
     trace_summary: dict[str, Any],
+    average_fps: float,
 ) -> dict[str, Any]:
     """Build the summary payload written to summary.json."""
     latencies = [
@@ -2607,6 +3085,11 @@ def _build_summary(
     ) + int(gateway_health.sink_enqueue_rejected_total)
     total_person_detections = sum(record.persons_count for record in records)
     total_face_detections = sum(record.faces_count for record in records)
+    total_motion_regions_detected = sum(
+        max(len(record.motion_roi_bboxes), record.motion_regions_count) for record in records
+    )
+    total_demo_bypass_frames = sum(1 for record in records if record.demo_bypass_motion_gate)
+    total_recognized_faces = sum(record.recognized_faces_count for record in records)
     return {
         "input_video_path": str(input_video_path),
         "output_dir": str(output_dir),
@@ -2625,10 +3108,22 @@ def _build_summary(
         "frames_rendered": len(records),
         "frames_dropped": frames_dropped,
         "stale_frames_dropped": int(final_health.stale_frames_dropped_total),
+        "average_fps": float(average_fps),
         "average_processing_latency_ms": _average(latencies),
         "max_processing_latency_ms": _maximum(latencies),
+        "total_motion_regions_detected": total_motion_regions_detected,
+        "demo_bypass_motion_gate_used": total_demo_bypass_frames > 0,
+        "total_demo_bypass_frames": total_demo_bypass_frames,
+        "total_object_detections": total_person_detections,
+        "total_object_detection_stage_ran": int(
+            trace_summary.get("total_object_detection_stage_ran", 0)
+        ),
+        "total_face_detection_stage_ran": int(
+            trace_summary.get("total_face_detection_stage_ran", 0)
+        ),
         "total_person_detections": total_person_detections,
         "total_face_detections": total_face_detections,
+        "total_recognized_faces": total_recognized_faces,
         "gateway_frames_in_total": int(gateway_health.frames_in_total),
         "gateway_frames_published_total": int(gateway_health.frames_published_total),
         "ips_accepted_total": int(service._metrics.get_camera_counter(CAMERA_ID, "accepted_per_camera")),
@@ -2686,10 +3181,13 @@ def _result_from_summary(summary: dict[str, Any]) -> VisualReplayRunResult:
         frames_rendered=int(summary["frames_rendered"]),
         frames_dropped=int(summary["frames_dropped"]),
         stale_frames_dropped=int(summary["stale_frames_dropped"]),
+        average_fps=float(summary.get("average_fps", 0.0)),
         average_processing_latency_ms=float(summary["average_processing_latency_ms"]),
         max_processing_latency_ms=float(summary["max_processing_latency_ms"]),
         total_person_detections=int(summary["total_person_detections"]),
         total_face_detections=int(summary["total_face_detections"]),
+        total_motion_regions_detected=int(summary.get("total_motion_regions_detected", 0)),
+        total_recognized_faces=int(summary.get("total_recognized_faces", 0)),
         gateway_frames_in_total=int(summary["gateway_frames_in_total"]),
         gateway_frames_published_total=int(summary["gateway_frames_published_total"]),
         ips_processed_total=int(summary["ips_processed_total"]),
@@ -2711,8 +3209,13 @@ def run_visual_replay(
     debug_trace_hud: bool = False,
     rpm_config_path: Path = DEFAULT_RPM_CONFIG_PATH,
     ips_config_path: Path = DEFAULT_IPS_CONFIG_PATH,
+    demo_mode: bool = False,
+    summary_screen_seconds: float = 0.0,
+    demo_bypass_motion_gate: bool = False,
 ) -> VisualReplayRunResult:
     """Run the real single-camera visual replay and return output metadata."""
+    if demo_mode and summary_screen_seconds <= 0.0:
+        summary_screen_seconds = DEMO_SUMMARY_SCREEN_SECONDS
     target_video_path = _resolve_input_video_path(input_video_path)
     target_output_dir, replay_fps = _resolve_replay_mode_defaults(
         quality_mode,
@@ -2738,6 +3241,7 @@ def run_visual_replay(
         quality_mode,
         rpm_config_path,
         ips_config_path,
+        demo_bypass_motion_gate,
     )
     result_handler.attach_rpm(components.rpm)
     trace_collector.install(components.rpm)
@@ -2791,14 +3295,20 @@ def run_visual_replay(
         int(final_health.stale_frames_dropped_total),
         frames_dropped,
     )
-    overlay_path, side_by_side_path, sample_frames_dir = _render_videos(
+    render_start = time.monotonic()
+    overlay_path, side_by_side_path, sample_frames_dir, summary_frame_count = _render_videos(
         records,
         target_output_dir,
         effective_fps,
         enable_side_by_side,
         sample_frame_interval,
         debug_trace_hud,
+        demo_mode=demo_mode,
+        summary_screen_seconds=summary_screen_seconds,
+        overlay_video_name=DEMO_OVERLAY_VIDEO_NAME if demo_mode else OVERLAY_VIDEO_NAME,
     )
+    render_seconds = max(time.monotonic() - render_start, 1e-6)
+    average_fps = len(records) / render_seconds
     metrics_path = _write_metrics_csv(target_output_dir, records)
     _write_runtime_trace_csv(target_output_dir, all_records)
     trace_summary = _build_runtime_trace_summary(all_records)
@@ -2818,7 +3328,10 @@ def run_visual_replay(
         components,
         warmup_records,
         trace_summary,
+        average_fps,
     )
+    summary["demo_mode"] = demo_mode
+    summary["summary_screen_frames"] = summary_frame_count
     summary_path = _write_summary_json(target_output_dir, summary)
     summary["summary_path"] = str(summary_path)
     _print_console_report(summary, trace_summary)
@@ -2831,6 +3344,32 @@ def _print_console_report(summary: dict[str, Any], trace_summary: dict[str, Any]
     warmup = trace_summary.get("warmup_section", {})
     averages = trace_summary.get("average_latency_ms_by_stage", {})
     maximums = trace_summary.get("max_latency_ms_by_stage", {})
+    print("Demo video statistics:")
+    print(f"  Total frames processed: {summary.get('frames_processed', 0)}")
+    print(f"  Average FPS: {float(summary.get('average_fps', 0.0)):.2f}")
+    print(f"  Total motion regions detected: {summary.get('total_motion_regions_detected', 0)}")
+    print(
+        "  Demo bypass motion gate used: "
+        f"{bool(summary.get('demo_bypass_motion_gate_used', False))}"
+    )
+    print(
+        "  demo_bypass_motion_gate="
+        f"{'true' if summary.get('demo_bypass_motion_gate_used', False) else 'false'}"
+    )
+    print(f"  Demo bypass frames: {summary.get('total_demo_bypass_frames', 0)}")
+    print(
+        "  Total object detection stage ran: "
+        f"{summary.get('total_object_detection_stage_ran', 0)}"
+    )
+    print(f"  Total object detections: {summary.get('total_object_detections', 0)}")
+    print(
+        "  Total face detection stage ran: "
+        f"{summary.get('total_face_detection_stage_ran', 0)}"
+    )
+    print(f"  Total persons detected: {summary.get('total_person_detections', 0)}")
+    print(f"  Total faces detected: {summary.get('total_face_detections', 0)}")
+    print(f"  Total recognized faces: {summary.get('total_recognized_faces', 0)}")
+    print(f"  Output overlay path: {summary.get('output_overlay_path', '')}")
     print("Replay diagnostics:")
     print(
         "  Warmup frames: "
@@ -2879,6 +3418,9 @@ def main() -> int:
             debug_trace_hud=args.debug_trace_hud,
             rpm_config_path=args.rpm_config_path,
             ips_config_path=args.ips_config_path,
+            demo_mode=args.demo_render,
+            summary_screen_seconds=args.demo_summary_seconds if args.demo_render else 0.0,
+            demo_bypass_motion_gate=args.demo_bypass_motion_gate,
         )
     except VisualReplayError as exc:
         print(f"[FATAL] {exc}")
