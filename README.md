@@ -8,6 +8,18 @@ Designed using a **Spec-Driven Development** approach with a focus on **real-tim
 
 ---
 
+## Demo
+
+<p align="center">
+  <img src="assets/demo.gif" width="250">
+</p>
+
+<p align="center">
+  <i>Real-time visual replay of the complete recognition pipeline</i>
+</p>
+
+---
+
 ## Architecture
 
 ```mermaid
@@ -99,17 +111,6 @@ Detailed design specifications covering system architecture, runtime processing 
 * [Recognition Pipeline Manager](doc/image_processing_service/RecognitionPipelineManager.md)
 * [Frame Ingestion Gateway](doc/image_processing_service/frame_ingestion_gateway.md)
 
----
-
-## Demo
-
-<p align="center">
-  <img src="assets/demo.gif" width="450">
-</p>
-
-**Recognition Pipeline**
-
-Motion Detection → Object Detection → Face Detection → Face Recognition → Identity Matching
 ---
 
 ## Author
