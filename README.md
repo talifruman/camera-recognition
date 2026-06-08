@@ -1,8 +1,8 @@
 # Camera Recognition System
 
-### Real-Time Multi-Camera Person & Face Recognition Platform
+### Multi-Camera Identity Recognition System
 
-A modular computer vision system that processes multiple camera streams concurrently, detects motion, identifies people, recognizes faces, and generates identity-aware recognition events.
+A modular computer vision platform that processes multiple camera streams concurrently, performs motion, person, and face recognition, and generates identity-aware recognition events in real time.
 
 Designed using a **Spec-Driven Development** approach with a focus on **real-time processing**, **scalability**, **system architecture**.
 
