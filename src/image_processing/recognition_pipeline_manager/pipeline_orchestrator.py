@@ -77,6 +77,7 @@ class PipelineOrchestrator:
         max_motion_rois_per_frame: int = 8,
         max_person_rois_per_frame: int = 16,
         max_face_rois_per_frame: int = 32,
+        demo_bypass_motion_gate: bool = False,
     ) -> None:
         self._ftl = ftl
         self._motion = motion
@@ -88,6 +89,7 @@ class PipelineOrchestrator:
         self._max_motion_rois_per_frame = max(1, int(max_motion_rois_per_frame))
         self._max_person_rois_per_frame = max(1, int(max_person_rois_per_frame))
         self._max_face_rois_per_frame = max(1, int(max_face_rois_per_frame))
+        self._demo_bypass_motion_gate = bool(demo_bypass_motion_gate)
         self._last_frame_metrics: dict[str, Any] = self._new_frame_metrics()
 
         # Cache stage input contracts at init time — immutable for lifetime (C2)
@@ -211,6 +213,7 @@ class PipelineOrchestrator:
             "motion_roi_largest_area": int(m["motion_roi_largest_area"]),
             "motion_roi_smallest_area": int(m["motion_roi_smallest_area"]),
             "motion_roi_total_area": int(m["motion_roi_total_area"]),
+            "demo_bypass_motion_gate": bool(m["demo_bypass_motion_gate"]),
             "person_rois_raw_count": int(m["person_rois_raw_count"]),
             "person_rois_dropped_by_cap": int(m["person_rois_dropped_by_cap"]),
             "face_rois_raw_count": int(m["face_rois_raw_count"]),
@@ -341,11 +344,6 @@ class PipelineOrchestrator:
         execution_state.frame_metrics["motion_detected"] = bool(motion_result["detected"])
         execution_state.frame_metrics["motion_regions_raw_count"] = len(motion_result["bboxes"])
 
-        if not motion_result["detected"]:
-            execution_state.frame_metrics["stop_reason"] = "no_motion"
-            self._last_frame_metrics = execution_state.frame_metrics
-            return empty
-
         selected_motion_bboxes = self._limit_bboxes_by_area(
             motion_result["bboxes"],
             self._max_motion_rois_per_frame,
@@ -366,15 +364,20 @@ class PipelineOrchestrator:
             execution_state.frame_metrics["motion_roi_smallest_area"] = min(_roi_areas)
             execution_state.frame_metrics["motion_roi_total_area"] = sum(_roi_areas)
 
-        if not selected_motion_bboxes:
-            execution_state.frame_metrics["stop_reason"] = "no_motion_regions"
+        od_motion_bboxes = list(selected_motion_bboxes)
+        if (not motion_result["detected"] or not selected_motion_bboxes) and self._demo_bypass_motion_gate:
+            od_motion_bboxes = [full_frame_bbox]
+            execution_state.frame_metrics["demo_bypass_motion_gate"] = True
+
+        if not od_motion_bboxes:
+            execution_state.frame_metrics["stop_reason"] = "no_motion" if not motion_result["detected"] else "no_motion_regions"
             self._last_frame_metrics = execution_state.frame_metrics
             return empty
 
         # Step 5 — process each motion region through OD → FD → FR
         persons: list[PersonResult] = []
 
-        for motion_bbox in selected_motion_bboxes:
+        for motion_bbox in od_motion_bboxes:
             execution_state.frame_metrics["od_roi_requests_count"] += 1
             self._process_motion_region(
                 cache=frame_cache,
@@ -1002,6 +1005,7 @@ class PipelineOrchestrator:
             "motion_roi_largest_area": 0,
             "motion_roi_smallest_area": 0,
             "motion_roi_total_area": 0,
+            "demo_bypass_motion_gate": False,
             "person_rois_raw_count": 0,
             "person_rois_dropped_by_cap": 0,
             "face_rois_raw_count": 0,
@@ -1070,7 +1074,10 @@ def _determine_stop_reason_from_state(frame_metrics: dict) -> str:
     """Determine the final stop_reason after the full pipeline loop completes."""
     if not frame_metrics["motion_stage_ran"]:
         return "cold_start"
-    if not frame_metrics["motion_detected"]:
+    bypass_used = bool(frame_metrics.get("demo_bypass_motion_gate", False))
+    if not frame_metrics["motion_detected"] and not (
+        bypass_used and frame_metrics["object_detection_call_count"] > 0
+    ):
         return "no_motion"
     if frame_metrics["object_detection_call_count"] == 0:
         return "no_motion_regions"

@@ -98,6 +98,7 @@ def _make_rpm(
     face_det: FakeFaceDetection,
     face_rec: FakeFaceRecognition,
     person_dir: FakePersonDirectory,
+    demo_bypass_motion_gate: bool = False,
 ) -> RecognitionPipelineManager:
     return RecognitionPipelineManager(
         ftl=ftl,
@@ -106,6 +107,7 @@ def _make_rpm(
         face_det=face_det,
         face_rec=face_rec,
         person_dir=person_dir,
+        demo_bypass_motion_gate=demo_bypass_motion_gate,
     )
 
 
@@ -221,6 +223,39 @@ class TestNoMotion:
         rpm.process_frame(_make_packet())
 
         assert len(motion.calls) == 1
+
+    def test_no_motion_with_demo_bypass_runs_object_detection_full_frame(self):
+        motion = FakeMotionDetection(result=MotionResult(detected=False, bboxes=[]))
+        od = FakeObjectDetection()
+        rpm = _default_rpm(
+            motion=motion,
+            object_det=od,
+            demo_bypass_motion_gate=True,
+        )
+
+        rpm.process_frame(_make_packet())
+        metrics = rpm.get_last_frame_metrics()
+
+        assert len(od.calls) == 1
+        assert od.calls[0]["roi_bbox_frame"] == {
+            "x": 0,
+            "y": 0,
+            "width": _FRAME_W,
+            "height": _FRAME_H,
+        }
+        assert metrics["motion_detected"] is False
+        assert metrics["demo_bypass_motion_gate"] is True
+
+    def test_no_motion_without_demo_bypass_keeps_original_gate(self):
+        motion = FakeMotionDetection(result=MotionResult(detected=False, bboxes=[]))
+        od = FakeObjectDetection()
+        rpm = _default_rpm(motion=motion, object_det=od)
+
+        rpm.process_frame(_make_packet())
+        metrics = rpm.get_last_frame_metrics()
+
+        assert len(od.calls) == 0
+        assert metrics["demo_bypass_motion_gate"] is False
 
 
 # ---------------------------------------------------------------------------

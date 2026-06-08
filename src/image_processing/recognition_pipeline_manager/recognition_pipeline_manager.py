@@ -62,6 +62,7 @@ class RecognitionPipelineManager:
         max_motion_rois_per_frame: int = 8,
         max_person_rois_per_frame: int = 16,
         max_face_rois_per_frame: int = 32,
+        demo_bypass_motion_gate: bool = False,
     ) -> None:
         spatial = SpatialCoordinator()
         self._validator = RecognitionPipelineInputValidator()
@@ -76,6 +77,7 @@ class RecognitionPipelineManager:
             max_motion_rois_per_frame=max_motion_rois_per_frame,
             max_person_rois_per_frame=max_person_rois_per_frame,
             max_face_rois_per_frame=max_face_rois_per_frame,
+            demo_bypass_motion_gate=demo_bypass_motion_gate,
         )
         self._builder = RecognitionPipelineOutputBuilder()
         self._last_output_build_ms: float = 0.0

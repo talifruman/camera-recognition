@@ -318,6 +318,7 @@ def build_runtime_components(
     real_object_detection: bool,
     real_face_detection: bool,
     real_face_recognition: bool,
+    demo_bypass_motion_gate: bool = False,
 ) -> RuntimeComponents:
     motion_bbox, person_bbox_local, face_bbox_local, fake_landmarks = _build_stub_detections(frame_width, frame_height)
 
@@ -488,6 +489,7 @@ def build_runtime_components(
         max_motion_rois_per_frame=max_motion_rois,
         max_person_rois_per_frame=max_person_rois,
         max_face_rois_per_frame=max_face_rois,
+        demo_bypass_motion_gate=demo_bypass_motion_gate,
     )
 
     print("[MODULE MODE]")
