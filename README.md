@@ -103,8 +103,11 @@ Detailed design specifications covering system architecture, runtime processing 
 
 ## Demo
 
-*Demo GIF / Video coming soon*
+<p align="center">
+  <img src="assets/demo.gif" width="800">
+</p>
 
+Motion Detection → Object Detection → Face Detection → Face Recognition
 ---
 
 ## Author
