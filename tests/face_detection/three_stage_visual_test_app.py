@@ -10,7 +10,7 @@ Gallery loading
 ---------------
 At startup, FaceGalleryLoaderModule reads real .npy embeddings from
 ``data/generated_face_gallery/`` (built by
-``build_real_face_gallery_from_images.py``).  The gallery is loaded once and
+``tools/build_real_face_gallery_from_images.py``).  The gallery is loaded once and
 held in memory for the entire run.
 
 Recognition pass

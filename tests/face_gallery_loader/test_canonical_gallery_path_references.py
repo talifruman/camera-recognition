@@ -9,7 +9,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CANONICAL_GALLERY_PATH = "generated_face_gallery"
 LEGACY_GALLERY_PATH = f"{CANONICAL_GALLERY_PATH}_real"
 FILES_THAT_MUST_USE_CANONICAL_PATH = (
-    "build_real_face_gallery_from_images.py",
+    "tools/build_real_face_gallery_from_images.py",
     "scripts/validate_face_gallery.py",
     "tools/rpm_visual_debug_runner.py",
     "tests/face_detection/three_stage_visual_test_app.py",
