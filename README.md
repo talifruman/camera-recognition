@@ -111,7 +111,6 @@ Detailed design specifications covering system architecture, runtime processing 
 * [Recognition Pipeline Manager](doc/image_processing_service/RecognitionPipelineManager.md)
 * [Frame Ingestion Gateway](doc/image_processing_service/frame_ingestion_gateway.md)
 
----
 
 ## Author
 
