@@ -1,59 +1,119 @@
-# Camera-regogintion
+# Camera Recognition System
 
-## Current Architecture Snapshot
+### Real-Time Multi-Camera Person & Face Recognition Platform
 
-The system currently follows an event-driven pipeline for camera monitoring on a single-host MVP baseline.
+A modular computer vision system that processes multiple camera streams concurrently, detects motion, identifies people, recognizes faces, and generates identity-aware recognition events.
 
-- Camera Service publishes normalized frames.
-- Image processing service performs motion, object, face detection, and recognition.
-- Frame Buffer Service maintains pre/post-roll frame history.
-- Event Service creates canonical events and drives downstream actions.
-- Media Service (merged Clip Recording + Storage boundary) fetches frame ranges, builds MP4 clips, and persists media artifacts.
-- Telegram Notification Service sends event alerts after clip readiness.
+Designed using a **Spec-Driven Development** approach with a focus on **real-time processing**, **scalability**, **system architecture**.
 
-## Event-Triggered Clip Flow
+---
 
-1. Image processing service emits person or motion-derived event signals.
-2. Event Service publishes event.created.
-3. Media Service reads event.created, requests frame window from Frame Buffer Service, muxes MP4, persists clip, and emits event.clip.ready.
-4. Telegram Notification Service consumes event.clip.ready and sends rich notification payloads.
+## Architecture
 
-See [doc/system.md](doc/system.md) for the full architecture, sequence diagrams, and API surface.
+```mermaid
+flowchart TB
 
-## IPS Single-Camera Visual Replay
+    Cameras["Multiple Cameras"]
 
-Place the replay video at:
+    Gateway["Frame Ingestion Gateway"]
 
-- `tests/visual_assets/image_processing_service/videos/single_camera_test.mp4`
-- `tests/image_processing_service/videos/single_camera_test.mp4` (supported fallback path)
+    IPS["Image Processing Service"]
 
-Run the replay runner:
+    subgraph LaneA["Camera Processing Lane A"]
+        QueueA["Queue"]
+        RPMA["Recognition Pipeline"]
+        QueueA --> RPMA
+    end
 
-- `c:/Users/talif/Desktop/Camera-regogintion/.venv/Scripts/python.exe tests/image_processing_service/visual_replay_single_camera.py`
+    subgraph LaneB["Camera Processing Lane B"]
+        QueueB["Queue"]
+        RPMB["Recognition Pipeline"]
+        QueueB --> RPMB
+    end
 
-Optional replay flags:
+    subgraph LaneN["Camera Processing Lane N"]
+        QueueN["Queue"]
+        RPMN["Recognition Pipeline"]
+        QueueN --> RPMN
+    end
 
-- `--replay-fps <fps>` to pace frame injection (for example `--replay-fps 5`)
-- `--quality-mode` to slow replay ingress and relax IPS freshness limits for completeness-first runs
-- `--side-by-side` to write left-original/right-overlay output video
-- `--sample-frame-interval <N>` to write `sample_frames/*.png` every N frames
+    Cameras --> Gateway
+    Gateway --> IPS
 
-Run the integration test:
+    IPS --> QueueA
+    IPS --> QueueB
+    IPS --> QueueN
+```
 
-- `python.exe -m pytest tests/image_processing_service/test_image_processing_service_visual_replay_single_camera.py -q`
+---
 
-Replay outputs are written to:
+## Recognition Pipeline
 
-- `tests/results/image_processing_service_visual/single_camera/output_overlay.mp4`
-- `tests/results/image_processing_service_visual/single_camera/summary.json`
-- `tests/results/image_processing_service_visual/single_camera/metrics.csv`
-- `tests/results/image_processing_service_visual/single_camera/output_side_by_side.mp4` (when `--side-by-side` is enabled)
-- `tests/results/image_processing_service_visual/single_camera/sample_frames/*.png` (when sample frame interval is enabled)
-- `tests/results/image_processing_service_visual/single_camera_quality_mode/` when `--quality-mode` is enabled and no custom output directory is provided
+```mermaid
+flowchart LR
 
-Visual checks to perform:
+    Frame["Frame"]
+    Motion["Motion Detection"]
+    Person["Person Detection"]
+    Face["Face Detection"]
+    Recognition["Face Recognition"]
+    Identity["Identity Matching"]
 
-- Detection alignment between frame content and rendered person/face boxes
-- Runtime HUD progression across frame index, queue depth, and latency values
-- Explicit status rendering for no detections, stale dropped, skipped, or dropped frames
-- Side-by-side correspondence between original timing and overlay timing
+    Frame --> Motion
+    Motion --> Person
+    Person --> Face
+    Face --> Recognition
+    Recognition --> Identity
+```
+
+---
+
+## Engineering Highlights
+
+* Multi-Camera Processing
+* Per-Camera Isolation
+* Real-Time First Design
+* Multi-Threaded Architecture
+* Bounded Queue Architecture
+* Queue-Based Backpressure Management
+* Motion-Gated Processing
+* Runtime Metrics & Diagnostics
+* Replay Framework
+* Config-Driven Runtime Behavior
+* Spec-Driven Development
+* 500+ Automated Tests
+
+---
+
+## Technologies
+
+**Python • OpenCV • YOLO • ONNX Runtime • NumPy • Docker • Linux • Pytest • YAML • Git**
+
+---
+
+## Design Documentation
+
+Detailed design specifications covering system architecture, runtime processing flow, recognition pipeline orchestration, and shared contracts.
+
+* [Image Processing Service](doc/image_processing_service/image_processing_service.md)
+* [Recognition Pipeline Manager](doc/image_processing_service/RecognitionPipelineManager.md)
+* [Frame Ingestion Gateway](doc/image_processing_service/frame_ingestion_gateway.md)
+
+---
+
+## Demo
+
+<p align="center">
+  <img src="assets/demo.gif" width="450">
+</p>
+
+**Recognition Pipeline**
+
+Motion Detection → Object Detection → Face Detection → Face Recognition → Identity Matching
+---
+
+## Author
+
+**Tali Fruman**
+B.Sc. Information Systems (AI Specialization)
+University of Haifa
