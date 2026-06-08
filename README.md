@@ -104,10 +104,12 @@ Detailed design specifications covering system architecture, runtime processing 
 ## Demo
 
 <p align="center">
-  <img src="assets/demo.gif" width="800">
+  <img src="assets/demo.gif" width="450">
 </p>
 
-Motion Detection → Object Detection → Face Detection → Face Recognition
+**Recognition Pipeline**
+
+Motion Detection → Object Detection → Face Detection → Face Recognition → Identity Matching
 ---
 
 ## Author
