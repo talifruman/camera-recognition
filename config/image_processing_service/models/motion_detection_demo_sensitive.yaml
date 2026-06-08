@@ -1,0 +1,25 @@
+implementation_type: "real"
+
+motion_threshold: 18
+motion_fraction_threshold: 0.003
+min_bbox_area: 400
+blur_kernel_size: 3
+morph_open_iterations: 0
+morph_close_iterations: 1
+dilation_iterations: 2
+min_aspect_ratio: 0.05
+max_aspect_ratio: 20.0
+enable_global_motion_compensation: false
+global_motion_method: "gftt_lk_affine"
+max_features: 300
+min_feature_matches: 20
+max_transform_shift: 25.0
+global_motion_changed_ratio_threshold: 0.30
+fallback_on_alignment_failure: true
+enable_bbox_merging: true
+bbox_merge_iou_threshold: 0.25
+bbox_merge_distance_threshold: 24.0
+enable_temporal_persistence: false
+min_persistence_frames: 1
+persistence_iou_threshold: 0.25
+max_history_frames: 4

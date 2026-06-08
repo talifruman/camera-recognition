@@ -1,0 +1,30 @@
+# Image Processing Service runtime policies and safety limits.
+# Experiment B replay profile: allow 3 motion ROIs/frame while keeping
+# person/face fan-out unchanged.
+
+camera_ids:
+  - "REPLACE_WITH_DEPLOYMENT_CAMERA_ID"
+
+max_queue_size_per_camera: 300
+max_queue_bytes_per_camera: 524288000
+reserved_queue_bytes_per_camera: 52428800
+max_total_queued_bytes: 2147483648
+
+max_frame_age_ms: 30000
+
+overflow_policy: "DROP_OLDEST"
+
+drain_on_shutdown: true
+max_drain_timeout_ms: 30000
+worker_shutdown_timeout_ms: 5000
+
+queue_degraded_utilization_threshold: 0.85
+memory_degraded_utilization_threshold: 0.85
+frame_drop_degraded_threshold_per_minute: 60
+worker_lag_degraded_threshold_ms: 2000
+stale_frame_drop_enabled: true
+stale_frame_degraded_threshold_per_minute: 30
+
+max_motion_regions_per_frame: 3
+max_person_rois_per_frame: 16
+max_face_rois_per_frame: 32

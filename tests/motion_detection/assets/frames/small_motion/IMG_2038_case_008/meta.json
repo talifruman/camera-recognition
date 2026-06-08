@@ -1,0 +1,7 @@
+{
+  "video": "IMG_2038.mov",
+  "previous_frame_index": 21,
+  "current_frame_index": 24,
+  "frame_gap": 3,
+  "expected_motion": true
+}

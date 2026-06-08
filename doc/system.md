@@ -16,6 +16,110 @@ Always use **Obra Superpowers: Brainstorming** in **Planning Mode**.
 - After each brainstorming session, update this file with new decisions, constraints, or trigger refinements.
 - If nothing changed, explicitly state that this file is already up to date.
 
+## Decision Updates
+- 2026-03-25: Frame Transformation Layer contract hard-switched to direct `FramePacket` flow.
+- 2026-03-25: `BaseImage` removed from transformation-layer architecture and method contracts.
+- 2026-03-25: `PayloadDecoder` introduced as an explicit component for deterministic payload decode before transformation.
+- 2026-03-25: No backward compatibility mode retained for `BaseImage` in documentation contracts.
+
+## Runtime Ownership Model (Approved)
+
+- Image Processing Service is the only top-level runtime lifecycle owner.
+- Only Image Processing Service creates, owns, starts, stops, and supervises runtime threads.
+- Frame Ingestion Gateway owns ingestion logic only; it does not own runtime lifecycle or runtime threads.
+- RecognitionPipelineManager owns pipeline processing logic only; it does not own queues, queue pulling, runtime threads, or lifecycle management.
+- Image Processing Service is the sole owner of service-wide DEGRADED/ERROR escalation; Gateway and RPM expose local symptoms only.
+- Queues between ingestion and RPM processing are internal Image Processing Service runtime structures.
+- Per-camera lanes are Image Processing Service-owned execution lanes: ingestion execution path + queue + RPM processing execution path.
+- Shutdown is initiated and coordinated only by Image Processing Service in this order: atomically transition into STOPPING and close enqueue acceptance, stop ingestion execution, drain or drop queues by policy, then stop RPM processing workers.
+- `drain=false` drops queued frames immediately.
+- `drain=true` drains fresh queued frames until timeout while stale policy remains active.
+- frame_ingestion_gateway.md is the sole canonical Gateway specification source.
+- Duplicate Gateway spec artifact was intentionally removed to prevent documentation drift.
+
+### Runtime Ownership Diagram
+
+```mermaid
+%%{init: {'theme': 'neutral'}}%%
+flowchart TB
+	IPS[Image Processing Service\nTop-level runtime lifecycle owner]
+	GW[Frame Ingestion Gateway\nIngestion logic only]
+	RPM[RecognitionPipelineManager\nPipeline logic only]
+
+	subgraph LANE1[Camera Lane 1 - Service Owned]
+		I1[Ingestion execution path]
+		Q1[Queue]
+		P1[RPM processing execution path]
+		I1 --> Q1 --> P1
+	end
+
+	subgraph LANE2[Camera Lane 2 - Service Owned]
+		I2[Ingestion execution path]
+		Q2[Queue]
+		P2[RPM processing execution path]
+		I2 --> Q2 --> P2
+	end
+
+	IPS --> LANE1
+	IPS --> LANE2
+	GW -. logic only .-> I1
+	GW -. logic only .-> I2
+	RPM -. logic only .-> P1
+	RPM -. logic only .-> P2
+```
+
+---
+
+## Service Startup Sequence — Gallery-to-Recognition Wiring
+
+`FaceGalleryLoaderModule` and `FaceRecognitionModule` are connected at service startup time by external startup code. Neither module depends on the other directly.
+
+### Startup Steps
+
+```
+1.  FaceGalleryLoaderModule.load_gallery(gallery_root_path)
+      └─ GalleryPathValidator → GalleryDirectoryScanner
+             → EmbeddingFileReader (NpyEmbeddingFileReader or Stub)
+             → FaceGalleryCache (internal to loader)
+
+2.  entries = FaceGalleryLoaderModule.get_all_embeddings()
+	└─ Returns list[LoadedGalleryEmbedding] (person_id + embedding per enrolled face)
+
+2b. startup wiring maps LoadedGalleryEmbedding[] → EnrolledIdentity[]
+	└─ enrolled = [EnrolledIdentity(person_id=e["person_id"], embedding=e["embedding"]) for e in entries]
+
+3.  FaceRecognitionModule(config, embedding_engine, gallery_entries=enrolled)
+	└─ Builds internal EnrolledIdentityCache (immutable, read-only during recognition)
+
+4.  RecognitionPipelineManager(…, face_recognition=FaceRecognitionModule)
+	└─ RPM holds FaceRecognitionInterface; never sees LoadedGalleryEmbedding, EnrolledIdentity, or gallery data
+```
+
+### Failure Handling at Startup
+
+| Failure | Effect |
+|---------|--------|
+| `load_gallery` raises `GalleryPathValidationError` | Startup aborts; `FaceRecognitionModule` is not created |
+| `load_gallery` raises `GalleryLoadError` (no valid embeddings) | Startup aborts; `FaceRecognitionModule` is not created |
+| Individual `.npy` file fails validation | File skipped with warning; load continues; other entries are included |
+
+### Module Ownership
+
+| Responsibility | Owner |
+|----------------|-------|
+| Gallery file reading | `FaceGalleryLoaderModule` (via `EmbeddingFileReader`) |
+| `LoadedGalleryEmbedding[]` production | `FaceGalleryLoaderModule.get_all_embeddings()` |
+| `LoadedGalleryEmbedding[]` → `EnrolledIdentity[]` mapping | External service startup code |
+| Internal `EnrolledIdentityCache` (recognition) | `FaceRecognitionModule` — immutable after construction |
+| Per-frame gallery lookup | `FaceMatcher` (internal to `FaceRecognitionModule`) |
+| RPM interaction with gallery | None — RPM never sees gallery data |
+
+> **Cross-references:**
+> - `FaceGalleryLoaderModule` API: `doc/image_processing_service/face_gallery_loader.md`
+> - `FaceRecognitionModule` construction: `doc/image_processing_service/face_recognition.md §9.2`
+
+---
+
 ## Plan: Smart Camera Monitoring System
 Learning-first microservices design that supports live/synthetic video, person recognition, event clips, and Telegram alerts while staying simple to evolve.
 
@@ -123,6 +227,7 @@ Core design rules:
 
 ## Service Diagram (Smart Camera Monitoring System)
 ```mermaid
+%%{init: {'theme': 'neutral'}}%%
 flowchart TB
 	subgraph CameraService[Camera Service]
 		CA1[UsbCameraAdapter]
@@ -137,7 +242,7 @@ flowchart TB
 		UV2[Object Detection]
 		UV3[Face Detection]
 		UV4[Face Recognition]
-		UV5[IPC Client And Grpc Client Frame Adapter]
+		UV5[gRPC Client Frame Ingestion Gateway]
 	end
 
 	EventService[Event Service]
@@ -193,6 +298,7 @@ Note: In MVP, Frame Buffer is continuously fed by Camera Service to preserve rel
 
 ### Frame Capture & Real-Time Detection Flow
 ```mermaid
+%%{init: {'theme': 'neutral'}}%%
 sequenceDiagram
 	autonumber
 	participant CameraService as Camera Service<br/>(RTSP Ingest)
@@ -221,6 +327,7 @@ sequenceDiagram
 
 ### Event-Triggered Media Clip Flow
 ```mermaid
+%%{init: {'theme': 'neutral'}}%%
 sequenceDiagram
 	autonumber
 	participant EventService as Event Service<br/>(Redis Stream)
@@ -247,6 +354,7 @@ sequenceDiagram
 
 ### Multi-Camera Frame Distribution
 ```mermaid
+%%{init: {'theme': 'neutral'}}%%
 sequenceDiagram
 	autonumber
 	participant CameraService as Camera Service<br/>(Multi-Camera)
