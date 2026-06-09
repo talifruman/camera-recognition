@@ -23,38 +23,72 @@ Designed using a **Spec-Driven Development** approach with a focus on **real-tim
 ## Architecture
 
 ```mermaid
-flowchart TB
+flowchart LR
 
-    Cameras["Multiple Cameras"]
-
-    Gateway["Frame Ingestion Gateway"]
-
-    IPS["Image Processing Service"]
-
-    subgraph LaneA["Camera Processing Lane A"]
-        QueueA["Queue"]
-        RPMA["Recognition Pipeline"]
-        QueueA --> RPMA
+    subgraph CAM["Camera Sources"]
+        C1["Camera 1"]
+        C2["Camera 2"]
+        C3["Camera N"]
     end
 
-    subgraph LaneB["Camera Processing Lane B"]
-        QueueB["Queue"]
-        RPMB["Recognition Pipeline"]
-        QueueB --> RPMB
+    subgraph GATEWAY["Frame Ingestion Gateway"]
+        T1["Receiver Thread 1<br/>Receive + Validate"]
+        T2["Receiver Thread 2<br/>Receive + Validate"]
+        T3["Receiver Thread N<br/>Receive + Validate"]
     end
 
-    subgraph LaneN["Camera Processing Lane N"]
-        QueueN["Queue"]
-        RPMN["Recognition Pipeline"]
-        QueueN --> RPMN
+    subgraph IPS["Image Processing Service"]
+
+        Q1["Queue 1"]
+        Q2["Queue 2"]
+        Q3["Queue N"]
+
+        W1["Worker Thread 1"]
+        W2["Worker Thread 2"]
+        W3["Worker Thread N"]
+
+        subgraph RPM["Recognition Pipeline Manager"]
+
+            MD["Motion Detection"]
+
+            OD["Object Detection"]
+
+            FD["Face Detection"]
+
+            FR["Face Recognition"]
+
+        end
     end
 
-    Cameras --> Gateway
-    Gateway --> IPS
+    OUT["Recognition Events"]
 
-    IPS --> QueueA
-    IPS --> QueueB
-    IPS --> QueueN
+    C1 --> T1 --> Q1 --> W1
+    C2 --> T2 --> Q2 --> W2
+    C3 --> T3 --> Q3 --> W3
+
+    W1 --> RPM
+    W2 --> RPM
+    W3 --> RPM
+
+    MD --> OD --> FD --> FR --> OUT
+
+    %% ---------- Colors ----------
+
+    style CAM fill:#F5F3FF,stroke:#A78BFA,stroke-width:2px
+    style GATEWAY fill:#F8FAFC,stroke:#94A3B8,stroke-width:2px
+    style IPS fill:#F8FAFC,stroke:#94A3B8,stroke-width:2px
+
+    style RPM fill:#F5F3FF,stroke:#8B5CF6,stroke-width:2px
+
+    style OUT fill:#ECFDF5,stroke:#22C55E,stroke-width:3px
+
+    classDef queue fill:#FEFCE8,stroke:#CA8A04,stroke-width:1.5px
+    classDef worker fill:#EFF6FF,stroke:#3B82F6,stroke-width:1.5px
+    classDef thread fill:#FDF4FF,stroke:#C026D3,stroke-width:1.5px
+
+    class T1,T2,T3 thread
+    class Q1,Q2,Q3 queue
+    class W1,W2,W3 worker
 ```
 
 ---
