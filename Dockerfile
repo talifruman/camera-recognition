@@ -20,4 +20,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["pytest", "-q"]
+ENTRYPOINT ["python", "scripts/run_demo.py"]
